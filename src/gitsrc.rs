@@ -148,14 +148,13 @@ async fn build_env(env_dir: &str, instance_id: &str, repo: &str, commit: &str) -
     let tmp = Path::new(env_dir).join(format!(".{instance_id}.building"));
     let _ = std::fs::remove_dir_all(&tmp);
 
-    let uv_cache = Path::new(env_dir).join(".uv-cache");
     let python = tmp.join("bin").join("python");
     let spec = format!("git+{repo}@{commit}");
 
     // 1) Create the venv. `--relocatable` is essential: we build under a temp
     //    path and rename it into place, and a non-relocatable venv hardcodes its
     //    build-time path into console-script shebangs, which the move breaks.
-    run_uv(&["venv", "--relocatable", &tmp.to_string_lossy()], &uv_cache).await?;
+    run_uv(&["venv", "--relocatable", &tmp.to_string_lossy()], env_dir).await?;
     // 2) Install the package + deps into it.
     run_uv(
         &[
@@ -165,22 +164,60 @@ async fn build_env(env_dir: &str, instance_id: &str, repo: &str, commit: &str) -
             &python.to_string_lossy(),
             &spec,
         ],
-        &uv_cache,
+        env_dir,
     )
     .await?;
 
     // 3) Swap in atomically.
     let _ = std::fs::remove_dir_all(&final_path);
     std::fs::rename(&tmp, &final_path).context("installing built environment")?;
+
+    // 4) The venv's interpreter is a managed CPython installed under
+    //    `<env_dir>/.uv-python` (see `run_uv`), shared read-only across users and
+    //    symlinked from each venv's `bin/python`. The venv gets chowned to its
+    //    owner, but the interpreter must be readable+executable by *every*
+    //    sandbox UID, so relax its permissions to `a+rX`. Best-effort.
+    let py_dir = python_install_dir(env_dir);
+    if py_dir.exists() {
+        if let Err(e) = crate::sandbox::make_world_traversable(&py_dir) {
+            tracing::warn!(error = %e, "could not relax permissions on shared python dir");
+        }
+    }
     Ok(())
 }
 
-async fn run_uv(args: &[&str], uv_cache: &Path) -> Result<()> {
+/// The shared directory uv installs managed Python interpreters into. Kept on
+/// the data volume (not root's home) so unprivileged sandbox UIDs can reach the
+/// interpreter a built venv symlinks to.
+fn python_install_dir(env_dir: &str) -> PathBuf {
+    Path::new(env_dir).join(".uv-python")
+}
+
+/// Whether an instance's built venv resolves its interpreter to the shared
+/// managed-Python directory (rather than an old build under root's home). Used
+/// to force a one-time rebuild of venvs created before the relocation.
+fn venv_python_is_shared(env_dir: &str, instance_id: &str) -> bool {
+    let link = env_path(env_dir, instance_id).join("bin").join("python");
+    match (
+        std::fs::canonicalize(&link),
+        std::fs::canonicalize(python_install_dir(env_dir)),
+    ) {
+        (Ok(target), Ok(shared)) => target.starts_with(shared),
+        _ => false,
+    }
+}
+
+async fn run_uv(args: &[&str], env_dir: &str) -> Result<()> {
+    let uv_cache = Path::new(env_dir).join(".uv-cache");
     let out = tokio::time::timeout(
         BUILD_TIMEOUT,
         Command::new("uv")
             .args(args)
             .env("UV_CACHE_DIR", uv_cache)
+            // Install managed interpreters under the data volume rather than
+            // root's home, so the venv's `bin/python` symlink resolves to a path
+            // that sandbox UIDs can traverse and execute.
+            .env("UV_PYTHON_INSTALL_DIR", python_install_dir(env_dir))
             .env("GIT_TERMINAL_PROMPT", "0")
             .output(),
     )
@@ -222,7 +259,11 @@ pub async fn update_instance(
     let commit = resolve_commit(repo, git_ref).await?;
     let already_built = inst.built_commit.as_deref() == Some(commit.as_str())
         && inst.build_status == "ready"
-        && env_path(env_dir, &inst.id).exists();
+        && env_path(env_dir, &inst.id).exists()
+        // A venv built before the interpreter was relocated points `bin/python`
+        // into root's home, which sandbox UIDs cannot exec — force a rebuild so
+        // it relinks to the shared, world-readable interpreter.
+        && venv_python_is_shared(env_dir, &inst.id);
     if already_built {
         return Ok(UpdateReport {
             changed: false,

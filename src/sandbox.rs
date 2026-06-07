@@ -118,6 +118,24 @@ pub fn chown_recursive(path: &str, uid: u32, gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Recursively make a tree world readable/traversable (`a+rX`: read for all,
+/// search on directories, execute on already-executable files). Used for the
+/// shared managed-Python interpreter that built git venvs symlink to: the venv
+/// itself is chowned to its owner, but the interpreter is shared read-only
+/// across users, so every sandbox UID must be able to read and exec it. Shells
+/// out to coreutils `chmod -R`.
+pub fn make_world_traversable(path: &Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("chmod")
+        .arg("-R")
+        .arg("a+rX")
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other("chmod -R failed"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::uid_for;
