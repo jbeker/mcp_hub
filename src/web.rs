@@ -309,6 +309,7 @@ pub async fn server_detail(
     let body = format!(
         r#"<header class="row"><h1>{name}</h1><a href="/">← Back</a></header>
 <p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
+{runtime}
 <form method="post" action="/servers/{id}/config">
   {csrf}
   {fields}
@@ -323,6 +324,7 @@ pub async fn server_detail(
         ns = esc(&inst.namespace),
         transport = esc(&def.transport),
         status = if inst.enabled { "enabled" } else { "disabled" },
+        runtime = runtime_banner(&inst),
         id = esc(&inst.id),
         csrf = csrf,
         fields = fields,
@@ -330,6 +332,39 @@ pub async fn server_detail(
         toggle = toggle,
     );
     page(&inst.display_name, &body).into_response()
+}
+
+/// Render the backend's last connection outcome as a coloured banner.
+fn runtime_banner(inst: &instances::Instance) -> String {
+    let when = inst
+        .runtime_checked_at
+        .map(|t| {
+            let secs = (crate::util::now_unix() - t).max(0);
+            if secs < 90 {
+                format!(" · checked {secs}s ago")
+            } else {
+                format!(" · checked {}m ago", secs / 60)
+            }
+        })
+        .unwrap_or_default();
+    let (class, label) = match inst.runtime_status.as_str() {
+        "ok" => ("ok", "running".to_string()),
+        "error" => ("danger", "error".to_string()),
+        "unbuilt" => ("warn", "not built".to_string()),
+        "skipped" => ("warn", "not started".to_string()),
+        _ => return String::new(), // 'unknown' before the first connection
+    };
+    let detail = match &inst.runtime_detail {
+        Some(d) if !d.is_empty() => format!(": {}", esc(d)),
+        _ => String::new(),
+    };
+    format!(
+        r#"<p class="status status-{class}">Backend {label}{detail}{when}</p>"#,
+        class = class,
+        label = label,
+        detail = detail,
+        when = when,
+    )
 }
 
 /// `POST /servers/{id}/config` — save secret + non-secret fields.

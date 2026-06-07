@@ -80,26 +80,26 @@ impl HubProxy {
             }
         };
         let per_user_cap = self.state.config.limits.max_backends_per_user;
-        for inst in instances.into_iter().filter(|i| i.enabled) {
+        let enabled: Vec<_> = instances.into_iter().filter(|i| i.enabled).collect();
+        for (idx, inst) in enabled.iter().enumerate() {
             if out.len() >= per_user_cap {
-                tracing::warn!(
-                    cap = per_user_cap,
-                    "per-user backend cap reached; remaining servers not started"
-                );
+                tracing::warn!(cap = per_user_cap, "per-user backend cap reached");
+                self.mark_skipped(&enabled[idx..], "per-user backend cap reached").await;
                 break;
             }
             // Acquire a global slot; if exhausted, stop adding backends.
             let permit = match self.state.backend_slots.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!("global backend capacity reached; skipping remaining backends");
+                    tracing::warn!("global backend capacity reached");
+                    self.mark_skipped(&enabled[idx..], "global backend capacity reached").await;
                     break;
                 }
             };
-            let mut def = match instances::resolve_def(&self.state.db, &inst).await {
+            let mut def = match instances::resolve_def(&self.state.db, inst).await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!(namespace = %inst.namespace, error = %e, "resolve def failed");
+                    self.mark_status(inst, "error", Some(&format!("resolve failed: {e}"))).await;
                     continue;
                 }
             };
@@ -116,20 +116,20 @@ impl HubProxy {
                             def.args = args;
                         }
                         Err(e) => {
-                            tracing::warn!(namespace = %inst.namespace, error = %e, "git launch failed");
+                            self.mark_status(inst, "error", Some(&format!("git launch failed: {e}"))).await;
                             continue;
                         }
                     }
                 } else {
-                    tracing::warn!(namespace = %inst.namespace, "git backend not built yet; run hub__update_server");
+                    self.mark_status(inst, "unbuilt", Some("not built yet; run hub__update_server")).await;
                     continue;
                 }
             }
-            let env = match instances::resolved_env(&self.state.db, &self.state.secrets, &inst).await
+            let env = match instances::resolved_env(&self.state.db, &self.state.secrets, inst).await
             {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!(namespace = %inst.namespace, error = %e, "resolve env failed");
+                    self.mark_status(inst, "error", Some(&format!("config error: {e}"))).await;
                     continue;
                 }
             };
@@ -142,13 +142,37 @@ impl HubProxy {
             )
             .await
             {
-                Ok(b) => out.push(b),
+                Ok(b) => {
+                    self.mark_status(inst, "ok", None).await;
+                    out.push(b);
+                }
                 Err(e) => {
-                    tracing::warn!(namespace = %inst.namespace, error = %e, "backend failed to start")
+                    self.mark_status(inst, "error", Some(&format!("failed to start: {e}"))).await;
                 }
             }
         }
         out
+    }
+
+    /// Persist a backend's connection outcome so the UI / hub__ tools can show
+    /// why it is (not) running. Best-effort: a status-write failure is logged,
+    /// not propagated.
+    async fn mark_status(&self, inst: &instances::Instance, status: &str, detail: Option<&str>) {
+        if status != "ok" {
+            tracing::warn!(namespace = %inst.namespace, status, detail, "backend not running");
+        }
+        if let Err(e) =
+            instances::set_runtime_status(&self.state.db, &inst.id, status, detail).await
+        {
+            tracing::error!(error = %e, "recording backend status failed");
+        }
+    }
+
+    /// Mark a run of instances skipped (capacity reached before reaching them).
+    async fn mark_skipped(&self, insts: &[instances::Instance], reason: &str) {
+        for inst in insts {
+            self.mark_status(inst, "skipped", Some(reason)).await;
+        }
     }
 }
 

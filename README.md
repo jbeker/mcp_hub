@@ -91,7 +91,7 @@ their resources as `hub://zabbix/…`, and the
 |---|---|---|
 | `hub__whoami` | user | Current user + configured servers |
 | `hub__list_catalog` | user | Browse the catalog |
-| `hub__list_my_servers` | user | Your instances + status |
+| `hub__list_my_servers` | user | Your instances + each backend's last connection status (`runtime_status`/`runtime_detail`) |
 | `hub__add_server` | user | Add a catalog server |
 | `hub__configure` / `hub__set_secret` | user | Provide credentials |
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage instances |

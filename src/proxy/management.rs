@@ -266,6 +266,9 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
             "secrets_set": secrets,
             "build_status": i.build_status,
             "built_commit": i.built_commit,
+            "runtime_status": i.runtime_status,
+            "runtime_detail": i.runtime_detail,
+            "runtime_checked_at": i.runtime_checked_at,
         }));
     }
     ok(json!({ "servers": out }))

@@ -183,6 +183,62 @@ async fn proxy_aggregates_a_stdio_backend() {
 }
 
 #[tokio::test]
+async fn failed_backend_reports_error_status() {
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    // An enabled stdio backend whose command does not exist: it must fail to
+    // start, be skipped from the aggregate, and report an error status.
+    let def = ServerDef {
+        name: "Broken".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some("/nonexistent/mcp-binary-xyz".into()),
+        args: vec![],
+        url: None,
+        runtime: "binary".into(),
+        secret_schema: vec![],
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    };
+    instances::create(&state.db, &user.id, None, Some(&def), "broken", "Broken")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // The broken backend contributes no tools but does not fail the session.
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("broken__")));
+
+    // ...and its failure is reported so the user can diagnose it.
+    let listed = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_my_servers".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(json.contains("\"runtime_status\":\"error\""), "got {json}");
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn proxy_aggregates_resources_and_prompts() {
     let exe = mock_server_path();
     assert!(std::path::Path::new(&exe).exists(), "build mock_mcp_server first");
