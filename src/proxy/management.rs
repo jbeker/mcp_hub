@@ -263,13 +263,16 @@ async fn configure(
         let value = val.as_str().ok_or_else(|| {
             McpError::invalid_params(format!("value for '{key}' must be a string"), None)
         })?;
-        let is_secret = def
-            .secret_schema
-            .iter()
-            .find(|f| &f.name == key)
-            .map(|f| f.secret)
-            .unwrap_or(true); // unknown keys treated as secret by default
-        if is_secret {
+        // Only keys declared by the server's schema may be set. This keys
+        // become process environment variables, so accepting arbitrary names
+        // would let a user inject PYTHONSTARTUP / NODE_OPTIONS / LD_PRELOAD etc.
+        let field = def.secret_schema.iter().find(|f| &f.name == key).ok_or_else(|| {
+            McpError::invalid_params(
+                format!("'{key}' is not a configuration key for this server"),
+                None,
+            )
+        })?;
+        if field.secret {
             instances::set_secret(&state.db, &state.secrets, &inst.id, key, value)
                 .await
                 .map_err(internal)?;
@@ -291,6 +294,20 @@ async fn set_secret(
     let key = req_str(args, "key")?;
     let value = req_str(args, "value")?;
     let inst = find_instance(state, user_id, &namespace).await?;
+    let def = instances::resolve_def(&state.db, &inst)
+        .await
+        .map_err(internal)?;
+    // The key must be a declared secret field (see configure() for why).
+    let declared = def
+        .secret_schema
+        .iter()
+        .any(|f| f.name == key && f.secret);
+    if !declared {
+        return Err(McpError::invalid_params(
+            format!("'{key}' is not a secret field for this server"),
+            None,
+        ));
+    }
     instances::set_secret(&state.db, &state.secrets, &inst.id, &key, &value)
         .await
         .map_err(internal)?;

@@ -196,6 +196,19 @@ async fn management_tools_over_mcp() {
     assert!(listed_json.contains("ZABBIX_TOKEN")); // secret name listed, value not
     assert!(!listed_json.contains("s3cr3t")); // value never returned
 
+    // An env key outside the server's schema is refused (no PYTHONSTARTUP etc.).
+    let injected = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__set_secret".into(),
+            arguments: args(serde_json::json!({"namespace": "zbx", "key": "LD_PRELOAD", "value": "/tmp/x.so"})),
+        })
+        .await;
+    let blocked = match injected {
+        Err(_) => true,
+        Ok(r) => r.is_error == Some(true),
+    };
+    assert!(blocked, "undeclared env key must be rejected");
+
     // Reserved namespace cannot be claimed via the management interface.
     let reserved = client
         .call_tool(CallToolRequestParam {
