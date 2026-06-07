@@ -95,6 +95,23 @@ async fn mcp_with_valid_token_passes_auth() {
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn sandbox_disabled_when_not_root_even_with_base_set() {
+    // With HUB_SANDBOX_UID_BASE configured but not running as root (as in
+    // tests/CI/dev), sandboxing is disabled — Ok(None), never an error — so
+    // local runs and the test suite keep working. Failing closed only applies
+    // once we are root and sandboxing is genuinely expected.
+    let mut cfg = test_config();
+    cfg.sandbox_uid_base = Some(20000);
+    let path = std::env::temp_dir().join(format!("mcp_hub_sb_{}.db", uuid::Uuid::new_v4()));
+    let pool = db::connect(path.to_str().unwrap()).await.unwrap();
+    let state = AppState::new(cfg, pool).await.unwrap();
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    assert!(state.sandbox_or_fail(&user.id).await.unwrap().is_none());
+}
+
 /// Build an `/mcp` request carrying `token` as a bearer credential.
 fn mcp_request(token: &str) -> Request<Body> {
     Request::post("/mcp")

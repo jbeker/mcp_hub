@@ -86,17 +86,27 @@ impl AppState {
         crate::sandbox::uid_for(self.config.sandbox_uid_base, slot)
     }
 
-    /// The prepared [`Sandbox`](crate::sandbox::Sandbox) for a user (creates the
-    /// per-UID cache dir), or `None` if sandboxing is off.
-    pub async fn sandbox_for(&self, user_id: &str) -> Option<crate::sandbox::Sandbox> {
-        let uid = self.sandbox_uid(user_id).await?;
-        match crate::sandbox::prepare(uid, &self.config.env_dir) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(uid, error = %e, "could not prepare sandbox; running unsandboxed");
-                None
-            }
+    /// Resolve the sandbox identity for a user's subprocesses and git builds,
+    /// **failing closed**. Returns `Ok(None)` only when sandboxing is genuinely
+    /// disabled — no `HUB_SANDBOX_UID_BASE` configured, or not running as root
+    /// (dev/test). When sandboxing *is* configured, a missing UID slot or a
+    /// failure to prepare the per-UID cache dir is an error, never a silent drop
+    /// to running user-controlled code as root.
+    pub async fn sandbox_or_fail(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<crate::sandbox::Sandbox>> {
+        if self.config.sandbox_uid_base.is_none() || !crate::sandbox::is_root() {
+            return Ok(None);
         }
+        let slot = crate::users::sandbox_slot(&self.db, user_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("sandbox is required but the user has no UID slot"))?;
+        let uid = crate::sandbox::uid_for(self.config.sandbox_uid_base, Some(slot))
+            .ok_or_else(|| anyhow::anyhow!("sandbox is required but its UID could not be derived"))?;
+        crate::sandbox::prepare(uid, &self.config.env_dir)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("sandbox is required but could not be prepared: {e}"))
     }
 }
 

@@ -80,9 +80,17 @@ impl HubProxy {
             }
         };
         let per_user_cap = self.state.config.limits.max_backends_per_user;
-        // The per-user sandbox identity for this user's stdio subprocesses.
-        let sandbox = self.state.sandbox_for(user_id).await;
         let enabled: Vec<_> = instances.into_iter().filter(|i| i.enabled).collect();
+        // The per-user sandbox identity for this user's stdio subprocesses. Fail
+        // closed: if sandboxing is configured but unavailable, start no backends
+        // rather than running user commands as root.
+        let sandbox = match self.state.sandbox_or_fail(user_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.mark_skipped(&enabled, &format!("sandbox unavailable: {e:#}")).await;
+                return out;
+            }
+        };
         for (idx, inst) in enabled.iter().enumerate() {
             if out.len() >= per_user_cap {
                 tracing::warn!(cap = per_user_cap, "per-user backend cap reached");

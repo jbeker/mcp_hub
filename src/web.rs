@@ -602,8 +602,11 @@ pub async fn update_server(
         return error_page("this server is not git-sourced");
     }
     let _guard = state.build_lock.lock().await;
-    let uid = state.sandbox_uid(&user.id).await;
-    match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, uid).await {
+    let sandbox = match state.sandbox_or_fail(&user.id).await {
+        Ok(s) => s,
+        Err(e) => return error_page(&format!("sandbox unavailable: {e:#}")),
+    };
+    match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, sandbox.as_ref()).await {
         Ok(_) => Redirect::to(&format!("/servers/{id}")).into_response(),
         Err(e) => error_page(&format!("update failed: {e}")),
     }
@@ -646,6 +649,12 @@ async fn probe_instance(
     if def.transport == "http" && def.url.as_deref().unwrap_or("").trim().is_empty() {
         return ("error", Some("no remote URL set".into()));
     }
+    // Fail closed: resolve the sandbox identity up front (used for both the
+    // self-heal rebuild and the probe spawn) rather than ever running as root.
+    let sandbox = match state.sandbox_or_fail(user_id).await {
+        Ok(s) => s,
+        Err(e) => return ("error", Some(format!("sandbox unavailable: {e:#}"))),
+    };
     // Git-sourced backends run from their prebuilt virtualenv; rewrite to a
     // direct stdio exec, or report that they need building first.
     if crate::gitsrc::is_git_source(&def) {
@@ -661,10 +670,14 @@ async fn probe_instance(
         // the sandbox; rebuild it transparently so testing just works.
         if crate::gitsrc::venv_is_stale(&state.config.env_dir, inst, &def) {
             let _guard = state.build_lock.lock().await;
-            let uid = state.sandbox_uid(user_id).await;
-            if let Err(e) =
-                crate::gitsrc::update_instance(&state.db, &state.config.env_dir, inst, &def, uid)
-                    .await
+            if let Err(e) = crate::gitsrc::update_instance(
+                &state.db,
+                &state.config.env_dir,
+                inst,
+                &def,
+                sandbox.as_ref(),
+            )
+            .await
             {
                 return ("error", Some(format!("rebuild failed: {e:#}")));
             }
@@ -682,7 +695,6 @@ async fn probe_instance(
         Ok(e) => e,
         Err(e) => return ("error", Some(format!("config error: {e:#}"))),
     };
-    let sandbox = state.sandbox_for(user_id).await;
     match crate::proxy::backend::Backend::probe(&def, &env, sandbox.as_ref()).await {
         Ok(()) => ("ok", None),
         Err(e) => ("error", Some(format!("failed to start: {e:#}"))),

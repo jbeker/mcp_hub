@@ -9,6 +9,7 @@ use sqlx::SqlitePool;
 use tokio::process::Command;
 
 use crate::instances::{self, Instance, ServerDef};
+use crate::sandbox::Sandbox;
 
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -142,7 +143,18 @@ async fn resolve_commit(repo: &str, git_ref: &str) -> Result<String> {
 
 /// Build `git+<repo>@<commit>` into a fresh virtualenv, swapping it in
 /// atomically on success. Slow; only ever called from an update.
-async fn build_env(env_dir: &str, instance_id: &str, repo: &str, commit: &str) -> Result<()> {
+///
+/// Installing the package runs its build backend — i.e. **arbitrary code** from
+/// the repo — so when `sandbox` is set that step is dropped to the owner's
+/// unprivileged UID. Without this it would run as the hub's (root) identity and
+/// could read the master key and the secrets DB, defeating the runtime sandbox.
+async fn build_env(
+    env_dir: &str,
+    instance_id: &str,
+    repo: &str,
+    commit: &str,
+    sandbox: Option<&Sandbox>,
+) -> Result<()> {
     std::fs::create_dir_all(env_dir).context("creating env directory")?;
     let final_path = env_path(env_dir, instance_id);
     let tmp = Path::new(env_dir).join(format!(".{instance_id}.building"));
@@ -151,36 +163,47 @@ async fn build_env(env_dir: &str, instance_id: &str, repo: &str, commit: &str) -
     let python = tmp.join("bin").join("python");
     let spec = format!("git+{repo}@{commit}");
 
-    // 1) Create the venv. `--relocatable` is essential: we build under a temp
-    //    path and rename it into place, and a non-relocatable venv hardcodes its
-    //    build-time path into console-script shebangs, which the move breaks.
-    run_uv(&["venv", "--relocatable", &tmp.to_string_lossy()], env_dir).await?;
-    // 2) Install the package + deps into it.
-    run_uv(
-        &[
-            "pip",
-            "install",
-            "--python",
-            &python.to_string_lossy(),
-            &spec,
-        ],
-        env_dir,
-    )
-    .await?;
+    // 1) Create the venv as the hub (no sandbox): this only links the shared
+    //    managed interpreter and runs no repo code. `--relocatable` is essential:
+    //    we build under a temp path and rename it into place, and a
+    //    non-relocatable venv hardcodes its build-time path into console-script
+    //    shebangs, which the move breaks.
+    run_uv(&["venv", "--relocatable", &tmp.to_string_lossy()], env_dir, None).await?;
 
-    // 3) Swap in atomically.
-    let _ = std::fs::remove_dir_all(&final_path);
-    std::fs::rename(&tmp, &final_path).context("installing built environment")?;
-
-    // 4) The venv's interpreter is a managed CPython installed under
-    //    `<env_dir>/.uv-python` (see `run_uv`), shared read-only across users and
-    //    symlinked from each venv's `bin/python`. The venv gets chowned to its
-    //    owner, but the interpreter must be readable+executable by *every*
-    //    sandbox UID, so relax its permissions to `a+rX`. Best-effort.
+    // The shared interpreter must be readable/executable by the sandbox UID
+    // before that UID uses it to install (step 3). Best-effort.
     let py_dir = python_install_dir(env_dir);
     if py_dir.exists() {
         if let Err(e) = crate::sandbox::make_world_traversable(&py_dir) {
             tracing::warn!(error = %e, "could not relax permissions on shared python dir");
+        }
+    }
+
+    // 2) Hand the temp venv to the sandbox UID so the install can write into it.
+    if let Some(sb) = sandbox {
+        crate::sandbox::chown_recursive(&tmp.to_string_lossy(), sb.uid, sb.gid)
+            .context("handing build dir to sandbox uid")?;
+    }
+
+    // 3) Install the package + deps — running its build backend — as the sandbox
+    //    UID when one is set, so a malicious repo cannot execute code as root.
+    run_uv(
+        &["pip", "install", "--python", &python.to_string_lossy(), &spec],
+        env_dir,
+        sandbox,
+    )
+    .await?;
+
+    // 4) Swap in atomically (as the hub; root may rename the UID-owned tree).
+    let _ = std::fs::remove_dir_all(&final_path);
+    std::fs::rename(&tmp, &final_path).context("installing built environment")?;
+
+    // 5) Ensure the whole venv is owned by the sandbox UID that will run it.
+    if let Some(sb) = sandbox {
+        if let Err(e) =
+            crate::sandbox::chown_recursive(&final_path.to_string_lossy(), sb.uid, sb.gid)
+        {
+            tracing::warn!(error = %e, "could not chown built venv to sandbox uid");
         }
     }
     Ok(())
@@ -219,23 +242,33 @@ fn venv_python_is_shared(env_dir: &str, instance_id: &str) -> bool {
     }
 }
 
-async fn run_uv(args: &[&str], env_dir: &str) -> Result<()> {
-    let uv_cache = Path::new(env_dir).join(".uv-cache");
-    let out = tokio::time::timeout(
-        BUILD_TIMEOUT,
-        Command::new("uv")
-            .args(args)
-            .env("UV_CACHE_DIR", uv_cache)
-            // Install managed interpreters under the data volume rather than
-            // root's home, so the venv's `bin/python` symlink resolves to a path
-            // that sandbox UIDs can traverse and execute.
-            .env("UV_PYTHON_INSTALL_DIR", python_install_dir(env_dir))
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output(),
-    )
-    .await
-    .context("uv command timed out")?
-    .context("running uv")?;
+async fn run_uv(args: &[&str], env_dir: &str, sandbox: Option<&Sandbox>) -> Result<()> {
+    let mut cmd = Command::new("uv");
+    cmd.args(args)
+        // Install managed interpreters under the data volume rather than root's
+        // home, so the venv's `bin/python` symlink resolves to a path sandbox
+        // UIDs can traverse and execute.
+        .env("UV_PYTHON_INSTALL_DIR", python_install_dir(env_dir))
+        .env("GIT_TERMINAL_PROMPT", "0");
+    match sandbox {
+        // Run as the owner's unprivileged UID, with HOME and the package cache in
+        // that user's own writable sandbox directory (never shared/writable
+        // across users, so one user cannot poison another's build cache).
+        Some(sb) => {
+            cmd.uid(sb.uid)
+                .gid(sb.gid)
+                .env("HOME", &sb.cache_dir)
+                .env("USER", "mcp-sandbox")
+                .env("UV_CACHE_DIR", format!("{}/uv", sb.cache_dir));
+        }
+        None => {
+            cmd.env("UV_CACHE_DIR", Path::new(env_dir).join(".uv-cache"));
+        }
+    }
+    let out = tokio::time::timeout(BUILD_TIMEOUT, cmd.output())
+        .await
+        .context("uv command timed out")?
+        .context("running uv")?;
     if !out.status.success() {
         bail!(
             "uv {} failed: {}",
@@ -253,7 +286,7 @@ pub async fn update_instance(
     env_dir: &str,
     inst: &Instance,
     def: &ServerDef,
-    owner_uid: Option<u32>,
+    sandbox: Option<&Sandbox>,
 ) -> Result<UpdateReport> {
     if !is_git_source(def) {
         bail!("'{}' is not a git-sourced server", inst.namespace);
@@ -284,15 +317,8 @@ pub async fn update_instance(
         });
     }
 
-    match build_env(env_dir, &inst.id, repo, &commit).await {
+    match build_env(env_dir, &inst.id, repo, &commit, sandbox).await {
         Ok(()) => {
-            // Hand the built venv to the owner's sandbox UID so it can run it.
-            if let Some(uid) = owner_uid {
-                let path = env_path(env_dir, &inst.id);
-                if let Err(e) = crate::sandbox::chown_recursive(&path.to_string_lossy(), uid, uid) {
-                    tracing::warn!(error = %e, "could not chown built venv to sandbox uid");
-                }
-            }
             instances::set_build_state(pool, &inst.id, "ready", Some(&commit)).await?;
             Ok(UpdateReport {
                 changed: true,
@@ -390,7 +416,7 @@ mod tests {
 
         let repo_url = format!("file://{}", repo.display());
         let env_dir = envs.to_string_lossy().into_owned();
-        build_env(&env_dir, "inst1", &repo_url, &sha).await.unwrap();
+        build_env(&env_dir, "inst1", &repo_url, &sha, None).await.unwrap();
 
         // The built env survived the relocation and the entry point runs.
         let def = git_def(Some("echo-mcp"), &[]);
