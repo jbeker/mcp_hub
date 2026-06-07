@@ -5,7 +5,7 @@
 use mcp_hub::catalog::ServerDef;
 use mcp_hub::config::{Config, Limits};
 use mcp_hub::{build_router, db, instances, users, AppState};
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::{CallToolRequestParam, GetPromptRequestParam, ReadResourceRequestParam};
 use rmcp::service::{serve_client, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -178,6 +178,89 @@ async fn proxy_aggregates_a_stdio_backend() {
         })
         .await;
     assert!(bad.is_err());
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn proxy_aggregates_resources_and_prompts() {
+    let exe = mock_server_path();
+    assert!(std::path::Path::new(&exe).exists(), "build mock_mcp_server first");
+
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let def = ServerDef {
+        name: "Mock".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some(exe),
+        args: vec![],
+        url: None,
+        runtime: "binary".into(),
+        secret_schema: vec![],
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    };
+    instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // Resources are aggregated with namespaced URIs (hub://<ns>/<original>).
+    let resources = client.list_all_resources().await.unwrap();
+    let wrapped_uri = "hub://mock/mock://greeting";
+    assert!(
+        resources.iter().any(|r| r.uri == wrapped_uri),
+        "got {:?}",
+        resources.iter().map(|r| &r.uri).collect::<Vec<_>>()
+    );
+
+    // Reading the wrapped URI routes back to the mock and returns its content.
+    let read = client
+        .read_resource(ReadResourceRequestParam {
+            uri: wrapped_uri.to_string(),
+        })
+        .await
+        .unwrap();
+    let read_json = serde_json::to_string(&read.contents).unwrap();
+    assert!(read_json.contains("hello from mock"), "got {read_json}");
+    // The returned content URI is re-wrapped so the client sees a consistent id.
+    assert!(read_json.contains(wrapped_uri), "got {read_json}");
+
+    // An unknown namespace is rejected, not silently routed.
+    let bad = client
+        .read_resource(ReadResourceRequestParam {
+            uri: "hub://nope/x".to_string(),
+        })
+        .await;
+    assert!(bad.is_err());
+
+    // Prompts are aggregated and namespaced like tools.
+    let prompts = client.list_all_prompts().await.unwrap();
+    assert!(
+        prompts.iter().any(|p| p.name == "mock__hello"),
+        "got {:?}",
+        prompts.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+
+    let got = client
+        .get_prompt(GetPromptRequestParam {
+            name: "mock__hello".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let got_json = serde_json::to_string(&got.messages).unwrap();
+    assert!(got_json.contains("Say hello"), "got {got_json}");
 
     let _ = client.cancel().await;
 }

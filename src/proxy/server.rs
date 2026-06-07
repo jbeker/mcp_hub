@@ -3,15 +3,17 @@
 //! enabled backends, namespacing everything as `<server>__<tool>`.
 
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParam,
-    ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult, Implementation,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam, ReadResourceResult,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio::sync::Mutex;
 
 use crate::instances;
-use crate::proxy::backend::Backend;
+use crate::proxy::backend::{unwrap_uri, Backend};
 use crate::proxy::{management, AuthedUser};
 use crate::AppState;
 
@@ -157,6 +159,10 @@ impl ServerHandler for HubProxy {
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_resources()
+                .enable_resources_list_changed()
+                .enable_prompts()
+                .enable_prompts_list_changed()
                 .build(),
             server_info: Implementation {
                 name: "mcp-hub".into(),
@@ -166,7 +172,8 @@ impl ServerHandler for HubProxy {
                 website_url: None,
             },
             instructions: Some(
-                "Aggregating MCP proxy. Tools are namespaced as <server>__<tool>. \
+                "Aggregating MCP proxy. Tools and prompts are namespaced as \
+                 <server>__<name>, and resource URIs as hub://<server>/<uri>. \
                  Use the hub__ tools to manage your configured servers."
                     .into(),
             ),
@@ -235,6 +242,116 @@ impl ServerHandler for HubProxy {
 
         backend
             .call_tool(original.to_string(), request.arguments)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        self.ensure_bound(&context).await?;
+        let guard = self.bound.lock().await;
+        let bound = guard.as_ref().expect("bound after ensure_bound");
+        let mut resources = Vec::new();
+        for b in &bound.backends {
+            match b.list_namespaced_resources().await {
+                Ok(mut r) => resources.append(&mut r),
+                // A backend without the resources capability errors here; that
+                // is expected, so log at debug and move on.
+                Err(e) => tracing::debug!(namespace = %b.namespace, error = %e, "no resources"),
+            }
+        }
+        Ok(ListResourcesResult {
+            resources,
+            next_cursor: None,
+        })
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        self.ensure_bound(&context).await?;
+        let guard = self.bound.lock().await;
+        let bound = guard.as_ref().expect("bound after ensure_bound");
+        let mut resource_templates = Vec::new();
+        for b in &bound.backends {
+            match b.list_namespaced_resource_templates().await {
+                Ok(mut t) => resource_templates.append(&mut t),
+                Err(e) => tracing::debug!(namespace = %b.namespace, error = %e, "no templates"),
+            }
+        }
+        Ok(ListResourceTemplatesResult {
+            resource_templates,
+            next_cursor: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        self.ensure_bound(&context).await?;
+        let (ns, original) = unwrap_uri(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(
+                "resource URI must be namespaced as hub://<server>/<uri>",
+                None,
+            )
+        })?;
+
+        let guard = self.bound.lock().await;
+        let bound = guard.as_ref().expect("bound after ensure_bound");
+        let backend = bound.backends.iter().find(|b| b.namespace == ns).ok_or_else(|| {
+            McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
+        })?;
+        backend
+            .read_resource(original.to_string())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        self.ensure_bound(&context).await?;
+        let guard = self.bound.lock().await;
+        let bound = guard.as_ref().expect("bound after ensure_bound");
+        let mut prompts = Vec::new();
+        for b in &bound.backends {
+            match b.list_namespaced_prompts().await {
+                Ok(mut p) => prompts.append(&mut p),
+                Err(e) => tracing::debug!(namespace = %b.namespace, error = %e, "no prompts"),
+            }
+        }
+        Ok(ListPromptsResult {
+            prompts,
+            next_cursor: None,
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        self.ensure_bound(&context).await?;
+        let (ns, original) = request.name.split_once("__").ok_or_else(|| {
+            McpError::invalid_params("prompt name must be namespaced as <server>__<prompt>", None)
+        })?;
+
+        let guard = self.bound.lock().await;
+        let bound = guard.as_ref().expect("bound after ensure_bound");
+        let backend = bound.backends.iter().find(|b| b.namespace == ns).ok_or_else(|| {
+            McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
+        })?;
+        backend
+            .get_prompt(original.to_string(), request.arguments)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }

@@ -8,7 +8,7 @@ Run one hub, let your users sign in with **passkeys**, pick MCP servers from a *
 
 - **Catalog** of MCP servers (admin-curated built-ins + user-defined custom servers).
 - **Per-user instances**: each user configures servers with their own secrets, encrypted at rest.
-- **One proxy endpoint** (`/mcp`, Streamable HTTP) that aggregates every enabled backend, exposing their tools namespaced as `<server>__<tool>`.
+- **One proxy endpoint** (`/mcp`, Streamable HTTP) that aggregates every enabled backend, exposing their **tools and prompts** namespaced as `<server>__<name>` and their **resources** as `hub://<server>/<uri>`.
 - **Built-in management interface**: a reserved `hub__` toolset on the same endpoint, so the hub can be configured programmatically from any MCP client.
 - **Standards-based auth**: passkeys (WebAuthn) authenticate humans; the hub is its own OAuth 2.1 Authorization Server (PKCE, Dynamic Client Registration, ES256 JWTs, JWKS) for MCP clients.
 
@@ -81,7 +81,8 @@ Claude Code, for example:
 claude mcp add --transport http hub https://hub.example.com/mcp
 ```
 
-Once connected, your servers' tools appear namespaced (`zabbix__host_get`, …), and the
+Once connected, your servers' tools and prompts appear namespaced (`zabbix__host_get`, …),
+their resources as `hub://zabbix/…`, and the
 `hub__*` tools let you manage your configuration from inside the client.
 
 ### Management tools (`hub__`)
