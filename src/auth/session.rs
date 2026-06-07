@@ -20,13 +20,17 @@ pub const NEXT_COOKIE: &str = "hub_next";
 /// Session lifetime in seconds (30 days).
 const SESSION_TTL_SECS: i64 = 60 * 60 * 24 * 30;
 
-/// Validate that a redirect target is a safe local path (no open redirects).
+/// Validate that a redirect target is a safe same-origin path.
+///
+/// Only a path beginning with a single `/` is allowed. Backslashes and control
+/// characters are rejected because browsers normalize `\` to `/`, so values like
+/// `/\evil.com` would otherwise become the protocol-relative `//evil.com`.
 pub fn safe_next(path: &str) -> Option<String> {
-    if path.starts_with('/') && !path.starts_with("//") {
-        Some(path.to_string())
-    } else {
-        None
-    }
+    let valid = path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.contains(|c: char| c.is_control());
+    valid.then(|| path.to_string())
 }
 
 /// Build the short-lived cookie storing a post-login redirect target.
@@ -169,5 +173,27 @@ impl FromRequestParts<AppState> for MaybeUser {
             None => None,
         };
         Ok(MaybeUser(user))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_next;
+
+    #[test]
+    fn accepts_local_paths() {
+        assert_eq!(safe_next("/").as_deref(), Some("/"));
+        assert_eq!(safe_next("/authorize?x=1").as_deref(), Some("/authorize?x=1"));
+        assert_eq!(safe_next("/servers/abc").as_deref(), Some("/servers/abc"));
+    }
+
+    #[test]
+    fn rejects_open_redirects() {
+        assert_eq!(safe_next("//evil.com"), None);
+        assert_eq!(safe_next("/\\evil.com"), None); // backslash -> // in browsers
+        assert_eq!(safe_next("/\t/evil.com"), None); // control char
+        assert_eq!(safe_next("https://evil.com"), None);
+        assert_eq!(safe_next("evil.com"), None);
+        assert_eq!(safe_next(""), None);
     }
 }
