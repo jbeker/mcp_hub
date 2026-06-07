@@ -95,7 +95,8 @@ their resources as `hub://zabbix/…`, and the
 | `hub__add_server` | user | Add a catalog server |
 | `hub__configure` / `hub__set_secret` | user | Provide credentials |
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage instances |
-| `hub__list_users` | admin | List users |
+| `hub__list_users` | admin | List users (with admin/disabled status) |
+| `hub__disable_user` / `hub__enable_user` / `hub__delete_user` | admin | Suspend or remove an account |
 | `hub__catalog_upsert` / `hub__catalog_remove` | admin | Manage the catalog |
 | `hub__create_invite` / `hub__list_invites` / `hub__revoke_invite` | admin | Manage invite codes |
 | `hub__create_recovery` | admin | Issue a one-time account-recovery code |
@@ -186,6 +187,23 @@ Notes:
   customized image.
 - **Public repos only** for now — a private repo would need a token, which isn't yet handled
   cleanly.
+
+## Managing access
+
+- **Your connections.** The **Account** page lists the MCP clients you have
+  authorized and your active browser sessions. *Disconnect* revokes a client's
+  refresh token; *Sign out other sessions* ends every browser session but the
+  current one.
+- **Admin user management.** The **Users** page (and `hub__disable_user` /
+  `hub__enable_user` / `hub__delete_user`) let an admin suspend or remove an
+  account. Disabling ends the user's sessions and revokes their tokens at once;
+  deleting also removes their servers, secrets and passkeys. An admin cannot act
+  on their own account or the last remaining admin.
+
+Because access tokens are short-lived JWTs, a revoked or disabled user keeps any
+already-issued access token until it expires — but the proxy re-checks the
+account on every request, so revocation takes effect within seconds, well inside
+the 15-minute token lifetime.
 
 ## Security notes
 

@@ -14,7 +14,11 @@ pub struct User {
     pub display_name: String,
     pub is_admin: bool,
     pub created_at: i64,
+    pub disabled: bool,
 }
+
+/// Columns selected into [`User`].
+const USER_COLS: &str = "id, handle, display_name, is_admin, created_at, disabled";
 
 /// Number of users currently registered.
 pub async fn count(pool: &SqlitePool) -> Result<i64> {
@@ -25,9 +29,9 @@ pub async fn count(pool: &SqlitePool) -> Result<i64> {
 }
 
 pub async fn find_by_handle(pool: &SqlitePool, handle: &str) -> Result<Option<User>> {
-    let user = sqlx::query_as::<_, User>(
-        "SELECT id, handle, display_name, is_admin, created_at FROM users WHERE handle = ?",
-    )
+    let user = sqlx::query_as::<_, User>(&format!(
+        "SELECT {USER_COLS} FROM users WHERE handle = ?"
+    ))
     .bind(handle)
     .fetch_optional(pool)
     .await?;
@@ -35,22 +39,39 @@ pub async fn find_by_handle(pool: &SqlitePool, handle: &str) -> Result<Option<Us
 }
 
 pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<User>> {
-    let user = sqlx::query_as::<_, User>(
-        "SELECT id, handle, display_name, is_admin, created_at FROM users WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let user = sqlx::query_as::<_, User>(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(user)
 }
 
 pub async fn list(pool: &SqlitePool) -> Result<Vec<User>> {
-    let users = sqlx::query_as::<_, User>(
-        "SELECT id, handle, display_name, is_admin, created_at FROM users ORDER BY created_at",
-    )
+    let users = sqlx::query_as::<_, User>(&format!(
+        "SELECT {USER_COLS} FROM users ORDER BY created_at"
+    ))
     .fetch_all(pool)
     .await?;
     Ok(users)
+}
+
+/// Number of admin accounts (used to refuse removing the last admin).
+pub async fn count_admins(pool: &SqlitePool) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+/// Enable or disable a user. A disabled user cannot sign in or use the proxy.
+pub async fn set_disabled(pool: &SqlitePool, id: &str, disabled: bool) -> Result<()> {
+    sqlx::query("UPDATE users SET disabled = ? WHERE id = ?")
+        .bind(disabled)
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("updating user disabled flag")?;
+    Ok(())
 }
 
 /// Create a user, granting admin only if this is the very first account.
@@ -93,6 +114,7 @@ pub async fn create_admin_if_first(
             display_name: display_name.to_string(),
             is_admin,
             created_at,
+            disabled: false,
         })
     }
     .await;
@@ -135,6 +157,7 @@ pub async fn create(
         display_name: display_name.to_string(),
         is_admin,
         created_at,
+        disabled: false,
     })
 }
 

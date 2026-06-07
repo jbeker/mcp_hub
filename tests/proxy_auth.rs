@@ -67,9 +67,14 @@ async fn mcp_with_bad_token_is_401() {
 #[tokio::test]
 async fn mcp_with_valid_token_passes_auth() {
     let state = test_state().await;
+    // The proxy verifies the token's subject still exists and is enabled, so the
+    // user must be present in the database.
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token("u1", "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
+        .issue_access_token(&user.id, "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
         .unwrap();
 
     let resp = app(state)
@@ -87,4 +92,27 @@ async fn mcp_with_valid_token_passes_auth() {
         .unwrap();
     // The bearer check passed (not a 401); rmcp handles the protocol from here.
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_with_token_for_unknown_user_is_401() {
+    // A correctly-signed token whose subject has no account (e.g. deleted) is
+    // rejected, since the proxy re-checks the user on every request.
+    let state = test_state().await;
+    let (token, _) = state
+        .signer
+        .issue_access_token("ghost", "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

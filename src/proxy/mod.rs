@@ -56,18 +56,26 @@ async fn require_bearer(State(state): State<AppState>, mut req: Request, next: N
     let Some(token) = token else {
         return unauthorized(&state);
     };
-    match state
+    let claims = match state
         .signer
         .verify_access_token(token, &state.config.mcp_url())
     {
-        Ok(claims) => {
+        Ok(c) => c,
+        Err(_) => return unauthorized(&state),
+    };
+
+    // The token is a stateless JWT, so also confirm the account still exists and
+    // is enabled. This makes account deletion/disabling take effect on the proxy
+    // within seconds rather than waiting out the access-token lifetime.
+    match crate::users::find_by_id(&state.db, &claims.sub).await {
+        Ok(Some(user)) if !user.disabled => {
             req.extensions_mut().insert(AuthedUser {
                 user_id: claims.sub,
                 admin: claims.admin,
             });
             next.run(req).await
         }
-        Err(_) => unauthorized(&state),
+        _ => unauthorized(&state),
     }
 }
 

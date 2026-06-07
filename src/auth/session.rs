@@ -141,6 +141,58 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// A browser session belonging to a user (no secret material).
+pub struct SessionInfo {
+    pub id: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// List a user's active (unexpired) sessions, newest first.
+pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> Result<Vec<SessionInfo>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT id, created_at, expires_at FROM web_sessions \
+         WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .bind(now_unix())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, created_at, expires_at)| SessionInfo {
+            id,
+            created_at,
+            expires_at,
+        })
+        .collect())
+}
+
+/// Delete all of a user's sessions except `keep` (sign out other devices).
+/// Returns the number of sessions ended.
+pub async fn delete_others(pool: &SqlitePool, user_id: &str, keep: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM web_sessions WHERE user_id = ? AND id <> ?")
+        .bind(user_id)
+        .bind(keep)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Delete every session for a user (used when disabling the account).
+pub async fn delete_all_for_user(pool: &SqlitePool, user_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Read the current session id from a signed cookie jar (for "keep this one").
+pub fn current_session_id(jar: &SignedCookieJar) -> Option<String> {
+    jar.get(SESSION_COOKIE).map(|c| c.value().to_string())
+}
+
 /// Load the user behind a session id, if the session exists and is unexpired.
 pub async fn user_for_session(pool: &SqlitePool, session_id: &str) -> Result<Option<User>> {
     let row: Option<(String, i64)> =

@@ -142,6 +142,23 @@ pub fn tools(admin: bool) -> Vec<Tool> {
              returned once and cannot be retrieved later.",
             schema(json!({"handle": {"type": "string"}}), &["handle"]),
         ));
+        t.push(tool(
+            "hub__disable_user",
+            "(admin) Disable a user: end their sessions, revoke their tokens, and \
+             block sign-in. Cannot target yourself or the last admin.",
+            schema(json!({"handle": {"type": "string"}}), &["handle"]),
+        ));
+        t.push(tool(
+            "hub__enable_user",
+            "(admin) Re-enable a disabled user.",
+            schema(json!({"handle": {"type": "string"}}), &["handle"]),
+        ));
+        t.push(tool(
+            "hub__delete_user",
+            "(admin) Permanently delete a user and all their servers, secrets and \
+             passkeys. Cannot target yourself or the last admin.",
+            schema(json!({"handle": {"type": "string"}}), &["handle"]),
+        ));
     }
     t
 }
@@ -198,6 +215,18 @@ pub async fn dispatch(
         "create_recovery" => {
             require_admin(admin)?;
             create_recovery(state, user_id, &args).await
+        }
+        "disable_user" => {
+            require_admin(admin)?;
+            set_user_disabled(state, user_id, &args, true).await
+        }
+        "enable_user" => {
+            require_admin(admin)?;
+            set_user_disabled(state, user_id, &args, false).await
+        }
+        "delete_user" => {
+            require_admin(admin)?;
+            delete_user(state, user_id, &args).await
         }
         other => Err(McpError::invalid_params(
             format!("unknown management tool 'hub__{other}'"),
@@ -432,9 +461,82 @@ async fn list_users(state: &AppState) -> Result<CallToolResult, McpError> {
     let users = users::list(&state.db).await.map_err(internal)?;
     let out = users
         .into_iter()
-        .map(|u| json!({"handle": u.handle, "display_name": u.display_name, "admin": u.is_admin}))
+        .map(|u| {
+            json!({
+                "handle": u.handle,
+                "display_name": u.display_name,
+                "admin": u.is_admin,
+                "disabled": u.disabled,
+            })
+        })
         .collect::<Vec<_>>();
     ok(json!({ "users": out }))
+}
+
+/// Resolve the target of an admin user action, enforcing that it exists, is not
+/// the caller, and is not the last administrator.
+async fn admin_target(
+    state: &AppState,
+    caller_id: &str,
+    handle: &str,
+) -> Result<users::User, McpError> {
+    let target = users::find_by_handle(&state.db, handle)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| McpError::invalid_params(format!("no user with handle '{handle}'"), None))?;
+    if target.id == caller_id {
+        return Err(McpError::invalid_params(
+            "you cannot disable or delete your own account",
+            None,
+        ));
+    }
+    if target.is_admin && users::count_admins(&state.db).await.map_err(internal)? <= 1 {
+        return Err(McpError::invalid_params(
+            "cannot disable or delete the last administrator",
+            None,
+        ));
+    }
+    Ok(target)
+}
+
+async fn set_user_disabled(
+    state: &AppState,
+    caller_id: &str,
+    args: &JsonObject,
+    disabled: bool,
+) -> Result<CallToolResult, McpError> {
+    let handle = req_str(args, "handle")?;
+    if disabled {
+        let target = admin_target(state, caller_id, &handle).await?;
+        crate::web::deactivate_user(state, &target.id)
+            .await
+            .map_err(internal)?;
+    } else {
+        // Enabling has no self/last-admin hazard.
+        let target = users::find_by_handle(&state.db, &handle)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("no user with handle '{handle}'"), None)
+            })?;
+        users::set_disabled(&state.db, &target.id, false)
+            .await
+            .map_err(internal)?;
+    }
+    ok(json!({ "handle": handle, "disabled": disabled }))
+}
+
+async fn delete_user(
+    state: &AppState,
+    caller_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let handle = req_str(args, "handle")?;
+    let target = admin_target(state, caller_id, &handle).await?;
+    crate::web::purge_user(state, &target.id)
+        .await
+        .map_err(internal)?;
+    ok(json!({ "deleted": true, "handle": handle }))
 }
 
 async fn catalog_upsert(

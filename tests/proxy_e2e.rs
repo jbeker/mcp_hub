@@ -47,11 +47,20 @@ async fn spawn_hub() -> (String, AppState) {
     (base, state)
 }
 
-/// Connect an MCP client to the hub's `/mcp` endpoint with a bearer token.
-async fn connect(base: &str, token: String) -> RunningService<RoleClient, ()> {
+/// Try to connect an MCP client; returns the error instead of panicking so
+/// tests can assert that authentication is rejected.
+async fn try_connect(
+    base: &str,
+    token: String,
+) -> Result<RunningService<RoleClient, ()>, Box<dyn std::error::Error>> {
     let config =
         StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp")).auth_header(token);
-    serve_client((), StreamableHttpClientTransport::from_config(config))
+    Ok(serve_client((), StreamableHttpClientTransport::from_config(config)).await?)
+}
+
+/// Connect an MCP client to the hub's `/mcp` endpoint with a bearer token.
+async fn connect(base: &str, token: String) -> RunningService<RoleClient, ()> {
+    try_connect(base, token)
         .await
         .expect("MCP client should initialize through the proxy")
 }
@@ -480,6 +489,84 @@ async fn admin_invite_tools_round_trip() {
         .unwrap());
 
     let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn admin_can_disable_and_delete_users() {
+    let (base, state) = spawn_hub().await;
+    let admin = users::create(&state.db, "admin1", "alice", "Alice", true)
+        .await
+        .unwrap();
+    let bob = users::create(&state.db, "u2", "bob", "Bob", false)
+        .await
+        .unwrap();
+
+    let admin_token = state
+        .signer
+        .issue_access_token(&admin.id, "c", &format!("{base}/mcp"), "mcp", true, 3600)
+        .unwrap()
+        .0;
+    let bob_token = state
+        .signer
+        .issue_access_token(&bob.id, "c", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap()
+        .0;
+
+    // Bob can connect to start with.
+    assert!(try_connect(&base, bob_token.clone()).await.is_ok());
+
+    let admin_client = connect(&base, admin_token).await;
+
+    // The admin cannot disable themselves (last admin + self guard).
+    let self_disable = admin_client
+        .call_tool(CallToolRequestParam {
+            name: "hub__disable_user".into(),
+            arguments: args(serde_json::json!({"handle": "alice"})),
+        })
+        .await;
+    let blocked = match self_disable {
+        Err(_) => true,
+        Ok(r) => r.is_error == Some(true),
+    };
+    assert!(blocked, "admin must not disable their own/last-admin account");
+
+    // Disabling Bob revokes his proxy access immediately.
+    admin_client
+        .call_tool(CallToolRequestParam {
+            name: "hub__disable_user".into(),
+            arguments: args(serde_json::json!({"handle": "bob"})),
+        })
+        .await
+        .unwrap();
+    assert!(
+        try_connect(&base, bob_token.clone()).await.is_err(),
+        "disabled user's token must be rejected"
+    );
+
+    // Re-enabling restores access.
+    admin_client
+        .call_tool(CallToolRequestParam {
+            name: "hub__enable_user".into(),
+            arguments: args(serde_json::json!({"handle": "bob"})),
+        })
+        .await
+        .unwrap();
+    assert!(try_connect(&base, bob_token).await.is_ok());
+
+    // Deleting Bob removes the account.
+    admin_client
+        .call_tool(CallToolRequestParam {
+            name: "hub__delete_user".into(),
+            arguments: args(serde_json::json!({"handle": "bob"})),
+        })
+        .await
+        .unwrap();
+    assert!(users::find_by_handle(&state.db, "bob")
+        .await
+        .unwrap()
+        .is_none());
+
+    let _ = admin_client.cancel().await;
 }
 
 #[tokio::test]

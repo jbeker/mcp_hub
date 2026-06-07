@@ -104,7 +104,7 @@ pub async fn dashboard(
         badge = admin_badge,
         rows = rows,
         admin_section = if user.is_admin {
-            r#"<section><div class="row"><h2>Administration</h2><a href="/invites">Manage invites →</a></div></section>"#
+            r#"<section><div class="row"><h2>Administration</h2><span><a href="/invites">Invites</a> · <a href="/users">Users</a></span></div></section>"#
         } else {
             ""
         },
@@ -716,6 +716,33 @@ pub async fn account_page(
     }
     rows.push_str("</ul>");
 
+    // Connected MCP clients (OAuth) and browser sessions, each revocable.
+    let connections = crate::oauth::store::list_user_connections(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
+    let mut conn_rows = String::new();
+    if connections.is_empty() {
+        conn_rows.push_str(r#"<p class="muted">No MCP clients are connected.</p>"#);
+    } else {
+        conn_rows.push_str("<ul class=\"servers\">");
+        for c in &connections {
+            let name = c.client_name.clone().unwrap_or_else(|| c.client_id.clone());
+            conn_rows.push_str(&format!(
+                r#"<li><span><code>{name}</code></span>
+  <form method="post" action="/account/connections/revoke" data-confirm="Disconnect this client?">{csrf}<input type="hidden" name="client_id" value="{cid}"><button class="ghost danger">Disconnect</button></form></li>"#,
+                name = esc(&name),
+                csrf = csrf,
+                cid = esc(&c.client_id),
+            ));
+        }
+        conn_rows.push_str("</ul>");
+    }
+
+    let sessions = session::list_for_user(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
+    let other_sessions = sessions.len().saturating_sub(1);
+
     let body = format!(
         r#"<header class="row"><h1>Account</h1><a href="/">← Back</a></header>
 <p>Signed in as <strong>{handle}</strong></p>
@@ -725,11 +752,73 @@ pub async fn account_page(
   {rows}
   <button id="add-passkey-btn" type="button">Add a passkey</button>
   <p class="error" id="add-passkey-error"></p>
+</section>
+<section style="margin-top:18px">
+  <h2>Connected MCP clients</h2>
+  <p class="muted">Clients you have authorized to reach your MCP endpoint. Disconnecting revokes refresh access; any active token still works until it expires (≤15 min).</p>
+  {conn_rows}
+</section>
+<section style="margin-top:18px">
+  <h2>Browser sessions</h2>
+  <p class="muted">You have {n_sessions} active session(s){other}.</p>
+  {sign_out_others}
 </section>"#,
         handle = esc(&user.handle),
         rows = rows,
+        conn_rows = conn_rows,
+        n_sessions = sessions.len(),
+        other = if other_sessions > 0 {
+            format!(", including {other_sessions} other than this one")
+        } else {
+            String::new()
+        },
+        sign_out_others = if other_sessions > 0 {
+            format!(
+                r#"<form method="post" action="/account/sessions/revoke-others">{csrf}<button class="ghost">Sign out other sessions</button></form>"#,
+                csrf = csrf
+            )
+        } else {
+            String::new()
+        },
     );
     page("Account", &body).into_response()
+}
+
+/// `POST /account/sessions/revoke-others` — end every session but this one.
+pub async fn revoke_other_sessions(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let keep = session::current_session_id(&jar).unwrap_or_default();
+    let _ = session::delete_others(&state.db, &user.id, &keep).await;
+    Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RevokeConnectionForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub client_id: String,
+}
+
+/// `POST /account/connections/revoke` — disconnect one OAuth client.
+pub async fn revoke_connection(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<RevokeConnectionForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let _ =
+        crate::oauth::store::revoke_user_client(&state.db, &user.id, form.client_id.trim()).await;
+    Redirect::to("/account").into_response()
 }
 
 #[derive(Deserialize)]
@@ -775,6 +864,171 @@ pub async fn recover_page(MaybeUser(user): MaybeUser) -> Response {
 <p class="error" id="recover-error"></p>
 <p class="muted"><a href="/login">← Back to sign in</a></p>"#;
     page("Recover access", body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Users (admin)
+// ---------------------------------------------------------------------------
+
+/// `/users` — admin view: disable/enable/delete accounts.
+pub async fn users_page(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let all = users::list(&state.db).await.unwrap_or_default();
+    let admin_count = all.iter().filter(|u| u.is_admin).count();
+
+    let mut rows = String::new();
+    rows.push_str("<table class=\"invites\"><thead><tr><th>Handle</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>");
+    for u in &all {
+        let is_self = u.id == admin.id;
+        let last_admin = u.is_admin && admin_count <= 1;
+        let role = if u.is_admin { "admin" } else { "user" };
+        let status = if u.disabled { "disabled" } else { "active" };
+        // No destructive action on yourself or the last remaining admin.
+        let actions = if is_self || last_admin {
+            r#"<span class="muted">—</span>"#.to_string()
+        } else {
+            let toggle = if u.disabled {
+                ("/users/enable", "Enable")
+            } else {
+                ("/users/disable", "Disable")
+            };
+            format!(
+                r#"<form method="post" action="{ta}">{csrf}<input type="hidden" name="handle" value="{h}"><button class="ghost">{tl}</button></form>
+<form method="post" action="/users/delete" data-confirm="Delete this user and all their data?">{csrf}<input type="hidden" name="handle" value="{h}"><button class="ghost danger">Delete</button></form>"#,
+                ta = toggle.0,
+                tl = toggle.1,
+                csrf = csrf,
+                h = esc(&u.handle),
+            )
+        };
+        rows.push_str(&format!(
+            r#"<tr><td><code>{h}</code></td><td>{role}</td><td>{status}</td><td><div class="row">{actions}</div></td></tr>"#,
+            h = esc(&u.handle),
+            role = role,
+            status = status,
+            actions = actions,
+        ));
+    }
+    rows.push_str("</tbody></table>");
+
+    let body = format!(
+        r#"<header class="row"><h1>Users</h1><a href="/">← Back</a></header>
+<p class="muted">Disabling an account ends its sessions and revokes its tokens immediately; deleting also removes its servers and passkeys. You cannot act on your own account or the last admin.</p>
+{rows}"#,
+        rows = rows,
+    );
+    page("Users", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UserActionForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub handle: String,
+}
+
+/// Resolve a target user for an admin action, enforcing the shared guards:
+/// CSRF, admin caller, target exists, not self, not the last admin.
+async fn resolve_admin_target(
+    state: &AppState,
+    admin: &users::User,
+    jar: &SignedCookieJar,
+    form: &UserActionForm,
+) -> Result<users::User, Response> {
+    if !admin.is_admin {
+        return Err(admin_forbidden());
+    }
+    if !session::check_csrf(jar, &state.config.master_key, &form.csrf) {
+        return Err(forbidden());
+    }
+    let target = match users::find_by_handle(&state.db, form.handle.trim()).await {
+        Ok(Some(u)) => u,
+        _ => return Err(error_page("no user with that handle")),
+    };
+    if target.id == admin.id {
+        return Err(error_page("you cannot act on your own account here"));
+    }
+    if target.is_admin && users::count_admins(&state.db).await.unwrap_or(0) <= 1 {
+        return Err(error_page("cannot disable or delete the last administrator"));
+    }
+    Ok(target)
+}
+
+/// `POST /users/disable` — disable an account and revoke its access.
+pub async fn disable_user(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<UserActionForm>,
+) -> Response {
+    let target = match resolve_admin_target(&state, &admin, &jar, &form).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    if let Err(e) = deactivate_user(&state, &target.id).await {
+        return error_page(&e.to_string());
+    }
+    Redirect::to("/users").into_response()
+}
+
+/// `POST /users/enable` — re-enable a disabled account.
+pub async fn enable_user(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<UserActionForm>,
+) -> Response {
+    let target = match resolve_admin_target(&state, &admin, &jar, &form).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let _ = users::set_disabled(&state.db, &target.id, false).await;
+    Redirect::to("/users").into_response()
+}
+
+/// `POST /users/delete` — delete an account and all its data.
+pub async fn delete_user(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<UserActionForm>,
+) -> Response {
+    let target = match resolve_admin_target(&state, &admin, &jar, &form).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    if let Err(e) = purge_user(&state, &target.id).await {
+        return error_page(&e.to_string());
+    }
+    Redirect::to("/users").into_response()
+}
+
+/// Disable an account: set the flag, then end its sessions and tokens so the
+/// revocation takes effect immediately.
+pub async fn deactivate_user(state: &AppState, user_id: &str) -> anyhow::Result<()> {
+    users::set_disabled(&state.db, user_id, true).await?;
+    session::delete_all_for_user(&state.db, user_id).await?;
+    crate::oauth::store::revoke_all_user_tokens(&state.db, user_id).await?;
+    Ok(())
+}
+
+/// Delete an account and everything it owns. Database rows cascade; git
+/// environments live on disk, so remove those first.
+pub async fn purge_user(state: &AppState, user_id: &str) -> anyhow::Result<()> {
+    if let Ok(insts) = instances::list_for_user(&state.db, user_id).await {
+        for inst in insts {
+            crate::gitsrc::remove_env(&state.config.env_dir, &inst.id);
+        }
+    }
+    users::delete(&state.db, user_id).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

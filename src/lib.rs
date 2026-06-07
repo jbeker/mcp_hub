@@ -93,6 +93,13 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account", get(web::account_page))
         .route("/account/passkeys/add/start", post(wa::add_passkey_start))
         .route("/account/passkeys/remove", post(web::remove_passkey))
+        .route("/account/sessions/revoke-others", post(web::revoke_other_sessions))
+        .route("/account/connections/revoke", post(web::revoke_connection))
+        // User administration (admin)
+        .route("/users", get(web::users_page))
+        .route("/users/disable", post(web::disable_user))
+        .route("/users/enable", post(web::enable_user))
+        .route("/users/delete", post(web::delete_user))
         // Server management UI
         .route("/servers/catalog", get(web::catalog_page))
         .route("/servers/add", post(web::add_server))

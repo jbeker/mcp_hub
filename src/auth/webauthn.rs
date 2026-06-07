@@ -349,6 +349,9 @@ pub async fn recover_start(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(invalid)?;
+    if user.disabled {
+        return Err(invalid());
+    }
     if code.is_empty()
         || !invites::is_recovery_redeemable(&state.db, code, &user.id)
             .await
@@ -480,6 +483,11 @@ pub async fn login_start(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(unknown)?;
+    // A disabled account cannot sign in (same generic error, so being disabled
+    // is not distinguishable from not existing).
+    if user.disabled {
+        return Err(unknown());
+    }
 
     let passkeys = users::passkeys_for_user(&state.db, &user.id)
         .await

@@ -243,3 +243,63 @@ pub async fn revoke_family(pool: &SqlitePool, family_id: &str) -> Result<()> {
         .await?;
     Ok(())
 }
+
+/// One OAuth client a user has connected (an authorized MCP client).
+#[derive(Debug, Clone)]
+pub struct Connection {
+    pub client_id: String,
+    pub client_name: Option<String>,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
+/// List the OAuth clients a user has live refresh tokens for — i.e. the MCP
+/// clients currently connected to their account.
+pub async fn list_user_connections(pool: &SqlitePool, user_id: &str) -> Result<Vec<Connection>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT client_id, MIN(created_at), MAX(created_at) FROM oauth_refresh_tokens \
+         WHERE user_id = ? AND expires_at > ? GROUP BY client_id ORDER BY MAX(created_at) DESC",
+    )
+    .bind(user_id)
+    .bind(now_unix())
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (client_id, first_seen, last_seen) in rows {
+        // The human-friendly name comes from the client's DCR metadata.
+        let client_name = get_client(pool, &client_id).await?.and_then(|c| {
+            c.metadata
+                .get("client_name")
+                .and_then(|v| v.as_str().map(String::from))
+        });
+        out.push(Connection {
+            client_id,
+            client_name,
+            first_seen,
+            last_seen,
+        });
+    }
+    Ok(out)
+}
+
+/// Revoke a single connection: delete the user's refresh tokens for one client.
+/// Outstanding access tokens (short-lived JWTs) expire on their own within the
+/// access-token TTL. Returns the number of tokens removed.
+pub async fn revoke_user_client(pool: &SqlitePool, user_id: &str, client_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM oauth_refresh_tokens WHERE user_id = ? AND client_id = ?")
+        .bind(user_id)
+        .bind(client_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Revoke every refresh token for a user (used when disabling the account).
+pub async fn revoke_all_user_tokens(pool: &SqlitePool, user_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM oauth_refresh_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
