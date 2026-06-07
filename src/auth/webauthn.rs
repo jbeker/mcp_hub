@@ -258,19 +258,19 @@ pub async fn login_start(
     Json(req): Json<LoginStart>,
 ) -> Result<(SignedCookieJar, Json<RequestChallengeResponse>), ApiError> {
     let handle = req.handle.trim();
+    // Use one generic error for both "unknown handle" and "no passkeys" so the
+    // endpoint does not reveal which handles exist (user enumeration).
+    let unknown = || ApiError::new(StatusCode::UNAUTHORIZED, "could not start sign-in");
     let user = users::find_by_handle(&state.db, handle)
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "no such account"))?;
+        .ok_or_else(unknown)?;
 
     let passkeys = users::passkeys_for_user(&state.db, &user.id)
         .await
         .map_err(ApiError::from)?;
     if passkeys.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "no passkeys registered for this account",
-        ));
+        return Err(unknown());
     }
 
     let (rcr, auth_state) = state

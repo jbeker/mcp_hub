@@ -99,6 +99,37 @@ async fn first_user_registration_issues_challenge() {
 }
 
 #[tokio::test]
+async fn login_start_does_not_enumerate_users() {
+    let state = test_state().await;
+    // An existing account with no passkeys, and a nonexistent handle, must
+    // produce the identical response so handles cannot be probed.
+    users::create(&state.db, "u1", "realuser", "Real", false)
+        .await
+        .unwrap();
+
+    let call = |app: axum::Router, handle: &str| {
+        let body = format!(r#"{{"handle":"{handle}"}}"#);
+        app.oneshot(
+            Request::post("/auth/login/start")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+
+    let r1 = call(app(state.clone()), "realuser").await.unwrap();
+    let s1 = r1.status();
+    let b1 = body_string(r1).await;
+    let r2 = call(app(state), "ghost").await.unwrap();
+    let s2 = r2.status();
+    let b2 = body_string(r2).await;
+
+    assert_eq!(s1, StatusCode::UNAUTHORIZED);
+    assert_eq!(s1, s2);
+    assert_eq!(b1, b2, "responses must be indistinguishable");
+}
+
+#[tokio::test]
 async fn registration_closed_after_first_user() {
     let state = test_state().await;
     // Simulate an existing account; open registration is off by default.
