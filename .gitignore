@@ -4,3 +4,6 @@
 *.db-wal
 *.db-shm
 .env
+# Deployment compose lives outside the repo (kept private).
+docker-compose.yml
+docker-compose.yaml
