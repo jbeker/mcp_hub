@@ -18,6 +18,7 @@ fn test_config() -> Config {
         master_key: [3u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
+        seed_catalog: true,
         limits: Limits::default(),
     }
 }

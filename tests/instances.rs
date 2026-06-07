@@ -13,19 +13,35 @@ async fn pool() -> SqlitePool {
 #[tokio::test]
 async fn seed_builtins_populates_catalog() {
     let pool = pool().await;
-    catalog::seed_builtins(&pool).await.unwrap();
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
     let entries = catalog::list(&pool).await.unwrap();
     assert!(entries.iter().any(|e| e.slug == "zabbix"));
     assert!(entries.iter().any(|e| e.slug == "homeassistant"));
 
     // Seeding twice must be idempotent (upsert by slug, no duplicates).
-    catalog::seed_builtins(&pool).await.unwrap();
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
     let again = catalog::list(&pool).await.unwrap();
     assert_eq!(entries.len(), again.len());
 
     let zbx = catalog::get_by_slug(&pool, "zabbix").await.unwrap().unwrap();
     assert_eq!(zbx.transport, "stdio");
     assert!(zbx.secret_schema.iter().any(|f| f.name == "ZABBIX_TOKEN" && f.secret));
+}
+
+#[tokio::test]
+async fn reseeding_does_not_clobber_admin_changes() {
+    let pool = pool().await;
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
+    let before = catalog::list(&pool).await.unwrap().len();
+
+    // An admin deletes one entry...
+    let zbx = catalog::get_by_slug(&pool, "zabbix").await.unwrap().unwrap();
+    catalog::delete(&pool, &zbx.id).await.unwrap();
+
+    // ...and a later startup must not resurrect it (catalog is non-empty).
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
+    assert!(catalog::get_by_slug(&pool, "zabbix").await.unwrap().is_none());
+    assert_eq!(catalog::list(&pool).await.unwrap().len(), before - 1);
 }
 
 #[tokio::test]
@@ -40,7 +56,7 @@ async fn namespace_validation() {
 #[tokio::test]
 async fn create_instance_and_reject_duplicate_namespace() {
     let pool = pool().await;
-    catalog::seed_builtins(&pool).await.unwrap();
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
     let user = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
     let zbx = catalog::get_by_slug(&pool, "zabbix").await.unwrap().unwrap();
 
@@ -62,7 +78,7 @@ async fn create_instance_and_reject_duplicate_namespace() {
 #[tokio::test]
 async fn secrets_encrypt_and_resolve_to_env() {
     let pool = pool().await;
-    catalog::seed_builtins(&pool).await.unwrap();
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
     let secrets = SecretBox::new(&[5u8; 32]);
     let user = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
     let zbx = catalog::get_by_slug(&pool, "zabbix").await.unwrap().unwrap();
@@ -117,7 +133,7 @@ async fn custom_definition_resolves() {
 #[tokio::test]
 async fn wrong_user_cannot_access_instance() {
     let pool = pool().await;
-    catalog::seed_builtins(&pool).await.unwrap();
+    catalog::seed_builtins_if_empty(&pool).await.unwrap();
     let a = users::create(&pool, "a", "alice", "Alice", false).await.unwrap();
     let _b = users::create(&pool, "b", "bob", "Bob", false).await.unwrap();
     let zbx = catalog::get_by_slug(&pool, "zabbix").await.unwrap().unwrap();

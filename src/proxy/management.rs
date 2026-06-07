@@ -288,12 +288,23 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
         let secrets = instances::secret_names(&state.db, &i.id)
             .await
             .map_err(internal)?;
+        // The exact launch command for stdio/git backends (None for http).
+        let command = match instances::resolve_def(&state.db, &i).await {
+            Ok(def) => crate::gitsrc::resolved_command(&state.config.env_dir, &i, &def)
+                .map(|(program, args)| {
+                    let mut v = vec![program];
+                    v.extend(args);
+                    v
+                }),
+            Err(_) => None,
+        };
         out.push(json!({
             "namespace": i.namespace,
             "display_name": i.display_name,
             "enabled": i.enabled,
             "config": i.config,
             "secrets_set": secrets,
+            "command": command,
             "build_status": i.build_status,
             "built_commit": i.built_commit,
             "runtime_status": i.runtime_status,

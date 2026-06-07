@@ -104,7 +104,7 @@ pub async fn dashboard(
         badge = admin_badge,
         rows = rows,
         admin_section = if user.is_admin {
-            r#"<section><div class="row"><h2>Administration</h2><span><a href="/invites">Invites</a> · <a href="/users">Users</a></span></div></section>"#
+            r#"<section><div class="row"><h2>Administration</h2><span><a href="/catalog">Catalog</a> · <a href="/invites">Invites</a> · <a href="/users">Users</a></span></div></section>"#
         } else {
             ""
         },
@@ -324,6 +324,7 @@ pub async fn server_detail(
         r#"<header class="row"><h1>{name}</h1><a href="/">← Back</a></header>
 <p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
 {runtime}
+{command}
 <form method="post" action="/servers/{id}/config">
   {csrf}
   {fields}
@@ -339,6 +340,7 @@ pub async fn server_detail(
         transport = esc(&def.transport),
         status = if inst.enabled { "enabled" } else { "disabled" },
         runtime = runtime_banner(&inst),
+        command = command_line(&state, &inst, &def),
         id = esc(&inst.id),
         csrf = csrf,
         fields = fields,
@@ -346,6 +348,40 @@ pub async fn server_detail(
         toggle = toggle,
     );
     page(&inst.display_name, &body).into_response()
+}
+
+/// For stdio/git backends, show the exact command that will be executed.
+fn command_line(
+    state: &AppState,
+    inst: &instances::Instance,
+    def: &catalog::ServerDef,
+) -> String {
+    match crate::gitsrc::resolved_command(&state.config.env_dir, inst, def) {
+        Some((program, args)) => {
+            // Quote any argument containing whitespace so the line is unambiguous.
+            let mut parts = vec![program];
+            parts.extend(args);
+            let rendered = parts
+                .iter()
+                .map(|p| {
+                    if p.chars().any(char::is_whitespace) {
+                        format!("\"{p}\"")
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                r#"<p class="muted">Command</p><pre class="cmd"><code>{}</code></pre>"#,
+                esc(&rendered)
+            )
+        }
+        // git source not built yet → nothing exact to show (the Source section
+        // already explains it needs a build).
+        None if def.transport == "git" => String::new(),
+        None => String::new(),
+    }
 }
 
 /// Render the backend's last connection outcome as a coloured banner.
@@ -893,6 +929,328 @@ pub async fn recover_page(MaybeUser(user): MaybeUser) -> Response {
 <p class="error" id="recover-error"></p>
 <p class="muted"><a href="/login">← Back to sign in</a></p>"#;
     page("Recover access", body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Catalog management (admin)
+// ---------------------------------------------------------------------------
+
+/// `/catalog` — admin list of catalog entries with edit/delete.
+pub async fn catalog_admin(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let entries = catalog::list(&state.db).await.unwrap_or_default();
+
+    let mut rows = String::new();
+    if entries.is_empty() {
+        rows.push_str(r#"<p class="muted">The catalog is empty. Add an entry to make a server available to your users.</p>"#);
+    } else {
+        rows.push_str("<table class=\"invites\"><thead><tr><th>Slug</th><th>Name</th><th>Transport</th><th>Status</th><th></th></tr></thead><tbody>");
+        for e in &entries {
+            let status = if e.supported { "supported" } else { "unsupported" };
+            rows.push_str(&format!(
+                r#"<tr><td><code>{slug}</code></td><td>{name}</td><td>{transport}</td><td>{status}</td>
+<td><div class="row"><a href="/catalog/{id}/edit">Edit</a>
+<form method="post" action="/catalog/{id}/delete" data-confirm="Delete this catalog entry? (existing user instances are unaffected)">{csrf}<button class="ghost danger">Delete</button></form></div></td></tr>"#,
+                slug = esc(&e.slug),
+                name = esc(&e.name),
+                transport = esc(&e.transport),
+                status = status,
+                id = esc(&e.id),
+                csrf = csrf,
+            ));
+        }
+        rows.push_str("</tbody></table>");
+    }
+
+    let body = format!(
+        r#"<header class="row"><h1>Catalog</h1><a href="/">← Back</a></header>
+<p class="muted">Entries available to your users. Editing an entry changes how new connections launch; existing instances pick up changes on their next session.</p>
+<p><a href="/catalog/new">+ New catalog entry</a></p>
+{rows}"#,
+        rows = rows,
+    );
+    page("Catalog", &body).into_response()
+}
+
+/// `/catalog/new` — blank entry form.
+pub async fn catalog_new(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    page("New catalog entry", &catalog_form("New catalog entry", &csrf, None)).into_response()
+}
+
+/// `/catalog/{id}/edit` — edit an existing entry.
+pub async fn catalog_edit(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+    Path(id): Path<String>,
+) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let Some(entry) = catalog::get(&state.db, &id).await.ok().flatten() else {
+        return error_page("catalog entry not found");
+    };
+    page(
+        &format!("Edit {}", entry.name),
+        &catalog_form(&format!("Edit {}", entry.slug), &csrf, Some(&entry)),
+    )
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CatalogForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub runtime: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub git_ref: String,
+    #[serde(default)]
+    pub entry: String,
+    #[serde(default)]
+    pub module: String,
+    #[serde(default)]
+    pub secret_schema: String,
+    #[serde(default)]
+    pub supported: Option<String>,
+}
+
+/// `POST /catalog/save` — create or update an entry.
+pub async fn catalog_save(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<CatalogForm>,
+) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let server = match catalog_from_form(&state, &form, &admin.id).await {
+        Ok(s) => s,
+        Err(e) => return error_page(&e),
+    };
+    match catalog::upsert(&state.db, &server, Some(&admin.id)).await {
+        Ok(_) => Redirect::to("/catalog").into_response(),
+        Err(e) => error_page(&e.to_string()),
+    }
+}
+
+/// `POST /catalog/{id}/delete` — remove an entry (user instances are untouched).
+pub async fn catalog_delete(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let _ = catalog::delete(&state.db, &id).await;
+    Redirect::to("/catalog").into_response()
+}
+
+/// Build (and validate) a `CatalogServer` from the submitted form.
+async fn catalog_from_form(
+    state: &AppState,
+    form: &CatalogForm,
+    _admin_id: &str,
+) -> Result<catalog::CatalogServer, String> {
+    let slug = form.slug.trim().to_string();
+    let name = form.name.trim().to_string();
+    if slug.is_empty() || name.is_empty() {
+        return Err("slug and name are required".into());
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err("slug may only contain lowercase letters, digits, '-' and '_'".into());
+    }
+    let transport = form.transport.trim().to_string();
+    if !matches!(transport.as_str(), "stdio" | "http" | "git") {
+        return Err("transport must be stdio, http or git".into());
+    }
+
+    // Reject a new entry whose slug collides; preserve is_builtin when editing.
+    let existing = catalog::get_by_slug(&state.db, &slug).await.ok().flatten();
+    let is_new = form.id.trim().is_empty();
+    if is_new && existing.is_some() {
+        return Err(format!("a catalog entry with slug '{slug}' already exists"));
+    }
+    let is_builtin = existing.as_ref().map(|e| e.is_builtin).unwrap_or(false);
+
+    let args: Vec<String> = form
+        .args
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let secret_schema: Vec<catalog::SecretField> = {
+        let raw = form.secret_schema.trim();
+        if raw.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(raw)
+                .map_err(|e| format!("secret schema must be a JSON array: {e}"))?
+        }
+    };
+
+    let opt = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+
+    if transport == "git" && opt(&form.repo).is_none() {
+        return Err("a git entry needs a repository URL".into());
+    }
+    if transport == "git" && opt(&form.entry).is_none() && opt(&form.module).is_none() {
+        return Err("a git entry needs an entry script or a module".into());
+    }
+
+    Ok(catalog::CatalogServer {
+        id: form.id.trim().to_string(),
+        slug,
+        name,
+        description: form.description.trim().to_string(),
+        transport,
+        command: opt(&form.command),
+        args,
+        url: opt(&form.url),
+        runtime: form.runtime.trim().to_string(),
+        secret_schema,
+        repo: opt(&form.repo),
+        git_ref: opt(&form.git_ref),
+        entry: opt(&form.entry),
+        module: opt(&form.module),
+        is_builtin,
+        supported: form.supported.is_some(),
+    })
+}
+
+/// Render the create/edit form. `entry` is `None` for a new entry.
+fn catalog_form(title: &str, csrf: &str, entry: Option<&catalog::CatalogServer>) -> String {
+    let e = entry;
+    let v = |f: fn(&catalog::CatalogServer) -> String| e.map(f).unwrap_or_default();
+    let slug = v(|e| e.slug.clone());
+    let name = v(|e| e.name.clone());
+    let description = v(|e| e.description.clone());
+    let transport = e.map(|e| e.transport.clone()).unwrap_or_else(|| "stdio".into());
+    let runtime = v(|e| e.runtime.clone());
+    let command = v(|e| e.command.clone().unwrap_or_default());
+    let args = v(|e| e.args.join("\n"));
+    let url = v(|e| e.url.clone().unwrap_or_default());
+    let repo = v(|e| e.repo.clone().unwrap_or_default());
+    let git_ref = v(|e| e.git_ref.clone().unwrap_or_default());
+    let entry_script = v(|e| e.entry.clone().unwrap_or_default());
+    let module = v(|e| e.module.clone().unwrap_or_default());
+    let schema = e
+        .map(|e| serde_json::to_string_pretty(&e.secret_schema).unwrap_or_default())
+        .unwrap_or_else(|| "[]".into());
+    let supported = e.map(|e| e.supported).unwrap_or(true);
+    let id = v(|e| e.id.clone());
+    // Slug is the catalog key; lock it when editing so a rename can't orphan rows.
+    let slug_attr = if e.is_some() { "readonly" } else { "required" };
+    let opt = |t: &str, sel: &str| {
+        if t == sel {
+            "selected"
+        } else {
+            ""
+        }
+    };
+
+    format!(
+        r#"<header class="row"><h1>{title}</h1><a href="/catalog">← Catalog</a></header>
+<form method="post" action="/catalog/save">
+  {csrf}
+  <input type="hidden" name="id" value="{id}">
+  <label>Slug<input name="slug" value="{slug}" {slug_attr}></label>
+  <label>Name<input name="name" value="{name}" required></label>
+  <label>Description<input name="description" value="{description}"></label>
+  <label>Transport
+    <select name="transport">
+      <option value="stdio" {s_stdio}>stdio (subprocess)</option>
+      <option value="http" {s_http}>http (remote)</option>
+      <option value="git" {s_git}>git (built from a repo)</option>
+    </select>
+  </label>
+  <label>Runtime (informational, e.g. node / python / remote)<input name="runtime" value="{runtime}"></label>
+  <p class="muted"><strong>stdio</strong> — command + args run as a subprocess:</p>
+  <label>Command<input name="command" value="{command}" placeholder="uvx"></label>
+  <label>Args (one per line)<textarea name="args" rows="3">{args}</textarea></label>
+  <p class="muted"><strong>http</strong> — remote endpoint (users can override per instance with MCP_URL):</p>
+  <label>URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
+  <p class="muted"><strong>git</strong> — built once into a virtualenv on the data volume:</p>
+  <label>Repository URL<input name="repo" value="{repo}" placeholder="https://github.com/you/mcp"></label>
+  <label>Git ref (branch/tag)<input name="git_ref" value="{git_ref}" placeholder="main"></label>
+  <label>Entry script<input name="entry" value="{entry_script}" placeholder="my-mcp"></label>
+  <label>or Module (python -m)<input name="module" value="{module}"></label>
+  <label>Secret schema (JSON array of {{name,label,secret,required}})<textarea name="secret_schema" rows="6">{schema}</textarea></label>
+  <label class="checkbox"><input type="checkbox" name="supported" {supported_attr}> Supported (uncheck to hide from users)</label>
+  <button type="submit">Save</button>
+</form>"#,
+        title = esc(title),
+        csrf = csrf,
+        id = esc(&id),
+        slug = esc(&slug),
+        slug_attr = slug_attr,
+        name = esc(&name),
+        description = esc(&description),
+        s_stdio = opt(&transport, "stdio"),
+        s_http = opt(&transport, "http"),
+        s_git = opt(&transport, "git"),
+        runtime = esc(&runtime),
+        command = esc(&command),
+        args = esc(&args),
+        url = esc(&url),
+        repo = esc(&repo),
+        git_ref = esc(&git_ref),
+        entry_script = esc(&entry_script),
+        module = esc(&module),
+        schema = esc(&schema),
+        supported_attr = if supported { "checked" } else { "" },
+    )
 }
 
 // ---------------------------------------------------------------------------

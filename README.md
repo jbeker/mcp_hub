@@ -62,6 +62,7 @@ All configuration is via environment variables:
 | `HUB_RP_ID` | no | host of base URL | WebAuthn relying-party id (registrable domain). |
 | `HUB_BOOTSTRAP_ADMIN` | no | — | If set, the first registration must use this handle (and becomes admin). |
 | `HUB_ALLOW_OPEN_REGISTRATION` | no | `false` | Escape hatch: when `true`, anyone may self-register **without an invite**. Leave `false` to keep registration invite-only. |
+| `HUB_SEED_CATALOG` | no | `true` | Seed the example catalog into an **empty** catalog on first boot. Never overwrites edited/deleted entries. Set `false` to start empty and build entries in the admin Catalog UI. |
 | `HUB_DB_PATH` | no | `/data/hub.db` | SQLite database path. |
 | `HUB_ENV_DIR` | no | `/data/envs` | Where prebuilt virtualenvs for git-sourced servers live (keep on the data volume). |
 | `HUB_LISTEN` | no | `0.0.0.0:8080` | Bind address. |
@@ -95,13 +96,24 @@ their resources as `hub://zabbix/…`, and the
 | `hub__add_server` | user | Add a catalog server |
 | `hub__configure` / `hub__set_secret` | user | Provide credentials (for an http remote, set `MCP_URL` to your own endpoint) |
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage instances |
+| `hub__catalog_upsert` / `hub__catalog_remove` | admin | Manage the catalog (also a web UI at `/catalog`) |
 | `hub__list_users` | admin | List users (with admin/disabled status) |
 | `hub__disable_user` / `hub__enable_user` / `hub__delete_user` | admin | Suspend or remove an account |
-| `hub__catalog_upsert` / `hub__catalog_remove` | admin | Manage the catalog |
 | `hub__create_invite` / `hub__list_invites` / `hub__revoke_invite` | admin | Manage invite codes |
 | `hub__create_recovery` | admin | Issue a one-time account-recovery code |
 
 Newly added/enabled servers take effect on the next client session.
+
+## Managing the catalog
+
+The catalog is **admin-owned**. Manage it in the web UI under **Catalog**
+(`/catalog`) — add, edit, or delete entries of any transport (stdio, http, git),
+including their secret schema — or with the `hub__catalog_*` tools.
+
+The bundled examples are seeded **only into an empty catalog on first boot** and
+never overwrite your changes, so deletions and edits stick across restarts. Set
+`HUB_SEED_CATALOG=false` to start with a blank catalog and build every entry
+yourself. Deleting a catalog entry leaves users' existing instances untouched.
 
 ## Inviting users
 

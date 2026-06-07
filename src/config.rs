@@ -29,6 +29,9 @@ pub struct Config {
     pub bootstrap_admin: Option<String>,
     /// Whether anyone may self-register after the first (admin) account exists.
     pub allow_open_registration: bool,
+    /// Seed the example catalog on a *fresh* (empty) database. Never overwrites
+    /// existing entries. Set false to start with an empty, UI-managed catalog.
+    pub seed_catalog: bool,
     /// Backend lifecycle limits.
     pub limits: Limits,
 }
@@ -78,6 +81,11 @@ impl Config {
         let allow_open_registration = opt("HUB_ALLOW_OPEN_REGISTRATION")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
+        // Default true so a fresh install has example entries to start from; the
+        // seed only runs against an empty catalog, so it is harmless thereafter.
+        let seed_catalog = opt("HUB_SEED_CATALOG")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(true);
 
         let mut limits = Limits::default();
         if let Some(v) = opt_parse("HUB_MAX_BACKENDS_PER_USER")? {
@@ -99,6 +107,7 @@ impl Config {
             master_key,
             bootstrap_admin,
             allow_open_registration,
+            seed_catalog,
             limits,
         })
     }

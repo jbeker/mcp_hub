@@ -30,7 +30,7 @@ h1 { margin: 0 0 16px; font-size: 22px; }
 h2 { font-size: 16px; margin: 24px 0 8px; }
 .row { display: flex; align-items: center; justify-content: space-between; }
 label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 13px; }
-input {
+input, textarea, select {
   width: 100%;
   padding: 10px 12px;
   background: #11141a;
@@ -39,6 +39,9 @@ input {
   color: #e6e8ed;
   font-size: 15px;
 }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; resize: vertical; }
+label.checkbox { display: flex; align-items: center; gap: 8px; }
+label.checkbox input { width: auto; }
 button {
   margin-top: 18px;
   width: 100%;
@@ -114,3 +117,5 @@ code.invite-code {
 .status-ok { background: rgba(80, 200, 120, 0.15); color: #2e7d52; }
 .status-warn { background: rgba(230, 180, 60, 0.15); color: #8a6d1a; }
 .status-danger { background: rgba(255, 107, 107, 0.15); color: var(--error); }
+pre.cmd { background: #11141a; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+pre.cmd code { background: none; padding: 0; font-size: 13px; }

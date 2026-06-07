@@ -31,6 +31,27 @@ pub fn is_git_source(def: &ServerDef) -> bool {
     def.transport == "git"
 }
 
+/// The exact `(program, args)` a stdio or git backend will be launched with,
+/// for display in the UI. Returns `None` for http backends and for a git source
+/// that has not been built yet (its launch path does not exist).
+pub fn resolved_command(
+    env_dir: &str,
+    inst: &Instance,
+    def: &ServerDef,
+) -> Option<(String, Vec<String>)> {
+    if is_git_source(def) {
+        let ready = inst.build_status == "ready" && env_path(env_dir, &inst.id).exists();
+        if !ready {
+            return None;
+        }
+        launch_command(env_dir, &inst.id, def).ok()
+    } else if def.transport == "stdio" {
+        Some((def.command.clone()?, def.args.clone()))
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation (these values become process arguments, so keep them tight)
 // ---------------------------------------------------------------------------

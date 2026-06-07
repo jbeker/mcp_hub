@@ -36,6 +36,7 @@ async fn spawn_hub() -> (String, AppState) {
         master_key: [1u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
+        seed_catalog: true,
         limits: Limits::default(),
     };
     let state = AppState::new(config, pool).await.unwrap();
@@ -187,6 +188,18 @@ async fn proxy_aggregates_a_stdio_backend() {
         })
         .await;
     assert!(bad.is_err());
+
+    // The exact launch command is reported for stdio backends.
+    let listed = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_my_servers".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(json.contains("\"command\""), "got {json}");
+    assert!(json.contains("mock_mcp_server"), "got {json}");
 
     let _ = client.cancel().await;
 }

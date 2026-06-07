@@ -256,8 +256,22 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Seed the built-in catalog from the embedded definitions. Idempotent.
-pub async fn seed_builtins(pool: &SqlitePool) -> Result<()> {
+/// Number of catalog entries.
+pub async fn count(pool: &SqlitePool) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_servers")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+/// Seed the built-in catalog from the embedded definitions, but **only when the
+/// catalog is empty** so it never clobbers entries an admin has edited or
+/// deleted. A fresh install gets the examples as a starting point; from then on
+/// the catalog is fully owned by the admin (manage it in the web UI).
+pub async fn seed_builtins_if_empty(pool: &SqlitePool) -> Result<()> {
+    if count(pool).await? > 0 {
+        return Ok(());
+    }
     const BUILTINS: &str = include_str!("../catalog/builtins.json");
     let mut servers: Vec<CatalogServer> =
         serde_json::from_str(BUILTINS).context("parsing embedded builtins.json")?;
@@ -268,6 +282,6 @@ pub async fn seed_builtins(pool: &SqlitePool) -> Result<()> {
         }
         upsert(pool, s, None).await?;
     }
-    tracing::info!(count = servers.len(), "seeded built-in catalog");
+    tracing::info!(count = servers.len(), "seeded built-in catalog (empty catalog)");
     Ok(())
 }
