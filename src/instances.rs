@@ -12,6 +12,21 @@ use crate::util::{new_id, now_unix};
 /// Namespace reserved for the built-in management interface (see M6).
 pub const RESERVED_NAMESPACE: &str = "hub";
 
+/// Reserved per-instance config key that sets/overrides an http backend's
+/// remote URL. Lets each user point a shared `http` catalog entry at their own
+/// endpoint instead of the catalog's default.
+pub const URL_KEY: &str = "MCP_URL";
+
+/// Validate a user-supplied remote backend URL (http/https only).
+pub fn validate_remote_url(url: &str) -> Result<()> {
+    let parsed =
+        url::Url::parse(url.trim()).map_err(|_| anyhow!("'{url}' is not a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("remote URL must be an http(s) URL");
+    }
+    Ok(())
+}
+
 /// A user-configured server instance.
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -297,4 +312,18 @@ pub async fn resolved_env(
         env.insert(key, value);
     }
     Ok(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_remote_url;
+
+    #[test]
+    fn remote_url_validation() {
+        assert!(validate_remote_url("https://memory.example.com/mcp").is_ok());
+        assert!(validate_remote_url("http://10.0.0.5:8080/mcp").is_ok());
+        assert!(validate_remote_url("ftp://example.com").is_err());
+        assert!(validate_remote_url("not a url").is_err());
+        assert!(validate_remote_url("").is_err());
+    }
 }

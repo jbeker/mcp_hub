@@ -570,6 +570,77 @@ async fn admin_can_disable_and_delete_users() {
 }
 
 #[tokio::test]
+async fn http_remote_url_is_configurable() {
+    let (base, state) = spawn_hub().await;
+    let admin = users::create(&state.db, "admin1", "alice", "Alice", true)
+        .await
+        .unwrap();
+    let (token, _) = state
+        .signer
+        .issue_access_token(&admin.id, "c", &format!("{base}/mcp"), "mcp", true, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // 'memory' is a built-in http remote.
+    client
+        .call_tool(CallToolRequestParam {
+            name: "hub__add_server".into(),
+            arguments: args(serde_json::json!({"catalog_slug": "memory", "namespace": "mem"})),
+        })
+        .await
+        .unwrap();
+
+    // The per-instance remote URL is settable via MCP_URL even though it is not
+    // in the catalog's secret_schema.
+    let set_url = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__configure".into(),
+            arguments: args(serde_json::json!({
+                "namespace": "mem",
+                "values": {"MCP_URL": "https://my-memory.example.net/mcp"}
+            })),
+        })
+        .await
+        .unwrap();
+    assert_ne!(set_url.is_error, Some(true));
+
+    // A non-URL value is rejected...
+    let bad_url = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__configure".into(),
+            arguments: args(serde_json::json!({
+                "namespace": "mem", "values": {"MCP_URL": "not-a-url"}
+            })),
+        })
+        .await;
+    assert!(bad_url.is_err() || bad_url.unwrap().is_error == Some(true));
+
+    // ...and an undeclared, non-URL key is still rejected (schema restriction).
+    let injected = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__configure".into(),
+            arguments: args(serde_json::json!({
+                "namespace": "mem", "values": {"PYTHONSTARTUP": "/tmp/x"}
+            })),
+        })
+        .await;
+    assert!(injected.is_err() || injected.unwrap().is_error == Some(true));
+
+    // The URL shows up in the instance config.
+    let listed = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_my_servers".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(json.contains("my-memory.example.net"), "got {json}");
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn non_admin_cannot_use_admin_tools() {
     let (base, state) = spawn_hub().await;
     let user = users::create(&state.db, "u2", "bob", "Bob", false)

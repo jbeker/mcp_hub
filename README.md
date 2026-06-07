@@ -12,7 +12,7 @@ Run one hub, let your users sign in with **passkeys**, pick MCP servers from a *
 - **Built-in management interface**: a reserved `hub__` toolset on the same endpoint, so the hub can be configured programmatically from any MCP client.
 - **Standards-based auth**: passkeys (WebAuthn) authenticate humans; the hub is its own OAuth 2.1 Authorization Server (PKCE, Dynamic Client Registration, ES256 JWTs, JWKS) for MCP clients.
 
-Backends can be **stdio** servers (launched as subprocesses with `uvx`/`npx`) or **remote HTTP** servers (proxied with a static auth header).
+Backends can be **stdio** servers (launched as subprocesses with `uvx`/`npx`) or **remote HTTP** servers (proxied with a static auth header). For an HTTP remote, each user sets the endpoint themselves — the **Remote URL** field on the server page, or `MCP_URL` via `hub__configure` — so one catalog entry can front everyone's own server.
 
 ## Architecture
 
@@ -93,7 +93,7 @@ their resources as `hub://zabbix/…`, and the
 | `hub__list_catalog` | user | Browse the catalog |
 | `hub__list_my_servers` | user | Your instances + each backend's last connection status (`runtime_status`/`runtime_detail`) |
 | `hub__add_server` | user | Add a catalog server |
-| `hub__configure` / `hub__set_secret` | user | Provide credentials |
+| `hub__configure` / `hub__set_secret` | user | Provide credentials (for an http remote, set `MCP_URL` to your own endpoint) |
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage instances |
 | `hub__list_users` | admin | List users (with admin/disabled status) |
 | `hub__disable_user` / `hub__enable_user` / `hub__delete_user` | admin | Suspend or remove an account |

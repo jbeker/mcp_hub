@@ -40,7 +40,8 @@ pub fn tools(admin: bool) -> Vec<Tool> {
         ),
         tool(
             "hub__configure",
-            "Set one or more configuration/secret values on one of your servers.",
+            "Set one or more configuration/secret values on one of your servers. \
+             For an http remote, set 'MCP_URL' to point it at your own endpoint.",
             schema(
                 json!({
                     "namespace": {"type": "string"},
@@ -349,7 +350,16 @@ async fn configure(
         let value = val.as_str().ok_or_else(|| {
             McpError::invalid_params(format!("value for '{key}' must be a string"), None)
         })?;
-        // Only keys declared by the server's schema may be set. This keys
+        // The remote URL of an http backend is settable on any http instance
+        // (it is a connection target, not injected process environment).
+        if key == instances::URL_KEY && def.transport == "http" {
+            instances::validate_remote_url(value).map_err(bad_request)?;
+            instances::set_config_value(&state.db, &inst.id, key, value)
+                .await
+                .map_err(internal)?;
+            continue;
+        }
+        // Only keys declared by the server's schema may be set. These keys
         // become process environment variables, so accepting arbitrary names
         // would let a user inject PYTHONSTARTUP / NODE_OPTIONS / LD_PRELOAD etc.
         let field = def.secret_schema.iter().find(|f| &f.name == key).ok_or_else(|| {

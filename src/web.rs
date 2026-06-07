@@ -244,6 +244,20 @@ pub async fn server_detail(
     let set_secrets = instances::secret_names(&state.db, &inst.id).await.unwrap_or_default();
 
     let mut fields = String::new();
+    // http remotes get a per-instance URL field (defaulting to the catalog URL).
+    if def.transport == "http" {
+        let current = inst
+            .config
+            .get(instances::URL_KEY)
+            .cloned()
+            .or_else(|| def.url.clone())
+            .unwrap_or_default();
+        fields.push_str(&format!(
+            r#"<label>Remote URL *<input name="{key}" value="{val}" placeholder="https://your-server.example.com/mcp"></label>"#,
+            key = instances::URL_KEY,
+            val = esc(&current),
+        ));
+    }
     for f in &def.secret_schema {
         let label = if f.label.is_empty() { &f.name } else { &f.label };
         let req = if f.required { " *" } else { "" };
@@ -271,7 +285,7 @@ pub async fn server_detail(
             ));
         }
     }
-    if def.secret_schema.is_empty() {
+    if def.secret_schema.is_empty() && def.transport != "http" {
         fields.push_str(r#"<p class="muted">This server needs no configuration.</p>"#);
     }
 
@@ -385,6 +399,21 @@ pub async fn save_config(
         Ok(d) => d,
         Err(e) => return error_page(&e.to_string()),
     };
+    // The per-instance remote URL for http backends (not part of secret_schema).
+    if def.transport == "http" {
+        if let Some(url) = form.get(instances::URL_KEY).map(|s| s.trim()) {
+            if !url.is_empty() {
+                if let Err(e) = instances::validate_remote_url(url) {
+                    return error_page(&e.to_string());
+                }
+                if let Err(e) =
+                    instances::set_config_value(&state.db, &inst.id, instances::URL_KEY, url).await
+                {
+                    return error_page(&e.to_string());
+                }
+            }
+        }
+    }
     for f in &def.secret_schema {
         let Some(value) = form.get(&f.name) else { continue };
         if value.is_empty() {
