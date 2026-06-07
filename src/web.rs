@@ -657,6 +657,18 @@ async fn probe_instance(
                 Some("not built yet; run “Update from repository” first".into()),
             );
         }
+        // A venv built before the interpreter was relocated cannot exec under
+        // the sandbox; rebuild it transparently so testing just works.
+        if crate::gitsrc::venv_is_stale(&state.config.env_dir, inst, &def) {
+            let _guard = state.build_lock.lock().await;
+            let uid = state.sandbox_uid(user_id).await;
+            if let Err(e) =
+                crate::gitsrc::update_instance(&state.db, &state.config.env_dir, inst, &def, uid)
+                    .await
+            {
+                return ("error", Some(format!("rebuild failed: {e:#}")));
+            }
+        }
         match crate::gitsrc::launch_command(&state.config.env_dir, &inst.id, &def) {
             Ok((program, args)) => {
                 def.transport = "stdio".into();

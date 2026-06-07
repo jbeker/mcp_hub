@@ -114,6 +114,19 @@ impl HubProxy {
             if crate::gitsrc::is_git_source(&def) {
                 let ready = inst.build_status == "ready"
                     && crate::gitsrc::env_path(&self.state.config.env_dir, &inst.id).exists();
+                // A venv from before the interpreter relocation can't exec under
+                // the sandbox. Don't launch it (that yields a cryptic EACCES);
+                // point the user at the one-click heal instead. Rebuilding here
+                // would block every MCP connection on a slow build.
+                if ready && crate::gitsrc::venv_is_stale(&self.state.config.env_dir, inst, &def) {
+                    self.mark_status(
+                        inst,
+                        "unbuilt",
+                        Some("needs rebuild after upgrade — open its page and click “Test connection”"),
+                    )
+                    .await;
+                    continue;
+                }
                 if ready {
                     match crate::gitsrc::launch_command(&self.state.config.env_dir, &inst.id, &def) {
                         Ok((program, args)) => {

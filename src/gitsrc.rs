@@ -193,6 +193,18 @@ fn python_install_dir(env_dir: &str) -> PathBuf {
     Path::new(env_dir).join(".uv-python")
 }
 
+/// Whether a *built* git venv must be rebuilt to run under the current layout:
+/// its `bin/python` still resolves outside the shared interpreter dir (an old
+/// build under root's home, which sandbox UIDs cannot exec). False for non-git
+/// instances and for ones not yet built. Callers use this to transparently
+/// re-build venvs created before the interpreter was relocated.
+pub fn venv_is_stale(env_dir: &str, inst: &Instance, def: &ServerDef) -> bool {
+    def.is_git()
+        && inst.build_status == "ready"
+        && env_path(env_dir, &inst.id).exists()
+        && !venv_python_is_shared(env_dir, &inst.id)
+}
+
 /// Whether an instance's built venv resolves its interpreter to the shared
 /// managed-Python directory (rather than an old build under root's home). Used
 /// to force a one-time rebuild of venvs created before the relocation.
