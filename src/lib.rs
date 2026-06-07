@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod gitsrc;
 pub mod instances;
 pub mod oauth;
 pub mod proxy;
@@ -42,6 +43,8 @@ pub struct AppState {
     pub cookie_key: Key,
     /// Caps the total number of concurrently running backend connections.
     pub backend_slots: Arc<Semaphore>,
+    /// Serializes git-source builds (they are slow and disk-bound).
+    pub build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -61,6 +64,7 @@ impl AppState {
             auth_states: Arc::new(Mutex::new(HashMap::new())),
             cookie_key,
             backend_slots,
+            build_lock: Arc::new(tokio::sync::Mutex::new(())),
             config: Arc::new(config),
             db,
         })
@@ -90,6 +94,7 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/{id}/config", post(web::save_config))
         .route("/servers/{id}/enable", post(web::enable_server))
         .route("/servers/{id}/disable", post(web::disable_server))
+        .route("/servers/{id}/update", post(web::update_server))
         .route("/servers/{id}/delete", post(web::delete_server))
         // WebAuthn ceremonies
         .route("/auth/register/start", post(wa::register_start))

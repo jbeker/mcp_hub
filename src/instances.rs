@@ -24,6 +24,10 @@ pub struct Instance {
     pub enabled: bool,
     /// Non-secret configuration values (key -> value).
     pub config: BTreeMap<String, String>,
+    /// Commit a git-sourced backend was last built from (`None` if never built).
+    pub built_commit: Option<String>,
+    /// Build state: `unbuilt`, `ready`, or `error`.
+    pub build_status: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -36,6 +40,8 @@ struct Row {
     display_name: String,
     enabled: bool,
     config_json: String,
+    built_commit: Option<String>,
+    build_status: String,
 }
 
 impl Row {
@@ -51,11 +57,13 @@ impl Row {
             display_name: self.display_name,
             enabled: self.enabled,
             config: serde_json::from_str(&self.config_json).unwrap_or_default(),
+            built_commit: self.built_commit,
+            build_status: self.build_status,
         }
     }
 }
 
-const SELECT: &str = "SELECT id, user_id, catalog_server_id, custom_def_json, namespace, display_name, enabled, config_json FROM user_server_instances";
+const SELECT: &str = "SELECT id, user_id, catalog_server_id, custom_def_json, namespace, display_name, enabled, config_json, built_commit, build_status FROM user_server_instances";
 
 pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> Result<Vec<Instance>> {
     let rows: Vec<Row> = sqlx::query_as(&format!("{SELECT} WHERE user_id = ? ORDER BY namespace"))
@@ -141,6 +149,22 @@ pub async fn create(
 pub async fn set_enabled(pool: &SqlitePool, id: &str, enabled: bool) -> Result<()> {
     sqlx::query("UPDATE user_server_instances SET enabled = ? WHERE id = ?")
         .bind(enabled)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record the build state of a git-sourced instance.
+pub async fn set_build_state(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    built_commit: Option<&str>,
+) -> Result<()> {
+    sqlx::query("UPDATE user_server_instances SET build_status = ?, built_commit = ? WHERE id = ?")
+        .bind(status)
+        .bind(built_commit)
         .bind(id)
         .execute(pool)
         .await?;

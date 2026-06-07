@@ -61,6 +61,7 @@ All configuration is via environment variables:
 | `HUB_BOOTSTRAP_ADMIN` | no | — | If set, the first registration must use this handle (and becomes admin). |
 | `HUB_ALLOW_OPEN_REGISTRATION` | no | `false` | Allow self-registration after the first account exists. |
 | `HUB_DB_PATH` | no | `/data/hub.db` | SQLite database path. |
+| `HUB_ENV_DIR` | no | `/data/envs` | Where prebuilt virtualenvs for git-sourced servers live (keep on the data volume). |
 | `HUB_LISTEN` | no | `0.0.0.0:8080` | Bind address. |
 | `HUB_MAX_BACKENDS_PER_USER` | no | `16` | Max backends per client session. |
 | `HUB_MAX_BACKENDS_GLOBAL` | no | `128` | Max concurrent backends across all users. |
@@ -95,6 +96,52 @@ Once connected, your servers' tools appear namespaced (`zabbix__host_get`, …),
 | `hub__catalog_upsert` / `hub__catalog_remove` | admin | Manage the catalog |
 
 Newly added/enabled servers take effect on the next client session.
+
+## Running a server from a GitHub repo
+
+A catalog entry with `transport: "git"` is **built once** into a virtualenv on the data
+volume; connecting then runs that prebuilt environment directly — no fetch, no install — so
+startup stays fast. Updates are explicit: you push to GitHub, then run an update.
+
+Add the catalog entry (admin, via `hub__catalog_upsert` or `catalog/builtins.json`):
+
+```json
+{
+  "slug": "my-mcp",
+  "name": "My MCP",
+  "transport": "git",
+  "runtime": "python",
+  "repo": "https://github.com/you/my-mcp",
+  "git_ref": "main",
+  "entry": "my-mcp",
+  "supported": true,
+  "secret_schema": [
+    { "name": "MY_TOKEN", "label": "API token", "secret": true, "required": true }
+  ]
+}
+```
+
+- `entry` is the console-script your package defines; use `"module": "pkg.server"` instead to run
+  `python -m pkg.server`.
+- `git_ref` is the branch or tag to track; pin a tag or commit for reproducibility.
+
+Then, as a user:
+
+1. `hub__add_server` → `{ "catalog_slug": "my-mcp", "namespace": "mine" }`
+2. `hub__update_server` → `{ "namespace": "mine" }` — builds it (the one slow step).
+3. `hub__set_secret` for any credentials, then connect.
+
+**Updating after you push:** run `hub__update_server` again (or the "Update from repository"
+button on the server's page). It resolves the branch tip; if nothing changed it's a no-op,
+otherwise it rebuilds in the background and the next session uses the new code. The previously
+built version keeps serving until the rebuild succeeds.
+
+Notes:
+- v1 supports **Python (uv)** git sources; the repo must be `pip`-installable (has a
+  `pyproject.toml`). The image ships `git` + `uv`; packages needing C build tools may need a
+  customized image.
+- **Public repos only** for now — a private repo would need a token, which isn't yet handled
+  cleanly.
 
 ## Security notes
 

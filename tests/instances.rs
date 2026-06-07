@@ -101,6 +101,10 @@ async fn custom_definition_resolves() {
         url: None,
         runtime: "python".into(),
         secret_schema: vec![],
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
     };
     let inst = instances::create(&pool, &user.id, None, Some(&def), "custom", "Custom")
         .await

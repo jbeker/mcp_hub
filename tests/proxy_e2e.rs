@@ -32,6 +32,7 @@ async fn spawn_hub() -> (String, AppState) {
         rp_id: "localhost".into(),
         listen: addr,
         db_path: String::new(),
+        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
         master_key: [1u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
@@ -60,6 +61,62 @@ fn args(v: serde_json::Value) -> Option<serde_json::Map<String, serde_json::Valu
 }
 
 #[tokio::test]
+async fn unbuilt_git_backend_is_skipped() {
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    // A git-sourced instance that has never been built.
+    let def = ServerDef {
+        name: "Git Server".into(),
+        description: String::new(),
+        transport: "git".into(),
+        command: None,
+        args: vec![],
+        url: None,
+        runtime: "python".into(),
+        secret_schema: vec![],
+        repo: Some("https://github.com/example/mcp".into()),
+        git_ref: Some("main".into()),
+        entry: Some("example-mcp".into()),
+        module: None,
+    };
+    instances::create(&state.db, &user.id, None, Some(&def), "git", "Git Server")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // The unbuilt backend contributes no tools (it is skipped, not fatal).
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("git__")), "got {names:?}");
+    assert!(names.contains(&"hub__whoami".to_string()));
+
+    // ...and it is reported as unbuilt so the user knows to run hub__update_server.
+    let listed = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_my_servers".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(json.contains("\"build_status\":\"unbuilt\""), "got {json}");
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn proxy_aggregates_a_stdio_backend() {
     let exe = mock_server_path();
     assert!(
@@ -80,6 +137,10 @@ async fn proxy_aggregates_a_stdio_backend() {
         url: None,
         runtime: "binary".into(),
         secret_schema: vec![],
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await

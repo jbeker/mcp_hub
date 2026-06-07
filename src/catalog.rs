@@ -35,7 +35,7 @@ pub struct ServerDef {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    /// `"stdio"` or `"http"`.
+    /// `"stdio"`, `"http"`, or `"git"`.
     pub transport: String,
     #[serde(default)]
     pub command: Option<String>,
@@ -47,6 +47,19 @@ pub struct ServerDef {
     pub runtime: String,
     #[serde(default)]
     pub secret_schema: Vec<SecretField>,
+    // Git source (transport == "git").
+    /// HTTPS git URL of the repository.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Branch or tag to track (defaults to `main`).
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    /// Console-script name to run from the built virtualenv.
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// Or a module to run with `python -m`.
+    #[serde(default)]
+    pub module: Option<String>,
 }
 
 /// A catalog entry.
@@ -70,6 +83,14 @@ pub struct CatalogServer {
     #[serde(default)]
     pub secret_schema: Vec<SecretField>,
     #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    #[serde(default)]
+    pub entry: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
     pub is_builtin: bool,
     #[serde(default = "default_true")]
     pub supported: bool,
@@ -87,6 +108,10 @@ impl CatalogServer {
             url: self.url.clone(),
             runtime: self.runtime.clone(),
             secret_schema: self.secret_schema.clone(),
+            repo: self.repo.clone(),
+            git_ref: self.git_ref.clone(),
+            entry: self.entry.clone(),
+            module: self.module.clone(),
         }
     }
 }
@@ -104,6 +129,10 @@ struct Row {
     url: Option<String>,
     runtime: String,
     secret_schema_json: String,
+    repo: Option<String>,
+    git_ref: Option<String>,
+    entry: Option<String>,
+    module: Option<String>,
     is_builtin: bool,
     supported: bool,
 }
@@ -121,13 +150,17 @@ impl Row {
             url: self.url,
             runtime: self.runtime,
             secret_schema: serde_json::from_str(&self.secret_schema_json).unwrap_or_default(),
+            repo: self.repo,
+            git_ref: self.git_ref,
+            entry: self.entry,
+            module: self.module,
             is_builtin: self.is_builtin,
             supported: self.supported,
         }
     }
 }
 
-const SELECT: &str = "SELECT id, slug, name, description, transport, command, args_json, url, runtime, secret_schema_json, is_builtin, supported FROM catalog_servers";
+const SELECT: &str = "SELECT id, slug, name, description, transport, command, args_json, url, runtime, secret_schema_json, repo, git_ref, entry, module, is_builtin, supported FROM catalog_servers";
 
 pub async fn list(pool: &SqlitePool) -> Result<Vec<CatalogServer>> {
     let rows: Vec<Row> = sqlx::query_as(&format!("{SELECT} ORDER BY name"))
@@ -165,7 +198,7 @@ pub async fn upsert(
 
     if existing.is_some() {
         sqlx::query(
-            "UPDATE catalog_servers SET name=?, description=?, transport=?, command=?, args_json=?, url=?, runtime=?, secret_schema_json=?, is_builtin=?, supported=? WHERE id=?",
+            "UPDATE catalog_servers SET name=?, description=?, transport=?, command=?, args_json=?, url=?, runtime=?, secret_schema_json=?, repo=?, git_ref=?, entry=?, module=?, is_builtin=?, supported=? WHERE id=?",
         )
         .bind(&server.name)
         .bind(&server.description)
@@ -175,6 +208,10 @@ pub async fn upsert(
         .bind(&server.url)
         .bind(&server.runtime)
         .bind(&schema_json)
+        .bind(&server.repo)
+        .bind(&server.git_ref)
+        .bind(&server.entry)
+        .bind(&server.module)
         .bind(server.is_builtin)
         .bind(server.supported)
         .bind(&id)
@@ -183,8 +220,8 @@ pub async fn upsert(
         .context("updating catalog entry")?;
     } else {
         sqlx::query(
-            "INSERT INTO catalog_servers (id, slug, name, description, transport, command, args_json, url, runtime, secret_schema_json, is_builtin, supported, created_by, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO catalog_servers (id, slug, name, description, transport, command, args_json, url, runtime, secret_schema_json, repo, git_ref, entry, module, is_builtin, supported, created_by, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&server.slug)
@@ -196,6 +233,10 @@ pub async fn upsert(
         .bind(&server.url)
         .bind(&server.runtime)
         .bind(&schema_json)
+        .bind(&server.repo)
+        .bind(&server.git_ref)
+        .bind(&server.entry)
+        .bind(&server.module)
         .bind(server.is_builtin)
         .bind(server.supported)
         .bind(created_by)

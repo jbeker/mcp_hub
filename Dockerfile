@@ -27,7 +27,7 @@ FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl xz-utils libssl3 \
+        ca-certificates curl xz-utils libssl3 git \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js (provides npx) — pinned major version.
@@ -55,6 +55,7 @@ COPY --from=build /app/target/release/mcp_hub /usr/local/bin/mcp_hub
 COPY static /app/static
 
 ENV HUB_DB_PATH=/data/hub.db \
+    HUB_ENV_DIR=/data/envs \
     HUB_LISTEN=0.0.0.0:8080
 VOLUME ["/data"]
 EXPOSE 8080

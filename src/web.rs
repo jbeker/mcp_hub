@@ -273,6 +273,30 @@ pub async fn server_detail(
     }
     .replace("{id}", &esc(&inst.id));
 
+    // Git-sourced servers get a build status line and an Update button.
+    let git_section = if crate::gitsrc::is_git_source(&def) {
+        let commit = inst
+            .built_commit
+            .as_deref()
+            .map(|c| &c[..c.len().min(10)])
+            .unwrap_or("—");
+        format!(
+            r#"<section>
+  <h2>Source</h2>
+  <p class="muted">Repo <code>{repo}</code> @ <code>{git_ref}</code> · build <code>{status}</code> · commit <code>{commit}</code></p>
+  <form method="post" action="/servers/{id}/update">{csrf}<button>Update from repository</button></form>
+</section>"#,
+            repo = esc(def.repo.as_deref().unwrap_or("?")),
+            git_ref = esc(def.git_ref.as_deref().unwrap_or("main")),
+            status = esc(&inst.build_status),
+            commit = esc(commit),
+            id = esc(&inst.id),
+            csrf = csrf,
+        )
+    } else {
+        String::new()
+    };
+
     let body = format!(
         r#"<header class="row"><h1>{name}</h1><a href="/">← Back</a></header>
 <p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
@@ -281,6 +305,7 @@ pub async fn server_detail(
   {fields}
   <button type="submit">Save configuration</button>
 </form>
+{git_section}
 <div class="row" style="margin-top:18px">
   {toggle}
   <form method="post" action="/servers/{id}/delete" data-confirm="Remove this server?">{csrf}<button class="ghost danger">Remove</button></form>
@@ -292,6 +317,7 @@ pub async fn server_detail(
         id = esc(&inst.id),
         csrf = csrf,
         fields = fields,
+        git_section = git_section,
         toggle = toggle,
     );
     page(&inst.display_name, &body).into_response()
@@ -388,7 +414,36 @@ pub async fn delete_server(
         return error_page("server not found");
     }
     let _ = instances::delete(&state.db, &id).await;
+    crate::gitsrc::remove_env(&state.config.env_dir, &id);
     Redirect::to("/").into_response()
+}
+
+/// `POST /servers/{id}/update` — (re)build a git-sourced server.
+pub async fn update_server(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+        return error_page("server not found");
+    };
+    let def = match instances::resolve_def(&state.db, &inst).await {
+        Ok(d) => d,
+        Err(e) => return error_page(&e.to_string()),
+    };
+    if !crate::gitsrc::is_git_source(&def) {
+        return error_page("this server is not git-sourced");
+    }
+    let _guard = state.build_lock.lock().await;
+    match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def).await {
+        Ok(_) => Redirect::to(&format!("/servers/{id}")).into_response(),
+        Err(e) => error_page(&format!("update failed: {e}")),
+    }
 }
 
 fn error_page(msg: &str) -> Response {

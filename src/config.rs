@@ -21,6 +21,8 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Filesystem path to the SQLite database file.
     pub db_path: String,
+    /// Directory holding prebuilt virtualenvs for git-sourced backends.
+    pub env_dir: String,
     /// 32-byte master key used to encrypt secrets at rest.
     pub master_key: [u8; 32],
     /// Optional handle that is granted admin on first registration.
@@ -68,6 +70,7 @@ impl Config {
             .context("HUB_LISTEN must be a valid socket address, e.g. 0.0.0.0:8080")?;
 
         let db_path = opt("HUB_DB_PATH").unwrap_or_else(|| "./data/hub.db".to_string());
+        let env_dir = opt("HUB_ENV_DIR").unwrap_or_else(|| "./data/envs".to_string());
 
         let master_key = parse_master_key(&req("HUB_MASTER_KEY")?)?;
 
@@ -92,6 +95,7 @@ impl Config {
             rp_id,
             listen,
             db_path,
+            env_dir,
             master_key,
             bootstrap_admin,
             allow_open_registration,

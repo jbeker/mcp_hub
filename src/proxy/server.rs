@@ -94,13 +94,35 @@ impl HubProxy {
                     break;
                 }
             };
-            let def = match instances::resolve_def(&self.state.db, &inst).await {
+            let mut def = match instances::resolve_def(&self.state.db, &inst).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(namespace = %inst.namespace, error = %e, "resolve def failed");
                     continue;
                 }
             };
+            // Git-sourced backends run from their prebuilt virtualenv. Rewrite
+            // the def to a direct stdio exec; skip if it has not been built yet.
+            if crate::gitsrc::is_git_source(&def) {
+                let ready = inst.build_status == "ready"
+                    && crate::gitsrc::env_path(&self.state.config.env_dir, &inst.id).exists();
+                if ready {
+                    match crate::gitsrc::launch_command(&self.state.config.env_dir, &inst.id, &def) {
+                        Ok((program, args)) => {
+                            def.transport = "stdio".into();
+                            def.command = Some(program);
+                            def.args = args;
+                        }
+                        Err(e) => {
+                            tracing::warn!(namespace = %inst.namespace, error = %e, "git launch failed");
+                            continue;
+                        }
+                    }
+                } else {
+                    tracing::warn!(namespace = %inst.namespace, "git backend not built yet; run hub__update_server");
+                    continue;
+                }
+            }
             let env = match instances::resolved_env(&self.state.db, &self.state.secrets, &inst).await
             {
                 Ok(e) => e,

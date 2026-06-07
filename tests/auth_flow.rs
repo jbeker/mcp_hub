@@ -19,6 +19,7 @@ fn test_config() -> Config {
         rp_id: "localhost".into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         db_path: String::new(),
+        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
         master_key: [7u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,

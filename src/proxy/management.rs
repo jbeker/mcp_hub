@@ -62,6 +62,13 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             ),
         ),
         tool(
+            "hub__update_server",
+            "Build or update a git-sourced server from its repository (fetches the \
+             latest commit and rebuilds its environment). Run this after you push \
+             changes; connecting otherwise uses the cached build.",
+            schema(json!({"namespace": {"type": "string"}}), &["namespace"]),
+        ),
+        tool(
             "hub__enable",
             "Enable one of your servers.",
             schema(json!({"namespace": {"type": "string"}}), &["namespace"]),
@@ -132,6 +139,7 @@ pub async fn dispatch(
         "add_server" => add_server(state, user_id, &args).await,
         "configure" => configure(state, user_id, &args).await,
         "set_secret" => set_secret(state, user_id, &args).await,
+        "update_server" => update_server(state, user_id, &args).await,
         "enable" => set_enabled(state, user_id, &args, true).await,
         "disable" => set_enabled(state, user_id, &args, false).await,
         "remove" => remove(state, user_id, &args).await,
@@ -212,6 +220,8 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
             "enabled": i.enabled,
             "config": i.config,
             "secrets_set": secrets,
+            "build_status": i.build_status,
+            "built_commit": i.built_commit,
         }));
     }
     ok(json!({ "servers": out }))
@@ -312,6 +322,36 @@ async fn set_secret(
         .await
         .map_err(internal)?;
     ok(json!({ "set": true, "namespace": namespace, "key": key }))
+}
+
+async fn update_server(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let namespace = req_str(args, "namespace")?;
+    let inst = find_instance(state, user_id, &namespace).await?;
+    let def = instances::resolve_def(&state.db, &inst)
+        .await
+        .map_err(internal)?;
+    if !crate::gitsrc::is_git_source(&def) {
+        return Err(McpError::invalid_params(
+            format!("'{namespace}' is not a git-sourced server"),
+            None,
+        ));
+    }
+    // Serialize builds: they are slow and disk-bound.
+    let _guard = state.build_lock.lock().await;
+    let report = crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def)
+        .await
+        .map_err(bad_request)?;
+    ok(json!({
+        "namespace": namespace,
+        "updated": report.changed,
+        "commit": report.commit,
+        "previous_commit": report.previous_commit,
+        "note": if report.changed { "rebuilt; reconnect to use the new version" } else { "already up to date" },
+    }))
 }
 
 async fn set_enabled(
