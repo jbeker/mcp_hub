@@ -493,6 +493,53 @@ async fn admin_invite_tools_round_trip() {
 }
 
 #[tokio::test]
+async fn personal_access_token_tools_round_trip() {
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user.id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // A token is minted out of band (web UI only); it shows up in the listing.
+    let (pat, secret) = mcp_hub::tokens::create(&state.db, &user.id, "laptop", 3600)
+        .await
+        .unwrap();
+    let listed = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_tokens".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(listed_json.contains(&pat.id));
+    assert!(listed_json.contains("laptop"));
+    // The secret is never echoed back.
+    assert!(!listed_json.contains(&secret));
+
+    // Revoke it over MCP; afterwards it no longer authenticates.
+    let revoked = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__revoke_token".into(),
+            arguments: args(serde_json::json!({"token_id": pat.id})),
+        })
+        .await
+        .unwrap();
+    assert_eq!(revoked.structured_content.unwrap()["revoked"], true);
+    let hash = mcp_hub::oauth::token_hash(&secret);
+    assert!(mcp_hub::tokens::resolve_valid(&state.db, &hash)
+        .await
+        .unwrap()
+        .is_none());
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn admin_can_disable_and_delete_users() {
     let (base, state) = spawn_hub().await;
     let admin = users::create(&state.db, "admin1", "alice", "Alice", true)

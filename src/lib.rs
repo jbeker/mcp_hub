@@ -10,6 +10,7 @@ pub mod invites;
 pub mod oauth;
 pub mod proxy;
 pub mod sandbox;
+pub mod tokens;
 pub mod users;
 pub mod util;
 pub mod web;
@@ -122,6 +123,8 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account/passkeys/remove", post(web::remove_passkey))
         .route("/account/sessions/revoke-others", post(web::revoke_other_sessions))
         .route("/account/connections/revoke", post(web::revoke_connection))
+        .route("/account/tokens/create", post(web::create_token))
+        .route("/account/tokens/revoke", post(web::revoke_token))
         // User administration (admin)
         .route("/users", get(web::users_page))
         .route("/users/disable", post(web::disable_user))

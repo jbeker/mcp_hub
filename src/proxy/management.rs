@@ -91,6 +91,18 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "Remove one of your servers.",
             schema(json!({"namespace": {"type": "string"}}), &["namespace"]),
         ),
+        tool(
+            "hub__list_tokens",
+            "List your personal access tokens (metadata only — the token secrets \
+             are never shown again). Create new ones from the Account web page.",
+            schema(json!({}), &[]),
+        ),
+        tool(
+            "hub__revoke_token",
+            "Revoke one of your personal access tokens by its id (from \
+             hub__list_tokens).",
+            schema(json!({"token_id": {"type": "string"}}), &["token_id"]),
+        ),
     ];
     if admin {
         t.push(tool(
@@ -171,6 +183,8 @@ pub async fn dispatch(
         "enable" => set_enabled(state, user_id, &args, true).await,
         "disable" => set_enabled(state, user_id, &args, false).await,
         "remove" => remove(state, user_id, &args).await,
+        "list_tokens" => list_tokens(state, user_id).await,
+        "revoke_token" => revoke_token(state, user_id, &args).await,
         "list_users" => {
             require_admin(admin)?;
             list_users(state).await
@@ -465,6 +479,37 @@ async fn remove(
         .await
         .map_err(internal)?;
     ok(json!({ "removed": true, "namespace": namespace }))
+}
+
+async fn list_tokens(state: &AppState, user_id: &str) -> Result<CallToolResult, McpError> {
+    let tokens = crate::tokens::list_for_user(&state.db, user_id)
+        .await
+        .map_err(internal)?;
+    let out = tokens
+        .into_iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "name": t.name,
+                "created_at": t.created_at,
+                "last_used_at": t.last_used_at,
+                "expires_at": t.expires_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    ok(json!({ "tokens": out }))
+}
+
+async fn revoke_token(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let token_id = req_str(args, "token_id")?;
+    let revoked = crate::tokens::revoke(&state.db, user_id, &token_id)
+        .await
+        .map_err(internal)?;
+    ok(json!({ "revoked": revoked }))
 }
 
 async fn list_users(state: &AppState) -> Result<CallToolResult, McpError> {

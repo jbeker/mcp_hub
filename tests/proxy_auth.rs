@@ -95,6 +95,82 @@ async fn mcp_with_valid_token_passes_auth() {
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Build an `/mcp` request carrying `token` as a bearer credential.
+fn mcp_request(token: &str) -> Request<Body> {
+    Request::post("/mcp")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mcp_with_valid_pat_passes_auth() {
+    let state = test_state().await;
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let (_, token) = mcp_hub::tokens::create(&state.db, &user.id, "laptop", 3600)
+        .await
+        .unwrap();
+    assert!(token.starts_with(mcp_hub::tokens::PREFIX));
+
+    let resp = app(state).oneshot(mcp_request(&token)).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_with_expired_pat_is_401() {
+    let state = test_state().await;
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    // ttl in the past → already expired.
+    let (_, token) = mcp_hub::tokens::create(&state.db, &user.id, "old", -10)
+        .await
+        .unwrap();
+
+    let resp = app(state).oneshot(mcp_request(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_with_revoked_pat_is_401() {
+    let state = test_state().await;
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let (pat, token) = mcp_hub::tokens::create(&state.db, &user.id, "k", 3600)
+        .await
+        .unwrap();
+    assert!(mcp_hub::tokens::revoke(&state.db, &user.id, &pat.id)
+        .await
+        .unwrap());
+
+    let resp = app(state).oneshot(mcp_request(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_with_pat_for_disabled_user_is_401() {
+    let state = test_state().await;
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let (_, token) = mcp_hub::tokens::create(&state.db, &user.id, "k", 3600)
+        .await
+        .unwrap();
+    mcp_hub::users::set_disabled(&state.db, &user.id, true)
+        .await
+        .unwrap();
+
+    let resp = app(state).oneshot(mcp_request(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn mcp_with_token_for_unknown_user_is_401() {
     // A correctly-signed token whose subject has no account (e.g. deleted) is

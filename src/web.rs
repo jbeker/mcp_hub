@@ -942,6 +942,40 @@ pub async fn account_page(
         .unwrap_or_default();
     let other_sessions = sessions.len().saturating_sub(1);
 
+    // Personal access tokens (for clients that can't do the OAuth flow).
+    let pats = crate::tokens::list_for_user(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
+    let now = crate::util::now_unix();
+    let mut pat_rows = String::new();
+    if pats.is_empty() {
+        pat_rows.push_str(r#"<p class="muted">No tokens yet.</p>"#);
+    } else {
+        pat_rows.push_str("<ul class=\"servers\">");
+        for t in &pats {
+            let name = if t.name.is_empty() { "token" } else { &t.name };
+            let used = match t.last_used_at {
+                Some(u) => format!("last used {}", ago(now - u)),
+                None => "never used".to_string(),
+            };
+            let expiry = if t.expires_at <= now {
+                "expired".to_string()
+            } else {
+                format!("expires in {}", duration(t.expires_at - now))
+            };
+            pat_rows.push_str(&format!(
+                r#"<li><span><code>{name}</code> <span class="muted">· {used} · {expiry}</span></span>
+  <form method="post" action="/account/tokens/revoke" data-confirm="Revoke this token?">{csrf}<input type="hidden" name="token_id" value="{id}"><button class="ghost danger">Revoke</button></form></li>"#,
+                name = esc(name),
+                used = used,
+                expiry = expiry,
+                csrf = csrf,
+                id = esc(&t.id),
+            ));
+        }
+        pat_rows.push_str("</ul>");
+    }
+
     let body = format!(
         r#"<header class="row"><h1>Account</h1><a href="/">← Back</a></header>
 <p>Signed in as <strong>{handle}</strong></p>
@@ -958,6 +992,23 @@ pub async fn account_page(
   {conn_rows}
 </section>
 <section style="margin-top:18px">
+  <h2>Personal access tokens</h2>
+  <p class="muted">For MCP clients that can't sign in with OAuth. A token is a bearer credential with full access to your MCP endpoint — treat it like a password. Shown once at creation.</p>
+  {pat_rows}
+  <form method="post" action="/account/tokens/create" class="row" style="margin-top:10px;gap:8px;align-items:flex-end">
+    {csrf}
+    <label>Name<br><input type="text" name="name" placeholder="e.g. my-laptop" maxlength="60" required></label>
+    <label>Expires<br><select name="expires_days">
+      <option value="7">7 days</option>
+      <option value="30" selected>30 days</option>
+      <option value="90">90 days</option>
+      <option value="180">180 days</option>
+      <option value="365">365 days</option>
+    </select></label>
+    <button type="submit">Create token</button>
+  </form>
+</section>
+<section style="margin-top:18px">
   <h2>Browser sessions</h2>
   <p class="muted">You have {n_sessions} active session(s){other}.</p>
   {sign_out_others}
@@ -965,6 +1016,7 @@ pub async fn account_page(
         handle = esc(&user.handle),
         rows = rows,
         conn_rows = conn_rows,
+        pat_rows = pat_rows,
         n_sessions = sessions.len(),
         other = if other_sessions > 0 {
             format!(", including {other_sessions} other than this one")
@@ -1018,6 +1070,108 @@ pub async fn revoke_connection(
     let _ =
         crate::oauth::store::revoke_user_client(&state.db, &user.id, form.client_id.trim()).await;
     Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateTokenForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub expires_days: i64,
+}
+
+/// `POST /account/tokens/create` — mint a personal access token and reveal it
+/// once. Creation is web-only (passkey-authenticated); see the plan rationale.
+pub async fn create_token(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<CreateTokenForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let name = form.name.trim();
+    if name.is_empty() {
+        return error_page("a token name is required");
+    }
+    // Expiry is mandatory and bounded; clamp the submitted value to 1..=365 days.
+    let days = form.expires_days.clamp(1, 365);
+    let ttl = days * 86_400;
+    let (_, plaintext) = match crate::tokens::create(&state.db, &user.id, name, ttl).await {
+        Ok(v) => v,
+        Err(e) => return error_page(&format!("could not create token: {e}")),
+    };
+
+    // Reveal the secret exactly once. It is never recoverable after this page.
+    let example = format!(
+        "curl -H \"Authorization: Bearer {tok}\" {url}",
+        tok = esc(&plaintext),
+        url = esc(&state.config.mcp_url()),
+    );
+    let body = format!(
+        r#"<header class="row"><h1>Token created</h1><a href="/account">← Account</a></header>
+<p class="status status-warn">Copy this token now — it will <strong>not</strong> be shown again.</p>
+<p class="muted">Token <code>{name}</code>, expires in {days} days. It grants full access to your MCP endpoint; store it like a password.</p>
+<pre class="cmd"><code>{tok}</code></pre>
+<p class="muted">Use it as a bearer token, e.g.</p>
+<pre class="cmd"><code>{example}</code></pre>
+<p><a href="/account">← Back to account</a></p>"#,
+        name = esc(name),
+        days = days,
+        tok = esc(&plaintext),
+        example = example,
+    );
+    page("Token created", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RevokeTokenForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub token_id: String,
+}
+
+/// `POST /account/tokens/revoke` — delete one of the user's tokens.
+pub async fn revoke_token(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<RevokeTokenForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let _ = crate::tokens::revoke(&state.db, &user.id, form.token_id.trim()).await;
+    Redirect::to("/account").into_response()
+}
+
+/// Render an elapsed duration as a coarse "N units ago" string.
+fn ago(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 90 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
+}
+
+/// Render a remaining duration coarsely ("N days" / "N hours").
+fn duration(secs: i64) -> String {
+    let s = secs.max(0);
+    if s >= 86_400 {
+        format!("{} days", s / 86_400)
+    } else if s >= 3600 {
+        format!("{} hours", s / 3600)
+    } else {
+        format!("{} minutes", (s / 60).max(1))
+    }
 }
 
 #[derive(Deserialize)]
