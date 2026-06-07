@@ -194,6 +194,48 @@ pub async fn insert_credential(
     Ok(())
 }
 
+/// Display metadata for a registered passkey (no key material).
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct CredentialInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+/// List a user's registered passkeys (metadata only), oldest first.
+pub async fn list_credentials(pool: &SqlitePool, user_id: &str) -> Result<Vec<CredentialInfo>> {
+    let rows = sqlx::query_as::<_, CredentialInfo>(
+        "SELECT id, name, created_at FROM webauthn_credentials \
+         WHERE user_id = ? ORDER BY created_at",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Count a user's registered passkeys (used to refuse removing the last one).
+pub async fn count_credentials(pool: &SqlitePool, user_id: &str) -> Result<i64> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(n)
+}
+
+/// Delete one of a user's passkeys by its row id. Scoped to `user_id` so a user
+/// can only remove their own credentials. Returns whether a row was deleted.
+pub async fn delete_credential(pool: &SqlitePool, user_id: &str, cred_row_id: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?")
+        .bind(cred_row_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .context("deleting credential")?;
+    Ok(res.rows_affected() >= 1)
+}
+
 /// Find the owning user id for a credential id (raw bytes).
 pub async fn user_for_credential(pool: &SqlitePool, cred_id: &[u8]) -> Result<Option<String>> {
     let row: Option<(String,)> =
@@ -214,4 +256,48 @@ pub async fn update_credential(pool: &SqlitePool, passkey: &Passkey) -> Result<(
         .await
         .context("updating credential")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("mcp_hub_users_{}.db", new_id()));
+        crate::db::connect(path.to_str().unwrap()).await.unwrap()
+    }
+
+    /// Insert a credential row directly (a real Passkey needs a live ceremony).
+    async fn add_cred(pool: &SqlitePool, user_id: &str, row_id: &str) {
+        sqlx::query(
+            "INSERT INTO webauthn_credentials (id, user_id, credential_id, passkey_json, name, created_at)
+             VALUES (?, ?, ?, '{}', 'passkey', ?)",
+        )
+        .bind(row_id)
+        .bind(user_id)
+        .bind(row_id.as_bytes())
+        .bind(now_unix())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_listing_and_scoped_delete() {
+        let pool = pool().await;
+        let u = create(&pool, "u", "user", "User", false).await.unwrap();
+        add_cred(&pool, &u.id, "c1").await;
+        add_cred(&pool, &u.id, "c2").await;
+
+        assert_eq!(count_credentials(&pool, &u.id).await.unwrap(), 2);
+        assert_eq!(list_credentials(&pool, &u.id).await.unwrap().len(), 2);
+
+        // Delete is scoped to the owner: another user cannot remove it.
+        assert!(!delete_credential(&pool, "someone-else", "c1").await.unwrap());
+        assert_eq!(count_credentials(&pool, &u.id).await.unwrap(), 2);
+
+        assert!(delete_credential(&pool, &u.id, "c1").await.unwrap());
+        assert_eq!(count_credentials(&pool, &u.id).await.unwrap(), 1);
+    }
 }

@@ -21,6 +21,9 @@ pub struct Invite {
     pub created_at: i64,
     pub used_at: Option<i64>,
     pub used_by: Option<String>,
+    /// When set, this is a recovery code that enrolls a passkey onto this
+    /// existing user rather than creating a new account.
+    pub recovery_user_id: Option<String>,
 }
 
 impl Invite {
@@ -31,6 +34,10 @@ impl Invite {
 
     pub fn used(&self) -> bool {
         self.used_at.is_some()
+    }
+
+    pub fn is_recovery(&self) -> bool {
+        self.recovery_user_id.is_some()
     }
 }
 
@@ -67,6 +74,44 @@ pub async fn create(pool: &SqlitePool, created_by: &str, note: &str) -> Result<(
             created_at,
             used_at: None,
             used_by: None,
+            recovery_user_id: None,
+        },
+    ))
+}
+
+/// Create a single-use recovery code for an existing user. Redeeming it enrolls
+/// a new passkey onto that account rather than creating a new one. Returns the
+/// one-time plaintext code.
+pub async fn create_recovery(
+    pool: &SqlitePool,
+    created_by: &str,
+    recovery_user_id: &str,
+) -> Result<(String, Invite)> {
+    let code = generate_code();
+    let code_hash = token_hash(&code);
+    let created_at = now_unix();
+    sqlx::query(
+        "INSERT INTO invites (code_hash, note, created_by, created_at, recovery_user_id) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&code_hash)
+    .bind("account recovery")
+    .bind(created_by)
+    .bind(created_at)
+    .bind(recovery_user_id)
+    .execute(pool)
+    .await
+    .context("inserting recovery code")?;
+    Ok((
+        code,
+        Invite {
+            code_hash,
+            note: "account recovery".into(),
+            created_by: Some(created_by.to_string()),
+            created_at,
+            used_at: None,
+            used_by: None,
+            recovery_user_id: Some(recovery_user_id.to_string()),
         },
     ))
 }
@@ -77,11 +122,32 @@ pub async fn create(pool: &SqlitePool, created_by: &str, note: &str) -> Result<(
 /// error); the authoritative single-use consume happens in [`redeem`].
 pub async fn is_redeemable(pool: &SqlitePool, code: &str) -> Result<bool> {
     let hash = token_hash(code.trim());
-    let (n,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM invites WHERE code_hash = ? AND used_at IS NULL")
-            .bind(&hash)
-            .fetch_one(pool)
-            .await?;
+    // A registration invite, not a recovery code.
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM invites \
+         WHERE code_hash = ? AND used_at IS NULL AND recovery_user_id IS NULL",
+    )
+    .bind(&hash)
+    .fetch_one(pool)
+    .await?;
+    Ok(n == 1)
+}
+
+/// Whether a code is an unused recovery code for `user_id` specifically.
+pub async fn is_recovery_redeemable(
+    pool: &SqlitePool,
+    code: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let hash = token_hash(code.trim());
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM invites \
+         WHERE code_hash = ? AND used_at IS NULL AND recovery_user_id = ?",
+    )
+    .bind(&hash)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
     Ok(n == 1)
 }
 
@@ -110,9 +176,17 @@ pub async fn redeem(pool: &SqlitePool, code: &str, user_id: &str) -> Result<()> 
 
 /// List all invites, newest first (metadata only — never the plaintext).
 pub async fn list(pool: &SqlitePool) -> Result<Vec<Invite>> {
-    type Row = (String, String, Option<String>, i64, Option<i64>, Option<String>);
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
     let rows = sqlx::query_as::<_, Row>(
-        "SELECT code_hash, note, created_by, created_at, used_at, used_by \
+        "SELECT code_hash, note, created_by, created_at, used_at, used_by, recovery_user_id \
          FROM invites ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -120,13 +194,16 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<Invite>> {
     Ok(rows
         .into_iter()
         .map(
-            |(code_hash, note, created_by, created_at, used_at, used_by)| Invite {
-                code_hash,
-                note,
-                created_by,
-                created_at,
-                used_at,
-                used_by,
+            |(code_hash, note, created_by, created_at, used_at, used_by, recovery_user_id)| {
+                Invite {
+                    code_hash,
+                    note,
+                    created_by,
+                    created_at,
+                    used_at,
+                    used_by,
+                    recovery_user_id,
+                }
             },
         )
         .collect())
@@ -187,6 +264,43 @@ mod tests {
             .await
             .unwrap();
         assert!(redeem(&pool, "nope", &user.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_code_is_scoped_and_distinct_from_invites() {
+        let pool = pool().await;
+        let admin = crate::users::create(&pool, "a", "admin", "Admin", true)
+            .await
+            .unwrap();
+        let target = crate::users::create(&pool, "u", "user", "User", false)
+            .await
+            .unwrap();
+
+        let (code, inv) = create_recovery(&pool, &admin.id, &target.id).await.unwrap();
+        assert!(inv.is_recovery());
+        // A recovery code is not usable as a registration invite...
+        assert!(!is_redeemable(&pool, &code).await.unwrap());
+        // ...and only for its target user, not anyone else.
+        assert!(is_recovery_redeemable(&pool, &code, &target.id).await.unwrap());
+        assert!(!is_recovery_redeemable(&pool, &code, &admin.id).await.unwrap());
+
+        // Single use.
+        redeem(&pool, &code, &target.id).await.unwrap();
+        assert!(!is_recovery_redeemable(&pool, &code, &target.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn registration_invite_is_not_a_recovery_code() {
+        let pool = pool().await;
+        let admin = crate::users::create(&pool, "a", "admin", "Admin", true)
+            .await
+            .unwrap();
+        let user = crate::users::create(&pool, "u", "user", "User", false)
+            .await
+            .unwrap();
+        let (code, _) = create(&pool, &admin.id, "").await.unwrap();
+        assert!(is_redeemable(&pool, &code).await.unwrap());
+        assert!(!is_recovery_redeemable(&pool, &code, &user.id).await.unwrap());
     }
 
     #[tokio::test]

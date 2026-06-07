@@ -24,6 +24,7 @@ use webauthn_rs::prelude::{
 };
 
 use crate::auth::session;
+use crate::auth::AuthUser;
 use crate::{invites, users};
 use crate::AppState;
 
@@ -33,16 +34,29 @@ const CEREMONY_TTL_SECS: i64 = 300;
 /// Hard cap on simultaneously in-flight ceremonies (a memory-DoS backstop).
 const CEREMONY_CAP: usize = 4096;
 
+/// What a passkey-registration ceremony does when it finishes.
+pub enum RegPurpose {
+    /// Create a brand-new account, optionally consuming an invite code.
+    NewUser {
+        is_admin: bool,
+        /// Invite to consume at finish (None for the bootstrap admin or when
+        /// open registration is enabled).
+        invite_code: Option<String>,
+    },
+    /// Enroll an additional passkey onto an existing account. `recovery_code` is
+    /// `Some` for an admin-issued recovery (consumed at finish); `None` when a
+    /// logged-in user is adding a backup key.
+    AddCredential { recovery_code: Option<String> },
+}
+
 /// In-flight registration ceremony state.
 pub struct RegCeremony {
     pub state: PasskeyRegistration,
+    /// The WebAuthn user handle, which is also the account's database id.
     pub user_id: Uuid,
     pub handle: String,
     pub display_name: String,
-    pub is_admin: bool,
-    /// Invite code to consume when the ceremony finishes (None for the
-    /// bootstrap admin or when open registration is enabled).
-    pub invite_code: Option<String>,
+    pub purpose: RegPurpose,
     pub created_at: i64,
 }
 
@@ -248,14 +262,101 @@ pub async fn register_start(
             user_id,
             handle,
             display_name,
-            is_admin,
-            invite_code,
+            purpose: RegPurpose::NewUser {
+                is_admin,
+                invite_code,
+            },
             created_at: crate::util::now_unix(),
         },
     )?;
 
     let jar = jar.add(ceremony_cookie(cid, state.config.cookie_secure()));
     Ok((jar, Json(ccr)))
+}
+
+/// Shared body for the two "enroll a passkey onto an existing account" flows:
+/// a logged-in user adding a backup key, and an admin-issued recovery. Builds
+/// the ceremony (excluding already-registered authenticators) and sets the
+/// ceremony cookie.
+async fn start_add_credential(
+    state: &AppState,
+    jar: SignedCookieJar,
+    user: &users::User,
+    recovery_code: Option<String>,
+) -> Result<(SignedCookieJar, Json<CreationChallengeResponse>), ApiError> {
+    let user_id = Uuid::parse_str(&user.id)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+
+    // Exclude existing credentials so the same authenticator is not enrolled
+    // twice (the browser will refuse and prompt for a different key).
+    let existing = users::passkeys_for_user(&state.db, &user.id)
+        .await
+        .map_err(ApiError::from)?;
+    let exclude: Vec<_> = existing.iter().map(|p| p.cred_id().clone()).collect();
+
+    let (ccr, reg_state) = state
+        .webauthn
+        .start_passkey_registration(user_id, &user.handle, &user.display_name, Some(exclude))
+        .map_err(|e| bad(format!("could not start enrollment: {e}")))?;
+
+    let cid = crate::util::new_id();
+    insert_ceremony(
+        &state.reg_states,
+        cid.clone(),
+        RegCeremony {
+            state: reg_state,
+            user_id,
+            handle: user.handle.clone(),
+            display_name: user.display_name.clone(),
+            purpose: RegPurpose::AddCredential { recovery_code },
+            created_at: crate::util::now_unix(),
+        },
+    )?;
+
+    let jar = jar.add(ceremony_cookie(cid, state.config.cookie_secure()));
+    Ok((jar, Json(ccr)))
+}
+
+/// `POST /account/passkeys/add/start` — a logged-in user enrolls another passkey.
+pub async fn add_passkey_start(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+) -> Result<(SignedCookieJar, Json<CreationChallengeResponse>), ApiError> {
+    start_add_credential(&state, jar, &user, None).await
+}
+
+/// Request body for starting account recovery.
+#[derive(Deserialize)]
+pub struct RecoverStart {
+    pub handle: String,
+    pub code: String,
+}
+
+/// `POST /auth/recover/start` — bind a new passkey to an existing account using
+/// an admin-issued recovery code (for a user who has lost their authenticators).
+pub async fn recover_start(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    Json(req): Json<RecoverStart>,
+) -> Result<(SignedCookieJar, Json<CreationChallengeResponse>), ApiError> {
+    let handle = req.handle.trim();
+    let code = req.code.trim();
+    // One generic error for unknown handle / wrong code so recovery cannot be
+    // used to probe which handles exist.
+    let invalid = || ApiError::new(StatusCode::FORBIDDEN, "invalid handle or recovery code");
+    let user = users::find_by_handle(&state.db, handle)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(invalid)?;
+    if code.is_empty()
+        || !invites::is_recovery_redeemable(&state.db, code, &user.id)
+            .await
+            .map_err(ApiError::from)?
+    {
+        return Err(invalid());
+    }
+    start_add_credential(&state, jar, &user, Some(code.to_string())).await
 }
 
 pub async fn register_finish(
@@ -276,56 +377,77 @@ pub async fn register_finish(
         .finish_passkey_registration(&cred, &ceremony.state)
         .map_err(|e| bad(format!("registration failed: {e}")))?;
 
-    // Guard against a race where the handle was taken between start and finish.
-    if users::find_by_handle(&state.db, &ceremony.handle)
-        .await
-        .map_err(ApiError::from)?
-        .is_some()
-    {
-        return Err(ApiError::new(StatusCode::CONFLICT, "that handle is taken"));
-    }
+    // Resolve the account this passkey belongs to, branching on the ceremony's
+    // purpose: create a new account, or enroll onto an existing one.
+    let user_id = match &ceremony.purpose {
+        RegPurpose::NewUser {
+            is_admin,
+            invite_code,
+        } => {
+            // Guard against the handle being taken between start and finish.
+            if users::find_by_handle(&state.db, &ceremony.handle)
+                .await
+                .map_err(ApiError::from)?
+                .is_some()
+            {
+                return Err(ApiError::new(StatusCode::CONFLICT, "that handle is taken"));
+            }
+            // Decide admin atomically at insert time: the grant happens only if
+            // this is still the first account (closes the bootstrap race).
+            let user = if *is_admin {
+                users::create_admin_if_first(
+                    &state.db,
+                    &ceremony.user_id.to_string(),
+                    &ceremony.handle,
+                    &ceremony.display_name,
+                )
+                .await
+            } else {
+                users::create(
+                    &state.db,
+                    &ceremony.user_id.to_string(),
+                    &ceremony.handle,
+                    &ceremony.display_name,
+                    false,
+                )
+                .await
+            }
+            .map_err(ApiError::from)?;
 
-    // Decide admin atomically at insert time. The ceremony's is_admin flag
-    // reflects the policy at start; the actual grant happens only if this is
-    // still the first account, closing the concurrent-bootstrap race.
-    let user = if ceremony.is_admin {
-        users::create_admin_if_first(
-            &state.db,
-            &ceremony.user_id.to_string(),
-            &ceremony.handle,
-            &ceremony.display_name,
-        )
-        .await
-    } else {
-        users::create(
-            &state.db,
-            &ceremony.user_id.to_string(),
-            &ceremony.handle,
-            &ceremony.display_name,
-            false,
-        )
-        .await
-    }
-    .map_err(ApiError::from)?;
-
-    // Consume the invite now that the user row exists (used_by references it).
-    // The conditional UPDATE is the single-use guard: if a concurrent
-    // registration claimed the same code between start and finish, roll back the
-    // just-created user so neither a duplicate account nor a double-spend occurs.
-    if let Some(code) = &ceremony.invite_code {
-        if let Err(e) = invites::redeem(&state.db, code, &user.id).await {
-            let _ = users::delete(&state.db, &user.id).await;
-            return Err(ApiError::new(StatusCode::CONFLICT, e.to_string()));
+            // Consume the invite now that the user row exists (used_by references
+            // it). The conditional UPDATE is the single-use guard: a concurrent
+            // registration that claimed the same code wins, and we roll this user
+            // back so neither a duplicate account nor a double-spend occurs.
+            if let Some(code) = invite_code {
+                if let Err(e) = invites::redeem(&state.db, code, &user.id).await {
+                    let _ = users::delete(&state.db, &user.id).await;
+                    return Err(ApiError::new(StatusCode::CONFLICT, e.to_string()));
+                }
+            }
+            tracing::info!(handle = %user.handle, is_admin = user.is_admin, "registered new user");
+            user.id
         }
-    }
+        RegPurpose::AddCredential { recovery_code } => {
+            let user_id = ceremony.user_id.to_string();
+            // For recovery, consume the code first (single-use); the account
+            // already exists, so there is nothing to roll back on contention.
+            if let Some(code) = recovery_code {
+                invites::redeem(&state.db, code, &user_id)
+                    .await
+                    .map_err(|e| ApiError::new(StatusCode::CONFLICT, e.to_string()))?;
+                tracing::info!(handle = %ceremony.handle, "recovered account via recovery code");
+            } else {
+                tracing::info!(handle = %ceremony.handle, "enrolled additional passkey");
+            }
+            user_id
+        }
+    };
 
-    users::insert_credential(&state.db, &user.id, &passkey, "passkey")
+    users::insert_credential(&state.db, &user_id, &passkey, "passkey")
         .await
         .map_err(ApiError::from)?;
 
-    tracing::info!(handle = %user.handle, is_admin = user.is_admin, "registered new user");
-
-    let sid = session::create(&state.db, &user.id)
+    let sid = session::create(&state.db, &user_id)
         .await
         .map_err(ApiError::from)?;
     let secure = state.config.cookie_secure();

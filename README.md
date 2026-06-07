@@ -97,6 +97,7 @@ Once connected, your servers' tools appear namespaced (`zabbix__host_get`, …),
 | `hub__list_users` | admin | List users |
 | `hub__catalog_upsert` / `hub__catalog_remove` | admin | Manage the catalog |
 | `hub__create_invite` / `hub__list_invites` / `hub__revoke_invite` | admin | Manage invite codes |
+| `hub__create_recovery` | admin | Issue a one-time account-recovery code |
 
 Newly added/enabled servers take effect on the next client session.
 
@@ -123,6 +124,21 @@ button); used codes are kept for audit.
 
 To allow open self-registration instead (no invite needed), set
 `HUB_ALLOW_OPEN_REGISTRATION=true`.
+
+## Passkeys and account recovery
+
+Auth is passkey-only, so a lost device must not mean a lost account. Two
+safeguards:
+
+- **Multiple passkeys.** On the **Account** page (`/account`), a signed-in user
+  enrolls additional passkeys — a second device or a hardware key. The hub
+  refuses to remove your *last* passkey, so you cannot lock yourself out from the
+  UI. Enroll a backup key early.
+- **Admin recovery codes.** If a user loses every passkey, an admin issues a
+  one-time recovery code (Invites page → *Recovery code*, or
+  `hub__create_recovery`). The user enters their handle and the code at
+  `/recover` and enrolls a fresh passkey on their **existing** account. Recovery
+  codes share the invite protections: 128-bit, stored only as a hash, single-use.
 
 ## Running a server from a GitHub repo
 

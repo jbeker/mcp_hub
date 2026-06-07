@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::auth::session;
 use crate::auth::{AuthUser, MaybeUser};
-use crate::{catalog, instances, invites, AppState};
+use crate::{catalog, instances, invites, users, AppState};
 
 /// Optional `?next=` redirect target carried into the login/register pages.
 #[derive(Deserialize)]
@@ -87,7 +87,10 @@ pub async fn dashboard(
     let body = format!(
         r#"<header class="row">
   <h1>MCP Hub</h1>
-  <form method="post" action="/logout">{csrf}<button class="ghost">Sign out</button></form>
+  <div class="row">
+    <a href="/account">Account</a>
+    <form method="post" action="/logout">{csrf}<button class="ghost">Sign out</button></form>
+  </div>
 </header>
 <p>Signed in as <strong>{handle}</strong> {badge}</p>
 <section>
@@ -522,11 +525,61 @@ pub async fn invites_page(
   <label>Note (optional)<input name="note" placeholder="e.g. for Alice" autocomplete="off"></label>
   <button type="submit">Generate invite</button>
 </form>
-<section style="margin-top:18px">{rows}</section>"#,
+<section style="margin-top:18px">{rows}</section>
+<section style="margin-top:18px">
+  <h2>Recovery code</h2>
+  <p class="muted">Issue a one-time code that lets an existing user who lost their device enroll a new passkey on their account.</p>
+  <form method="post" action="/invites/recovery">
+    {csrf}
+    <label>User handle<input name="handle" placeholder="their handle" autocomplete="off" required></label>
+    <button type="submit">Issue recovery code</button>
+  </form>
+</section>"#,
         csrf = csrf,
         rows = rows,
     );
     page("Invites", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RecoveryForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub handle: String,
+}
+
+/// `POST /invites/recovery` — admin issues a recovery code for a user.
+pub async fn create_recovery(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<RecoveryForm>,
+) -> Response {
+    if !user.is_admin {
+        return admin_forbidden();
+    }
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let target = match crate::users::find_by_handle(&state.db, form.handle.trim()).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return error_page("no user with that handle"),
+        Err(e) => return error_page(&e.to_string()),
+    };
+    let (code, _) = match invites::create_recovery(&state.db, &user.id, &target.id).await {
+        Ok(v) => v,
+        Err(e) => return error_page(&e.to_string()),
+    };
+    let body = format!(
+        r#"<header class="row"><h1>Recovery code created</h1><a href="/invites">← Back</a></header>
+<p>Give this one-time code to <strong>{handle}</strong>. It works once and <strong>will not be shown again</strong>:</p>
+<p><code class="invite-code">{code}</code></p>
+<p class="muted">They enroll a new passkey at <code>{base}/recover</code> using their handle and this code.</p>"#,
+        handle = esc(&target.handle),
+        code = esc(&code),
+        base = esc(&state.config.base_url),
+    );
+    page("Recovery code created", &body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -591,6 +644,105 @@ pub async fn revoke_invite(
 }
 
 // ---------------------------------------------------------------------------
+// Account / passkey management
+// ---------------------------------------------------------------------------
+
+/// `/account` — manage the signed-in user's passkeys.
+pub async fn account_page(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let creds = users::list_credentials(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
+    let only_one = creds.len() <= 1;
+
+    let mut rows = String::new();
+    rows.push_str("<ul class=\"servers\">");
+    for c in &creds {
+        let name = if c.name.is_empty() { "passkey" } else { &c.name };
+        // Removing the last passkey would lock the account out, so it is refused.
+        let remove = if only_one {
+            r#"<span class="muted">only key</span>"#.to_string()
+        } else {
+            format!(
+                r#"<form method="post" action="/account/passkeys/remove" data-confirm="Remove this passkey?">{csrf}<input type="hidden" name="cred_id" value="{id}"><button class="ghost danger">Remove</button></form>"#,
+                csrf = csrf,
+                id = esc(&c.id),
+            )
+        };
+        rows.push_str(&format!(
+            r#"<li><span><code>{name}</code></span> {remove}</li>"#,
+            name = esc(name),
+            remove = remove,
+        ));
+    }
+    rows.push_str("</ul>");
+
+    let body = format!(
+        r#"<header class="row"><h1>Account</h1><a href="/">← Back</a></header>
+<p>Signed in as <strong>{handle}</strong></p>
+<section>
+  <h2>Passkeys</h2>
+  <p class="muted">Add a second passkey (another device or a hardware key) so you are not locked out if you lose one.</p>
+  {rows}
+  <button id="add-passkey-btn" type="button">Add a passkey</button>
+  <p class="error" id="add-passkey-error"></p>
+</section>"#,
+        handle = esc(&user.handle),
+        rows = rows,
+    );
+    page("Account", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RemovePasskeyForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub cred_id: String,
+}
+
+/// `POST /account/passkeys/remove` — delete one of the user's passkeys.
+pub async fn remove_passkey(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<RemovePasskeyForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    // Never let a user remove their last passkey — that is an unrecoverable
+    // lockout (only an admin recovery code could undo it).
+    match users::count_credentials(&state.db, &user.id).await {
+        Ok(n) if n <= 1 => return error_page("you cannot remove your only passkey"),
+        Ok(_) => {}
+        Err(e) => return error_page(&e.to_string()),
+    }
+    let _ = users::delete_credential(&state.db, &user.id, form.cred_id.trim()).await;
+    Redirect::to("/account").into_response()
+}
+
+/// `/recover` — bind a new passkey to an existing account with a recovery code.
+pub async fn recover_page(MaybeUser(user): MaybeUser) -> Response {
+    if user.is_some() {
+        return Redirect::to("/account").into_response();
+    }
+    let body = r#"<h1>Recover access</h1>
+<p class="muted">Lost the device with your passkey? Ask an administrator for a recovery code, then enroll a new passkey here.</p>
+<form id="recover-form">
+  <label>Handle<input id="recover-handle" name="handle" autocomplete="username" required></label>
+  <label>Recovery code<input id="recover-code" name="code" autocomplete="off" required></label>
+  <button id="recover-btn" type="submit">Recover &amp; add passkey</button>
+</form>
+<p class="error" id="recover-error"></p>
+<p class="muted"><a href="/login">← Back to sign in</a></p>"#;
+    page("Recover access", body).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Auth pages
 // ---------------------------------------------------------------------------
 
@@ -619,7 +771,8 @@ pub async fn login_page(
   <button id="login-btn" type="submit">Sign in with passkey</button>
 </form>
 <p class="error" id="login-error"></p>
-<p class="muted">Need an account? <a href="/register">Register</a></p>"#;
+<p class="muted">Need an account? <a href="/register">Register</a></p>
+<p class="muted">Lost your device? <a href="/recover">Recover access</a></p>"#;
     (jar, page("Sign in", body)).into_response()
 }
 

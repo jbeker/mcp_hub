@@ -105,6 +105,24 @@ async function doLogin(handle) {
   window.location.href = result.redirect || "/";
 }
 
+// Enroll an additional passkey onto the signed-in account.
+async function doAddPasskey() {
+  const challenge = await postJson("/account/passkeys/add/start", {});
+  const publicKey = decodeCreationOptions(challenge.publicKey);
+  const cred = await navigator.credentials.create({ publicKey });
+  await postJson("/auth/register/finish", encodeAttestation(cred));
+  window.location.href = "/account";
+}
+
+// Bind a new passkey to an existing account using an admin recovery code.
+async function doRecover(handle, code) {
+  const challenge = await postJson("/auth/recover/start", { handle, code });
+  const publicKey = decodeCreationOptions(challenge.publicKey);
+  const cred = await navigator.credentials.create({ publicKey });
+  const result = await postJson("/auth/register/finish", encodeAttestation(cred));
+  window.location.href = result.redirect || "/";
+}
+
 function wire() {
   const reg = document.getElementById("register-form");
   if (reg) {
@@ -132,6 +150,34 @@ function wire() {
       err.textContent = "";
       try {
         await doLogin(document.getElementById("login-handle").value.trim());
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    });
+  }
+  const addBtn = document.getElementById("add-passkey-btn");
+  if (addBtn) {
+    addBtn.addEventListener("click", async () => {
+      const err = document.getElementById("add-passkey-error");
+      err.textContent = "";
+      try {
+        await doAddPasskey();
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    });
+  }
+  const recover = document.getElementById("recover-form");
+  if (recover) {
+    recover.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const err = document.getElementById("recover-error");
+      err.textContent = "";
+      try {
+        await doRecover(
+          document.getElementById("recover-handle").value.trim(),
+          document.getElementById("recover-code").value.trim()
+        );
       } catch (e) {
         err.textContent = e.message;
       }

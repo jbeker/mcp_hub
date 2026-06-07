@@ -87,7 +87,12 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/", get(web::dashboard))
         .route("/login", get(web::login_page))
         .route("/register", get(web::register_page))
+        .route("/recover", get(web::recover_page))
         .route("/logout", get(web::logout_get).post(wa::logout))
+        // Account / passkey management
+        .route("/account", get(web::account_page))
+        .route("/account/passkeys/add/start", post(wa::add_passkey_start))
+        .route("/account/passkeys/remove", post(web::remove_passkey))
         // Server management UI
         .route("/servers/catalog", get(web::catalog_page))
         .route("/servers/add", post(web::add_server))
@@ -100,12 +105,14 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         // Invite management (admin)
         .route("/invites", get(web::invites_page))
         .route("/invites/create", post(web::create_invite))
+        .route("/invites/recovery", post(web::create_recovery))
         .route("/invites/revoke", post(web::revoke_invite))
         // WebAuthn ceremonies
         .route("/auth/register/start", post(wa::register_start))
         .route("/auth/register/finish", post(wa::register_finish))
         .route("/auth/login/start", post(wa::login_start))
         .route("/auth/login/finish", post(wa::login_finish))
+        .route("/auth/recover/start", post(wa::recover_start))
         // OAuth 2.1 discovery metadata
         .route(
             "/.well-known/oauth-authorization-server",

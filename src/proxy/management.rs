@@ -135,6 +135,13 @@ pub fn tools(admin: bool) -> Vec<Tool> {
              hub__list_invites).",
             schema(json!({"id": {"type": "string"}}), &["id"]),
         ));
+        t.push(tool(
+            "hub__create_recovery",
+            "(admin) Issue a one-time recovery code so a user who lost their \
+             passkey can enroll a new one on their existing account. The code is \
+             returned once and cannot be retrieved later.",
+            schema(json!({"handle": {"type": "string"}}), &["handle"]),
+        ));
     }
     t
 }
@@ -187,6 +194,10 @@ pub async fn dispatch(
         "revoke_invite" => {
             require_admin(admin)?;
             revoke_invite(state, &args).await
+        }
+        "create_recovery" => {
+            require_admin(admin)?;
+            create_recovery(state, user_id, &args).await
         }
         other => Err(McpError::invalid_params(
             format!("unknown management tool 'hub__{other}'"),
@@ -496,6 +507,29 @@ async fn revoke_invite(state: &AppState, args: &JsonObject) -> Result<CallToolRe
             None,
         ))
     }
+}
+
+async fn create_recovery(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let handle = req_str(args, "handle")?;
+    let target = users::find_by_handle(&state.db, &handle)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| McpError::invalid_params(format!("no user with handle '{handle}'"), None))?;
+    let (code, inv) = invites::create_recovery(&state.db, user_id, &target.id)
+        .await
+        .map_err(internal)?;
+    ok(json!({
+        "created": true,
+        "code": code,
+        "id": inv.short_id(),
+        "for_handle": target.handle,
+        "redeem_at": format!("{}/recover", state.config.base_url),
+        "advice": "single-use; shown only once. The user enrolls a new passkey with their handle and this code.",
+    }))
 }
 
 // ---------------------------------------------------------------------------
