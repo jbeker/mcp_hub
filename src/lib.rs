@@ -132,6 +132,7 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/create", post(web::create_server))
         .route("/servers/{id}", get(web::server_detail))
         .route("/servers/{id}/config", post(web::save_config))
+        .route("/servers/{id}/test", post(web::test_server))
         .route("/servers/{id}/enable", post(web::enable_server))
         .route("/servers/{id}/disable", post(web::disable_server))
         .route("/servers/{id}/update", post(web::update_server))

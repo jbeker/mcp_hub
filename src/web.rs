@@ -397,6 +397,7 @@ pub async fn server_detail(
 </form>
 {git_section}
 <div class="row" style="margin-top:18px">
+  <form method="post" action="/servers/{id}/test">{csrf}<button class="ghost">Test connection</button></form>
   {toggle}
   <form method="post" action="/servers/{id}/delete" data-confirm="Remove this server?">{csrf}<button class="ghost danger">Remove</button></form>
 </div>"#,
@@ -469,16 +470,20 @@ fn runtime_banner(inst: &instances::Instance) -> String {
         "skipped" => ("warn", "not started".to_string()),
         _ => return String::new(), // 'unknown' before the first connection
     };
+    // A single-line reason sits inline; a multi-line one (e.g. captured stderr
+    // from a Test connection) goes in its own block so it stays readable.
     let detail = match &inst.runtime_detail {
-        Some(d) if !d.is_empty() => format!(": {}", esc(d)),
-        _ => String::new(),
+        Some(d) if d.contains('\n') => {
+            format!("{when}<pre class=\"cmd\"><code>{}</code></pre>", esc(d))
+        }
+        Some(d) if !d.is_empty() => format!(": {}{when}", esc(d)),
+        _ => when,
     };
     format!(
-        r#"<p class="status status-{class}">Backend {label}{detail}{when}</p>"#,
+        r#"<div class="status status-{class}">Backend {label}{detail}</div>"#,
         class = class,
         label = label,
         detail = detail,
-        when = when,
     )
 }
 
@@ -601,6 +606,74 @@ pub async fn update_server(
     match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, uid).await {
         Ok(_) => Redirect::to(&format!("/servers/{id}")).into_response(),
         Err(e) => error_page(&format!("update failed: {e}")),
+    }
+}
+
+/// `POST /servers/{id}/test` — start the backend once, right now, record the
+/// outcome (with the subprocess's own stderr on failure), then return to the
+/// server page. Lets a user verify a server actually runs without opening a
+/// fresh MCP client connection.
+pub async fn test_server(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+        return error_page("server not found");
+    };
+    let (status, detail) = probe_instance(&state, &user.id, &inst).await;
+    let _ = instances::set_runtime_status(&state.db, &inst.id, status, detail.as_deref()).await;
+    Redirect::to(&format!("/servers/{id}")).into_response()
+}
+
+/// Resolve and start one instance once, mirroring the proxy's per-backend launch
+/// logic, and return a `(status, detail)` pair suitable for
+/// [`instances::set_runtime_status`].
+async fn probe_instance(
+    state: &AppState,
+    user_id: &str,
+    inst: &instances::Instance,
+) -> (&'static str, Option<String>) {
+    let mut def = match instances::resolve_def(&state.db, inst).await {
+        Ok(d) => d,
+        Err(e) => return ("error", Some(format!("resolve failed: {e:#}"))),
+    };
+    if def.transport == "http" && def.url.as_deref().unwrap_or("").trim().is_empty() {
+        return ("error", Some("no remote URL set".into()));
+    }
+    // Git-sourced backends run from their prebuilt virtualenv; rewrite to a
+    // direct stdio exec, or report that they need building first.
+    if crate::gitsrc::is_git_source(&def) {
+        let ready = inst.build_status == "ready"
+            && crate::gitsrc::env_path(&state.config.env_dir, &inst.id).exists();
+        if !ready {
+            return (
+                "unbuilt",
+                Some("not built yet; run “Update from repository” first".into()),
+            );
+        }
+        match crate::gitsrc::launch_command(&state.config.env_dir, &inst.id, &def) {
+            Ok((program, args)) => {
+                def.transport = "stdio".into();
+                def.command = Some(program);
+                def.args = args;
+            }
+            Err(e) => return ("error", Some(format!("git launch failed: {e:#}"))),
+        }
+    }
+    let env = match instances::resolved_env(&state.db, &state.secrets, inst).await {
+        Ok(e) => e,
+        Err(e) => return ("error", Some(format!("config error: {e:#}"))),
+    };
+    let sandbox = state.sandbox_for(user_id).await;
+    match crate::proxy::backend::Backend::probe(&def, &env, sandbox.as_ref()).await {
+        Ok(()) => ("ok", None),
+        Err(e) => ("error", Some(format!("failed to start: {e:#}"))),
     }
 }
 

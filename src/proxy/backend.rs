@@ -40,36 +40,8 @@ impl Backend {
     ) -> Result<Backend> {
         let peer = match def.transport.as_str() {
             "stdio" => {
-                let program = def
-                    .command
-                    .clone()
-                    .ok_or_else(|| anyhow!("stdio backend '{namespace}' has no command"))?;
-                let args = def.args.clone();
-                let env = env.clone();
-                let sandbox = sandbox.cloned();
-                let cmd = tokio::process::Command::new(&program).configure(|c| {
-                    c.args(&args);
-                    // Don't leak the hub's own environment into the child.
-                    c.env_clear();
-                    for (k, v) in &env {
-                        c.env(k, v);
-                    }
-                    // Preserve PATH so `uvx`/`npx` can find interpreters.
-                    if let Ok(path) = std::env::var("PATH") {
-                        c.env("PATH", path);
-                    }
-                    // Drop the child to its per-user sandbox UID and point its
-                    // caches/HOME at a writable per-UID directory.
-                    if let Some(sb) = &sandbox {
-                        c.uid(sb.uid);
-                        c.gid(sb.gid);
-                        c.env("HOME", &sb.cache_dir);
-                        c.env("USER", "mcp-sandbox");
-                        c.env("XDG_CACHE_HOME", &sb.cache_dir);
-                        c.env("UV_CACHE_DIR", format!("{}/uv", sb.cache_dir));
-                        c.env("npm_config_cache", format!("{}/npm", sb.cache_dir));
-                    }
-                });
+                let cmd = stdio_command(def, env, sandbox)
+                    .with_context(|| format!("backend '{namespace}'"))?;
                 let transport = TokioChildProcess::new(cmd)
                     .with_context(|| format!("spawning backend '{namespace}'"))?;
                 serve_client((), transport)
@@ -77,14 +49,8 @@ impl Backend {
                     .with_context(|| format!("initializing stdio backend '{namespace}'"))?
             }
             "http" => {
-                let url = def
-                    .url
-                    .clone()
-                    .ok_or_else(|| anyhow!("http backend '{namespace}' has no url"))?;
-                let mut config = StreamableHttpClientTransportConfig::with_uri(url);
-                if let Some(auth) = env.get("AUTHORIZATION").filter(|v| !v.is_empty()) {
-                    config = config.auth_header(strip_bearer(auth));
-                }
+                let config =
+                    http_config(def, env).with_context(|| format!("backend '{namespace}'"))?;
                 let transport = StreamableHttpClientTransport::from_config(config);
                 serve_client((), transport)
                     .await
@@ -98,6 +64,57 @@ impl Backend {
             peer,
             _permit: permit,
         })
+    }
+
+    /// Try to start the backend once, complete the MCP `initialize` handshake,
+    /// then shut it straight back down — reporting why it failed. Unlike
+    /// [`spawn`](Self::spawn), a failing stdio child's **stderr is captured** and
+    /// folded into the error, so the caller sees the subprocess's own crash
+    /// output (e.g. a Python traceback) rather than just "connection closed".
+    /// Used by the "Test connection" button so a user can verify a server starts
+    /// without opening a fresh MCP client connection.
+    pub async fn probe(
+        def: &ServerDef,
+        env: &BTreeMap<String, String>,
+        sandbox: Option<&crate::sandbox::Sandbox>,
+    ) -> Result<()> {
+        match def.transport.as_str() {
+            "stdio" => {
+                let cmd = stdio_command(def, env, sandbox)?;
+                // Pipe stderr so we can surface the child's own error output if
+                // it dies before answering `initialize`.
+                let (transport, stderr) = TokioChildProcess::builder(cmd)
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .context("spawning backend")?;
+                match serve_client((), transport).await {
+                    Ok(peer) => {
+                        let _ = peer.cancel().await;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let tail = match stderr {
+                            Some(s) => read_stderr_tail(s).await,
+                            None => String::new(),
+                        };
+                        if tail.is_empty() {
+                            Err(anyhow::Error::new(e).context("initializing backend"))
+                        } else {
+                            Err(anyhow!("{e}\n--- server stderr ---\n{tail}"))
+                        }
+                    }
+                }
+            }
+            "http" => {
+                let transport = StreamableHttpClientTransport::from_config(http_config(def, env)?);
+                let peer = serve_client((), transport)
+                    .await
+                    .context("connecting http backend")?;
+                let _ = peer.cancel().await;
+                Ok(())
+            }
+            other => bail!("unsupported transport '{other}'"),
+        }
     }
 
     /// List this backend's tools, renamed into the hub namespace
@@ -212,6 +229,82 @@ impl Backend {
     }
 }
 
+/// Build the `Command` for an stdio backend: the configured command + args, a
+/// cleared environment with only the injected vars (+ `PATH`), and — when a
+/// sandbox is active — a drop to the per-user UID with caches/HOME pointed at a
+/// writable per-UID directory.
+fn stdio_command(
+    def: &ServerDef,
+    env: &BTreeMap<String, String>,
+    sandbox: Option<&crate::sandbox::Sandbox>,
+) -> Result<tokio::process::Command> {
+    let program = def
+        .command
+        .clone()
+        .ok_or_else(|| anyhow!("stdio backend has no command"))?;
+    let args = def.args.clone();
+    let env = env.clone();
+    let sandbox = sandbox.cloned();
+    Ok(tokio::process::Command::new(&program).configure(|c| {
+        c.args(&args);
+        // Don't leak the hub's own environment into the child.
+        c.env_clear();
+        for (k, v) in &env {
+            c.env(k, v);
+        }
+        // Preserve PATH so `uvx`/`npx` can find interpreters.
+        if let Ok(path) = std::env::var("PATH") {
+            c.env("PATH", path);
+        }
+        // Drop the child to its per-user sandbox UID and point its caches/HOME
+        // at a writable per-UID directory.
+        if let Some(sb) = &sandbox {
+            c.uid(sb.uid);
+            c.gid(sb.gid);
+            c.env("HOME", &sb.cache_dir);
+            c.env("USER", "mcp-sandbox");
+            c.env("XDG_CACHE_HOME", &sb.cache_dir);
+            c.env("UV_CACHE_DIR", format!("{}/uv", sb.cache_dir));
+            c.env("npm_config_cache", format!("{}/npm", sb.cache_dir));
+        }
+    }))
+}
+
+/// Build the Streamable-HTTP transport config for an http backend, applying the
+/// `AUTHORIZATION` env var as the bearer credential if present. (Returns the
+/// config rather than the transport so the concrete reqwest-backed type need not
+/// be named at the call sites.)
+fn http_config(
+    def: &ServerDef,
+    env: &BTreeMap<String, String>,
+) -> Result<StreamableHttpClientTransportConfig> {
+    let url = def
+        .url
+        .clone()
+        .ok_or_else(|| anyhow!("http backend has no url"))?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    if let Some(auth) = env.get("AUTHORIZATION").filter(|v| !v.is_empty()) {
+        config = config.auth_header(strip_bearer(auth));
+    }
+    Ok(config)
+}
+
+/// Drain a failed child's stderr (bounded in time and size) and return the tail
+/// — the end of a traceback is the useful part. Char-safe truncation.
+async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stderr.read_to_end(&mut buf),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&buf);
+    // Keep the last ~3000 characters without splitting a UTF-8 boundary.
+    let kept: Vec<char> = text.trim().chars().rev().take(3000).collect();
+    kept.into_iter().rev().collect()
+}
+
 /// Wrap a backend resource URI so it routes back to its namespace.
 ///
 /// Resources are identified by opaque URI (unlike tools/prompts, which have
@@ -237,5 +330,45 @@ fn strip_bearer(value: &str) -> String {
         trimmed[7..].trim().to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stdio_def(command: &str, args: &[&str]) -> ServerDef {
+        ServerDef {
+            name: "t".into(),
+            description: String::new(),
+            transport: "stdio".into(),
+            command: Some(command.into()),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            url: None,
+            runtime: "test".into(),
+            repo: None,
+            git_ref: None,
+            entry: None,
+            module: None,
+        }
+    }
+
+    /// A stdio backend that dies before answering `initialize` surfaces its own
+    /// stderr in the probe error — this is what the Test-connection button shows.
+    #[tokio::test]
+    async fn probe_captures_stderr_from_a_crashing_backend() {
+        let def = stdio_def("sh", &["-c", "echo BOOM_MARKER >&2; exit 1"]);
+        let err = Backend::probe(&def, &BTreeMap::new(), None)
+            .await
+            .expect_err("a backend that exits should fail to probe");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("BOOM_MARKER"), "stderr not captured: {msg}");
+    }
+
+    #[test]
+    fn strip_bearer_is_case_insensitive() {
+        assert_eq!(strip_bearer("Bearer abc"), "abc");
+        assert_eq!(strip_bearer("bearer  abc "), "abc");
+        assert_eq!(strip_bearer("abc"), "abc");
     }
 }
