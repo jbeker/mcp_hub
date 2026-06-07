@@ -50,7 +50,12 @@ fn esc(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// `/` — dashboard (requires login).
-pub async fn dashboard(State(state): State<AppState>, AuthUser(user): AuthUser) -> Response {
+pub async fn dashboard(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
     let admin_badge = if user.is_admin {
         r#"<span class="badge">admin</span>"#
     } else {
@@ -82,7 +87,7 @@ pub async fn dashboard(State(state): State<AppState>, AuthUser(user): AuthUser) 
     let body = format!(
         r#"<header class="row">
   <h1>MCP Hub</h1>
-  <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
+  <form method="post" action="/logout">{csrf}<button class="ghost">Sign out</button></form>
 </header>
 <p>Signed in as <strong>{handle}</strong> {badge}</p>
 <section>
@@ -90,6 +95,7 @@ pub async fn dashboard(State(state): State<AppState>, AuthUser(user): AuthUser) 
   {rows}
 </section>
 <p class="muted">Your MCP endpoint: <code>{mcp}</code></p>"#,
+        csrf = csrf,
         handle = esc(&user.handle),
         badge = admin_badge,
         rows = rows,
@@ -103,7 +109,12 @@ pub async fn dashboard(State(state): State<AppState>, AuthUser(user): AuthUser) 
 // ---------------------------------------------------------------------------
 
 /// `/servers/catalog` — pick a server to add.
-pub async fn catalog_page(State(state): State<AppState>, AuthUser(_user): AuthUser) -> Response {
+pub async fn catalog_page(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
     let entries = catalog::list(&state.db).await.unwrap_or_default();
     let mut cards = String::new();
     for e in &entries {
@@ -119,12 +130,14 @@ pub async fn catalog_page(State(state): State<AppState>, AuthUser(_user): AuthUs
   <p class="muted">{desc}</p>
   {note}
   <form method="post" action="/servers/add">
+    {csrf}
     <input type="hidden" name="catalog_id" value="{id}">
     <label>Namespace<input name="namespace" value="{slug}" required></label>
     <label>Display name<input name="display_name" value="{name}" required></label>
     <button type="submit" {disabled}>Add</button>
   </form>
 </div>"#,
+            csrf = csrf,
             name = esc(&e.name),
             transport = esc(&e.transport),
             desc = esc(&e.description),
@@ -140,8 +153,29 @@ pub async fn catalog_page(State(state): State<AppState>, AuthUser(_user): AuthUs
     page("Catalog", &body).into_response()
 }
 
+/// A form carrying only the CSRF token (for button-only POSTs).
+#[derive(Deserialize)]
+pub struct CsrfForm {
+    #[serde(default)]
+    pub csrf: String,
+}
+
+/// Render a 403 page for a missing/invalid CSRF token.
+fn forbidden() -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        page(
+            "Blocked",
+            r#"<h1>Request blocked</h1><p>Invalid or missing security token. Reload the page and try again.</p><p><a href="/">← Back</a></p>"#,
+        ),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct AddServerForm {
+    #[serde(default)]
+    pub csrf: String,
     pub catalog_id: String,
     pub namespace: String,
     pub display_name: String,
@@ -151,8 +185,12 @@ pub struct AddServerForm {
 pub async fn add_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
     Form(form): Form<AddServerForm>,
 ) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
     let entry = match catalog::get(&state.db, &form.catalog_id).await {
         Ok(Some(e)) => e,
         _ => return error_page("unknown catalog entry"),
@@ -183,8 +221,10 @@ pub async fn add_server(
 pub async fn server_detail(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
     Path(id): Path<String>,
 ) -> Response {
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
         return error_page("server not found");
     };
@@ -227,9 +267,9 @@ pub async fn server_detail(
     }
 
     let toggle = if inst.enabled {
-        r#"<form method="post" action="/servers/{id}/disable"><button class="ghost">Disable</button></form>"#
+        format!(r#"<form method="post" action="/servers/{{id}}/disable">{csrf}<button class="ghost">Disable</button></form>"#)
     } else {
-        r#"<form method="post" action="/servers/{id}/enable"><button class="ghost">Enable</button></form>"#
+        format!(r#"<form method="post" action="/servers/{{id}}/enable">{csrf}<button class="ghost">Enable</button></form>"#)
     }
     .replace("{id}", &esc(&inst.id));
 
@@ -237,18 +277,20 @@ pub async fn server_detail(
         r#"<header class="row"><h1>{name}</h1><a href="/">← Back</a></header>
 <p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
 <form method="post" action="/servers/{id}/config">
+  {csrf}
   {fields}
   <button type="submit">Save configuration</button>
 </form>
 <div class="row" style="margin-top:18px">
   {toggle}
-  <form method="post" action="/servers/{id}/delete" onsubmit="return confirm('Remove this server?')"><button class="ghost danger">Remove</button></form>
+  <form method="post" action="/servers/{id}/delete" onsubmit="return confirm('Remove this server?')">{csrf}<button class="ghost danger">Remove</button></form>
 </div>"#,
         name = esc(&inst.display_name),
         ns = esc(&inst.namespace),
         transport = esc(&def.transport),
         status = if inst.enabled { "enabled" } else { "disabled" },
         id = esc(&inst.id),
+        csrf = csrf,
         fields = fields,
         toggle = toggle,
     );
@@ -259,9 +301,13 @@ pub async fn server_detail(
 pub async fn save_config(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
     Path(id): Path<String>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, form.get("csrf").map(String::as_str).unwrap_or("")) {
+        return forbidden();
+    }
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
         return error_page("server not found");
     };
@@ -305,24 +351,39 @@ async fn set_enabled_and_redirect(
 pub async fn enable_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
     Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
     set_enabled_and_redirect(&state, &user.id, &id, true).await
 }
 
 pub async fn disable_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
     Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
     set_enabled_and_redirect(&state, &user.id, &id, false).await
 }
 
 pub async fn delete_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
     Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
     if instances::get_owned(&state.db, &id, &user.id).await.ok().flatten().is_none() {
         return error_page("server not found");
     }

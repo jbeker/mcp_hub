@@ -2,6 +2,7 @@
 //! authenticated user from them.
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -59,6 +60,59 @@ pub fn take_next(jar: &SignedCookieJar) -> String {
     jar.get(NEXT_COOKIE)
         .and_then(|c| safe_next(c.value()))
         .unwrap_or_else(|| "/".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// CSRF tokens (synchronizer token, derived from the session secret)
+// ---------------------------------------------------------------------------
+
+/// Derive a CSRF token from the session id. The session id is a high-entropy
+/// secret held only in an HttpOnly signed cookie, so a cross-site attacker
+/// cannot compute this token, while same-origin pages can embed it.
+fn csrf_token(master_key: &[u8; 32], session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"hub-csrf-v1");
+    h.update(master_key);
+    h.update(session_id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+}
+
+fn session_id(jar: &SignedCookieJar) -> Option<String> {
+    jar.get(SESSION_COOKIE).map(|c| c.value().to_string())
+}
+
+/// The CSRF token for the current session, or `None` if unauthenticated.
+pub fn csrf_for(jar: &SignedCookieJar, master_key: &[u8; 32]) -> Option<String> {
+    session_id(jar).map(|sid| csrf_token(master_key, &sid))
+}
+
+/// A ready-to-embed hidden form field carrying the CSRF token.
+pub fn csrf_field(jar: &SignedCookieJar, master_key: &[u8; 32]) -> String {
+    match csrf_for(jar, master_key) {
+        Some(t) => format!(r#"<input type="hidden" name="csrf" value="{t}">"#),
+        None => String::new(),
+    }
+}
+
+/// Constant-time check of a submitted CSRF token against the session's token.
+pub fn check_csrf(jar: &SignedCookieJar, master_key: &[u8; 32], submitted: &str) -> bool {
+    match csrf_for(jar, master_key) {
+        Some(expected) => constant_time_eq(expected.as_bytes(), submitted.as_bytes()),
+        None => false,
+    }
+}
+
+/// Length-aware constant-time byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Create a session row for a user and return its id.

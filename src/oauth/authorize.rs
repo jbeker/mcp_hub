@@ -162,12 +162,19 @@ pub async fn authorize(
         .filter(|s| !s.is_empty())
         .unwrap_or(&q.client_id)
         .to_string();
-    (jar, Html(consent_html(&client_name, &pending.scope, &user.handle))).into_response()
+    let csrf = crate::auth::session::csrf_field(&jar, &state.config.master_key);
+    (
+        jar,
+        Html(consent_html(&client_name, &pending.scope, &user.handle, &csrf)),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
 pub struct Decision {
     pub decision: String,
+    #[serde(default)]
+    pub csrf: String,
 }
 
 /// `POST /authorize/decision`
@@ -177,6 +184,9 @@ pub async fn decision(
     jar: SignedCookieJar,
     Form(form): Form<Decision>,
 ) -> Response {
+    if !crate::auth::session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return error_page("invalid security token; please restart authorization");
+    }
     let Some(raw) = jar.get(AUTHREQ_COOKIE).map(|c| c.value().to_string()) else {
         return error_page("no authorization in progress");
     };
@@ -262,7 +272,7 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn consent_html(client_name: &str, scope: &str, handle: &str) -> String {
+fn consent_html(client_name: &str, scope: &str, handle: &str, csrf: &str) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -273,10 +283,12 @@ fn consent_html(client_name: &str, scope: &str, handle: &str) -> String {
   <p><strong>{client}</strong> wants to connect to your MCP Hub as <strong>{handle}</strong>.</p>
   <p class="muted">Requested scope: <code>{scope}</code></p>
   <form method="post" action="/authorize/decision">
+    {csrf}
     <button name="decision" value="approve" type="submit">Authorize</button>
     <button name="decision" value="deny" type="submit" class="ghost" style="width:100%;margin-top:10px">Deny</button>
   </form>
 </main></body></html>"#,
+        csrf = csrf,
         client = esc(client_name),
         handle = esc(handle),
         scope = esc(scope),

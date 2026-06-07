@@ -377,11 +377,25 @@ pub async fn login_finish(
     Ok((jar, Json(FinishResponse { ok: true, redirect })))
 }
 
+/// Form body for logout (carries the CSRF token).
+#[derive(serde::Deserialize)]
+pub struct LogoutForm {
+    #[serde(default)]
+    pub csrf: String,
+}
+
 /// Log out: delete the session and clear the cookie.
-pub async fn logout(State(state): State<AppState>, jar: SignedCookieJar) -> impl IntoResponse {
+pub async fn logout(
+    State(state): State<AppState>,
+    jar: SignedCookieJar,
+    axum::Form(form): axum::Form<LogoutForm>,
+) -> axum::response::Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return (StatusCode::FORBIDDEN, "invalid security token").into_response();
+    }
     if let Some(sid) = jar.get(session::SESSION_COOKIE).map(|c| c.value().to_string()) {
         let _ = session::delete(&state.db, &sid).await;
     }
     let jar = jar.add(session::clear_session_cookie(state.config.cookie_secure()));
-    (jar, axum::response::Redirect::to("/login"))
+    (jar, axum::response::Redirect::to("/login")).into_response()
 }

@@ -329,15 +329,17 @@ async fn full_consent_flow_issues_and_exchanges_code() {
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
     let authreq = set_cookie(&get, "hub_authreq").expect("authreq cookie set");
-    assert!(text_body(get).await.contains("My Client"));
+    let consent_html = text_body(get).await;
+    assert!(consent_html.contains("My Client"));
+    let csrf = extract_csrf(&consent_html).expect("consent page carries a CSRF token");
 
-    // POST the approval, carrying session + authreq cookies.
+    // POST the approval, carrying session + authreq cookies and the CSRF token.
     let decision = app(state.clone())
         .oneshot(
             Request::post("/authorize/decision")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("cookie", format!("{session_header}; {authreq}"))
-                .body(Body::from("decision=approve"))
+                .body(Body::from(format!("decision=approve&csrf={}", urlencoding(&csrf))))
                 .unwrap(),
         )
         .await
@@ -388,6 +390,64 @@ async fn full_consent_flow_issues_and_exchanges_code() {
         .unwrap();
     assert_eq!(refreshed.status(), StatusCode::OK);
     assert!(json_body(refreshed).await["access_token"].is_string());
+}
+
+#[tokio::test]
+async fn consent_without_csrf_is_rejected() {
+    let state = test_state().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let sid = session::create(&state.db, &user.id).await.unwrap();
+    let session_header = signed_session_cookie(&state, &sid);
+    store::create_client(
+        &state.db,
+        "client-x",
+        None,
+        &["http://127.0.0.1:9999/cb".into()],
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+
+    let challenge = b64url(&sha256(b"verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    let uri = format!(
+        "/authorize?response_type=code&client_id=client-x&redirect_uri={}&code_challenge={}&code_challenge_method=S256",
+        urlencoding("http://127.0.0.1:9999/cb"),
+        challenge,
+    );
+    let get = app(state.clone())
+        .oneshot(
+            Request::get(&uri)
+                .header("cookie", &session_header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let authreq = set_cookie(&get, "hub_authreq").unwrap();
+
+    // Approve with a forged/missing CSRF token: must not issue a code.
+    let decision = app(state)
+        .oneshot(
+            Request::post("/authorize/decision")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", format!("{session_header}; {authreq}"))
+                .body(Body::from("decision=approve&csrf=forged"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // No redirect to the client (no code leaked); an error page is shown instead.
+    assert_ne!(decision.status(), StatusCode::SEE_OTHER);
+}
+
+/// Pull the hidden CSRF token value out of a rendered HTML form.
+fn extract_csrf(html: &str) -> Option<String> {
+    let marker = "name=\"csrf\" value=\"";
+    let start = html.find(marker)? + marker.len();
+    let end = html[start..].find('"')? + start;
+    Some(html[start..end].to_string())
 }
 
 /// Minimal percent-encoding for test request bodies.
