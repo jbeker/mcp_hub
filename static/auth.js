@@ -107,7 +107,8 @@ async function doLogin(handle) {
 function wire() {
   const reg = document.getElementById("register-form");
   if (reg) {
-    reg.addEventListener("submit", async () => {
+    reg.addEventListener("submit", async (e) => {
+      e.preventDefault();
       const err = document.getElementById("register-error");
       err.textContent = "";
       try {
@@ -122,7 +123,8 @@ function wire() {
   }
   const login = document.getElementById("login-form");
   if (login) {
-    login.addEventListener("submit", async () => {
+    login.addEventListener("submit", async (e) => {
+      e.preventDefault();
       const err = document.getElementById("login-error");
       err.textContent = "";
       try {
@@ -132,6 +134,13 @@ function wire() {
       }
     });
   }
+  // Confirm-before-submit for forms marked with data-confirm (replaces the
+  // inline onsubmit handlers that a strict CSP would block).
+  document.querySelectorAll("form[data-confirm]").forEach((f) => {
+    f.addEventListener("submit", (e) => {
+      if (!window.confirm(f.getAttribute("data-confirm"))) e.preventDefault();
+    });
+  });
 }
 
 document.addEventListener("DOMContentLoaded", wire);

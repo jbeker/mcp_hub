@@ -283,7 +283,7 @@ pub async fn server_detail(
 </form>
 <div class="row" style="margin-top:18px">
   {toggle}
-  <form method="post" action="/servers/{id}/delete" onsubmit="return confirm('Remove this server?')">{csrf}<button class="ghost danger">Remove</button></form>
+  <form method="post" action="/servers/{id}/delete" data-confirm="Remove this server?">{csrf}<button class="ghost danger">Remove</button></form>
 </div>"#,
         name = esc(&inst.display_name),
         ns = esc(&inst.namespace),
@@ -420,7 +420,7 @@ pub async fn login_page(
     }
     let jar = with_next(jar, &state, q.next);
     let body = r#"<h1>Sign in</h1>
-<form id="login-form" onsubmit="return false;">
+<form id="login-form">
   <label>Handle<input id="login-handle" name="handle" autocomplete="username webauthn" required></label>
   <button id="login-btn" type="submit">Sign in with passkey</button>
 </form>
@@ -441,7 +441,7 @@ pub async fn register_page(
     }
     let jar = with_next(jar, &state, q.next);
     let body = r#"<h1>Create account</h1>
-<form id="register-form" onsubmit="return false;">
+<form id="register-form">
   <label>Handle<input id="reg-handle" name="handle" autocomplete="username" required></label>
   <label>Display name<input id="reg-display" name="display_name" required></label>
   <button id="register-btn" type="submit">Create account &amp; passkey</button>

@@ -132,6 +132,13 @@ impl Signer {
 
     /// Verify an access token and check the audience binding.
     pub fn verify_access_token(&self, token: &str, expected_audience: &str) -> Result<AccessClaims> {
+        // Pin the key by id: a token signed under a different/unknown kid is
+        // rejected outright, so introducing new keys later cannot be abused.
+        let header = jsonwebtoken::decode_header(token).map_err(|e| anyhow!("invalid token: {e}"))?;
+        match header.kid {
+            Some(kid) if kid == self.kid => {}
+            _ => return Err(anyhow!("invalid token: unknown signing key")),
+        }
         let mut validation = Validation::new(Algorithm::ES256);
         validation.set_issuer(std::slice::from_ref(&self.issuer));
         validation.set_audience(&[expected_audience]);

@@ -76,7 +76,7 @@ impl FromRef<AppState> for Key {
 
 /// Build the application router. `static_dir` is the path to served assets.
 pub fn build_router(state: AppState, static_dir: &str) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         // Web UI
         .route("/", get(web::dashboard))
@@ -120,7 +120,32 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .nest_service("/mcp", crate::proxy::mcp_router(state.clone()))
         // Static assets
         .nest_service("/static", ServeDir::new(static_dir))
-        .with_state(state)
+        .with_state(state);
+
+    // Conservative security headers on every response. TLS/HSTS is the reverse
+    // proxy's job; these cover framing, MIME sniffing, referrer leakage, and a
+    // CSP that forbids inline scripts.
+    const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+        img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'";
+    use axum::http::{header, HeaderValue};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    router
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CSP),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
 }
 
 async fn healthz() -> &'static str {

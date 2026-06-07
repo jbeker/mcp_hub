@@ -35,6 +35,20 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegistrationRequest>,
 ) -> Result<impl IntoResponse, OAuthError> {
+    // Open DCR is unauthenticated; cap total clients so it cannot fill the DB.
+    const MAX_CLIENTS: i64 = 10_000;
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_clients")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| OAuthError::from(anyhow::Error::from(e)))?;
+    if count >= MAX_CLIENTS {
+        return Err(OAuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "client registration is temporarily unavailable",
+        ));
+    }
+
     if req.redirect_uris.is_empty() {
         return Err(OAuthError::new(
             StatusCode::BAD_REQUEST,

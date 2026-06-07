@@ -53,6 +53,25 @@ async fn healthz_ok() {
 }
 
 #[tokio::test]
+async fn responses_carry_security_headers() {
+    let resp = app(test_state().await)
+        .oneshot(Request::get("/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let h = resp.headers();
+    assert_eq!(h["x-frame-options"], "DENY");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert!(h["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("frame-ancestors 'none'"));
+    assert!(h["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("script-src 'self'"));
+}
+
+#[tokio::test]
 async fn login_page_renders() {
     let resp = app(test_state().await)
         .oneshot(Request::get("/login").body(Body::empty()).unwrap())

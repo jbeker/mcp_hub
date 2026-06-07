@@ -68,7 +68,7 @@ async fn authenticate_client(
         })?;
     if let Some(expected) = &client.client_secret_hash {
         let ok = client_secret
-            .map(|s| &token_hash(s) == expected)
+            .map(|s| crate::oauth::ct_eq(token_hash(s).as_bytes(), expected.as_bytes()))
             .unwrap_or(false);
         if !ok {
             return Err(OAuthError::new(
@@ -107,10 +107,14 @@ async fn authorization_code(
     if row.client_id != client_id {
         return Err(OAuthError::invalid_grant("code was issued to another client"));
     }
-    if let Some(redirect_uri) = &form.redirect_uri {
-        if redirect_uri != &row.redirect_uri {
-            return Err(OAuthError::invalid_grant("redirect_uri mismatch"));
-        }
+    // redirect_uri was required at authorization, so it must be supplied here
+    // and match exactly (RFC 6749 §4.1.3).
+    let redirect_uri = form
+        .redirect_uri
+        .as_deref()
+        .ok_or_else(|| OAuthError::invalid_request("redirect_uri is required"))?;
+    if redirect_uri != row.redirect_uri {
+        return Err(OAuthError::invalid_grant("redirect_uri mismatch"));
     }
     if !verify_pkce_s256(verifier, &row.code_challenge) {
         return Err(OAuthError::invalid_grant("PKCE verification failed"));

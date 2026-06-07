@@ -258,14 +258,27 @@ pub async fn register_finish(
         return Err(ApiError::new(StatusCode::CONFLICT, "that handle is taken"));
     }
 
-    let user = users::create(
-        &state.db,
-        &ceremony.user_id.to_string(),
-        &ceremony.handle,
-        &ceremony.display_name,
-        ceremony.is_admin,
-    )
-    .await
+    // Decide admin atomically at insert time. The ceremony's is_admin flag
+    // reflects the policy at start; the actual grant happens only if this is
+    // still the first account, closing the concurrent-bootstrap race.
+    let user = if ceremony.is_admin {
+        users::create_admin_if_first(
+            &state.db,
+            &ceremony.user_id.to_string(),
+            &ceremony.handle,
+            &ceremony.display_name,
+        )
+        .await
+    } else {
+        users::create(
+            &state.db,
+            &ceremony.user_id.to_string(),
+            &ceremony.handle,
+            &ceremony.display_name,
+            false,
+        )
+        .await
+    }
     .map_err(ApiError::from)?;
     users::insert_credential(&state.db, &user.id, &passkey, "passkey")
         .await

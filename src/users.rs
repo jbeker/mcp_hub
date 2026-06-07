@@ -53,6 +53,62 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<User>> {
     Ok(users)
 }
 
+/// Create a user, granting admin only if this is the very first account.
+///
+/// Uses `BEGIN IMMEDIATE` so the count-and-insert is serialized: under a race
+/// between two first registrations, exactly one observes an empty table and
+/// becomes admin.
+pub async fn create_admin_if_first(
+    pool: &SqlitePool,
+    id: &str,
+    handle: &str,
+    display_name: &str,
+) -> Result<User> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .context("starting immediate transaction")?;
+
+    let result: Result<User> = async {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&mut *conn)
+            .await?;
+        let is_admin = n == 0;
+        let created_at = now_unix();
+        sqlx::query(
+            "INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(handle)
+        .bind(display_name)
+        .bind(is_admin)
+        .bind(created_at)
+        .execute(&mut *conn)
+        .await
+        .context("inserting user")?;
+        Ok(User {
+            id: id.to_string(),
+            handle: handle.to_string(),
+            display_name: display_name.to_string(),
+            is_admin,
+            created_at,
+        })
+    }
+    .await;
+
+    match result {
+        Ok(user) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(user)
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(e)
+        }
+    }
+}
+
 /// Create a user with a freshly generated id.
 pub async fn create(
     pool: &SqlitePool,
