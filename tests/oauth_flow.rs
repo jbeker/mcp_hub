@@ -393,6 +393,62 @@ async fn full_consent_flow_issues_and_exchanges_code() {
 }
 
 #[tokio::test]
+async fn refresh_token_reuse_revokes_the_family() {
+    let state = test_state().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    store::create_client(&state.db, "c", None, &["http://x/cb".into()], &serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Mint an initial refresh token via the authorization_code grant.
+    let verifier = "reuse-verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let challenge = b64url(&sha256(verifier.as_bytes()));
+    store::insert_code(&state.db, "rc", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
+        .await
+        .unwrap();
+    let _ = user;
+    let tok = app(state.clone())
+        .oneshot(
+            Request::post("/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code=rc&client_id=c&redirect_uri=http://x/cb&code_verifier={verifier}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let r1 = json_body(tok).await["refresh_token"].as_str().unwrap().to_string();
+
+    // First rotation succeeds and yields r2.
+    let refresh = |rt: String| {
+        app(state.clone()).oneshot(
+            Request::post("/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=refresh_token&refresh_token={}&client_id=c",
+                    urlencoding(&rt)
+                )))
+                .unwrap(),
+        )
+    };
+    let resp1 = refresh(r1.clone()).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let r2 = json_body(resp1).await["refresh_token"].as_str().unwrap().to_string();
+
+    // Replaying the now-consumed r1 must be rejected (reuse detected)...
+    let replay = refresh(r1).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(replay).await["error"], "invalid_grant");
+
+    // ...and it revokes the whole family, so the legitimate r2 also stops working.
+    let after = refresh(r2).await.unwrap();
+    assert_eq!(after.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn consent_without_csrf_is_rejected() {
     let state = test_state().await;
     let user = users::create(&state.db, "u1", "alice", "Alice", false)

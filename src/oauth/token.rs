@@ -125,7 +125,9 @@ async fn authorization_code(
         .clone()
         .unwrap_or_else(|| state.config.mcp_url());
 
-    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref()).await
+    // A new authorization starts a fresh refresh-token family.
+    let family_id = crate::util::new_id();
+    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &family_id).await
 }
 
 async fn refresh_token(
@@ -144,9 +146,21 @@ async fn refresh_token(
     authenticate_client(state, client_id, form.client_secret.as_deref()).await?;
 
     let hash = token_hash(token);
-    let row = store::get_refresh(&state.db, &hash)
-        .await?
-        .ok_or_else(|| OAuthError::invalid_grant("refresh token is invalid or expired"))?;
+    let row = match store::consume_refresh(&state.db, &hash).await? {
+        store::RefreshOutcome::Valid(row) => row,
+        store::RefreshOutcome::Replayed { family_id } => {
+            // A rotated-out token was replayed: revoke the entire family so a
+            // thief who raced the legitimate client cannot keep refreshing.
+            store::revoke_family(&state.db, &family_id).await?;
+            tracing::warn!(family = %family_id, client = %client_id, "refresh token reuse detected; family revoked");
+            return Err(OAuthError::invalid_grant(
+                "refresh token reuse detected; the session has been revoked",
+            ));
+        }
+        store::RefreshOutcome::Missing => {
+            return Err(OAuthError::invalid_grant("refresh token is invalid or expired"))
+        }
+    };
     if row.client_id != client_id {
         return Err(OAuthError::invalid_grant("refresh token was issued to another client"));
     }
@@ -155,17 +169,16 @@ async fn refresh_token(
         .await?
         .ok_or_else(|| OAuthError::invalid_grant("user no longer exists"))?;
 
-    // Rotate: invalidate the presented refresh token before issuing a new one.
-    store::delete_refresh(&state.db, &hash).await?;
-
     let audience = row
         .resource
         .clone()
         .unwrap_or_else(|| state.config.mcp_url());
-    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref()).await
+    // Stay in the same family so the rotation chain is tracked.
+    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &row.family_id).await
 }
 
-/// Mint an access token + a fresh (rotated) refresh token.
+/// Mint an access token + a fresh (rotated) refresh token within `family_id`.
+#[allow(clippy::too_many_arguments)]
 async fn issue_tokens(
     state: &AppState,
     user: &users::User,
@@ -173,6 +186,7 @@ async fn issue_tokens(
     audience: &str,
     scope: &str,
     resource: Option<&str>,
+    family_id: &str,
 ) -> Result<serde_json::Value, OAuthError> {
     let (access, ttl) = state
         .signer
@@ -186,6 +200,7 @@ async fn issue_tokens(
         &user.id,
         scope,
         resource,
+        family_id,
         REFRESH_TTL_SECS,
     )
     .await?;

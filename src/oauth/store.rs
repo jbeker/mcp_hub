@@ -144,8 +144,10 @@ pub struct RefreshToken {
     pub user_id: String,
     pub scope: String,
     pub resource: Option<String>,
+    pub family_id: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_refresh(
     pool: &SqlitePool,
     token_hash: &str,
@@ -153,18 +155,20 @@ pub async fn insert_refresh(
     user_id: &str,
     scope: &str,
     resource: Option<&str>,
+    family_id: &str,
     ttl_secs: i64,
 ) -> Result<()> {
     let now = now_unix();
     sqlx::query(
-        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scope, resource, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scope, resource, family_id, consumed, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
     )
     .bind(token_hash)
     .bind(client_id)
     .bind(user_id)
     .bind(scope)
     .bind(resource)
+    .bind(family_id)
     .bind(now)
     .bind(now + ttl_secs)
     .execute(pool)
@@ -173,33 +177,68 @@ pub async fn insert_refresh(
     Ok(())
 }
 
-/// Look up a (valid, unexpired) refresh token by its hash.
-pub async fn get_refresh(pool: &SqlitePool, token_hash: &str) -> Result<Option<RefreshToken>> {
-    let row: Option<(String, String, String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT client_id, user_id, scope, resource, expires_at
+/// The outcome of presenting a refresh token at the token endpoint.
+pub enum RefreshOutcome {
+    /// Valid first use; the token is now marked consumed.
+    Valid(RefreshToken),
+    /// An already-consumed token was replayed — the family must be revoked.
+    Replayed { family_id: String },
+    /// Unknown or expired.
+    Missing,
+}
+
+/// Columns selected from `oauth_refresh_tokens` when consuming a token.
+type RefreshRow = (String, String, String, Option<String>, String, bool, i64);
+
+/// Atomically consume a refresh token, detecting replay of a rotated token.
+pub async fn consume_refresh(pool: &SqlitePool, token_hash: &str) -> Result<RefreshOutcome> {
+    let mut tx = pool.begin().await?;
+    let row: Option<RefreshRow> = sqlx::query_as(
+        "SELECT client_id, user_id, scope, resource, family_id, consumed, expires_at
          FROM oauth_refresh_tokens WHERE token_hash = ?",
     )
     .bind(token_hash)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((client_id, user_id, scope, resource, expires_at)) = row else {
-        return Ok(None);
+
+    let Some((client_id, user_id, scope, resource, family_id, consumed, expires_at)) = row else {
+        tx.commit().await?;
+        return Ok(RefreshOutcome::Missing);
     };
+
     if expires_at < now_unix() {
-        let _ = delete_refresh(pool, token_hash).await;
-        return Ok(None);
+        sqlx::query("DELETE FROM oauth_refresh_tokens WHERE token_hash = ?")
+            .bind(token_hash)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(RefreshOutcome::Missing);
     }
-    Ok(Some(RefreshToken {
+
+    if consumed {
+        tx.commit().await?;
+        return Ok(RefreshOutcome::Replayed { family_id });
+    }
+
+    // First use: mark consumed so a later replay is detected.
+    sqlx::query("UPDATE oauth_refresh_tokens SET consumed = 1 WHERE token_hash = ?")
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(RefreshOutcome::Valid(RefreshToken {
         client_id,
         user_id,
         scope,
         resource,
+        family_id,
     }))
 }
 
-pub async fn delete_refresh(pool: &SqlitePool, token_hash: &str) -> Result<()> {
-    sqlx::query("DELETE FROM oauth_refresh_tokens WHERE token_hash = ?")
-        .bind(token_hash)
+/// Revoke every token in a family (used when reuse is detected).
+pub async fn revoke_family(pool: &SqlitePool, family_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM oauth_refresh_tokens WHERE family_id = ?")
+        .bind(family_id)
         .execute(pool)
         .await?;
     Ok(())
