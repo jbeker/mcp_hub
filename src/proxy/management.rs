@@ -426,9 +426,11 @@ async fn update_server(
     }
     // Serialize builds: they are slow and disk-bound.
     let _guard = state.build_lock.lock().await;
-    let report = crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def)
-        .await
-        .map_err(bad_request)?;
+    let uid = state.sandbox_uid(user_id).await;
+    let report =
+        crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, uid)
+            .await
+            .map_err(bad_request)?;
     ok(json!({
         "namespace": namespace,
         "updated": report.changed,

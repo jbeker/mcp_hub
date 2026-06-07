@@ -80,6 +80,8 @@ impl HubProxy {
             }
         };
         let per_user_cap = self.state.config.limits.max_backends_per_user;
+        // The per-user sandbox identity for this user's stdio subprocesses.
+        let sandbox = self.state.sandbox_for(user_id).await;
         let enabled: Vec<_> = instances.into_iter().filter(|i| i.enabled).collect();
         for (idx, inst) in enabled.iter().enumerate() {
             if out.len() >= per_user_cap {
@@ -143,6 +145,7 @@ impl HubProxy {
                 inst.namespace.clone(),
                 inst.display_name.clone(),
                 permit,
+                sandbox.as_ref(),
             )
             .await
             {

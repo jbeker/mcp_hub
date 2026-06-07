@@ -29,6 +29,10 @@ pub struct Config {
     pub bootstrap_admin: Option<String>,
     /// Whether anyone may self-register after the first (admin) account exists.
     pub allow_open_registration: bool,
+    /// Base UID for the per-user stdio sandbox (`HUB_SANDBOX_UID_BASE`). When set
+    /// and the hub runs as root, each user's stdio subprocesses run as
+    /// `base + the user's slot`. Unset → no sandbox (dev/test).
+    pub sandbox_uid_base: Option<u32>,
     /// Backend lifecycle limits.
     pub limits: Limits,
 }
@@ -78,6 +82,8 @@ impl Config {
         let allow_open_registration = opt("HUB_ALLOW_OPEN_REGISTRATION")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
+        // A base of 0 (or unset) disables sandboxing — never run children as root.
+        let sandbox_uid_base = opt_parse::<u32>("HUB_SANDBOX_UID_BASE")?.filter(|&b| b > 0);
 
         let mut limits = Limits::default();
         if let Some(v) = opt_parse("HUB_MAX_BACKENDS_PER_USER")? {
@@ -99,6 +105,7 @@ impl Config {
             master_key,
             bootstrap_admin,
             allow_open_registration,
+            sandbox_uid_base,
             limits,
         })
     }

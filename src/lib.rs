@@ -9,6 +9,7 @@ pub mod instances;
 pub mod invites;
 pub mod oauth;
 pub mod proxy;
+pub mod sandbox;
 pub mod users;
 pub mod util;
 pub mod web;
@@ -55,6 +56,12 @@ impl AppState {
         let signer = Arc::new(Signer::load_or_create(&db, &secrets, &config.base_url).await?);
         // Convert any legacy catalog-backed instances into self-contained defs.
         crate::instances::migrate_catalog_instances(&db, &secrets).await?;
+        // Give every existing user a sandbox slot, and lock the DB to root when
+        // sandboxing stdio (so dropped subprocesses can't read the secrets DB).
+        crate::users::assign_sandbox_slots(&db).await?;
+        if config.sandbox_uid_base.is_some() && crate::sandbox::is_root() {
+            crate::sandbox::lock_database(&config.db_path);
+        }
         let cookie_key = derive_cookie_key(&config.master_key);
         let backend_slots = Arc::new(Semaphore::new(config.limits.max_backends_global));
         Ok(Self {
@@ -69,6 +76,26 @@ impl AppState {
             config: Arc::new(config),
             db,
         })
+    }
+
+    /// The absolute sandbox UID a given user's stdio subprocesses run as, or
+    /// `None` if sandboxing is off (no base, not root, or no slot).
+    pub async fn sandbox_uid(&self, user_id: &str) -> Option<u32> {
+        let slot = crate::users::sandbox_slot(&self.db, user_id).await.ok().flatten();
+        crate::sandbox::uid_for(self.config.sandbox_uid_base, slot)
+    }
+
+    /// The prepared [`Sandbox`](crate::sandbox::Sandbox) for a user (creates the
+    /// per-UID cache dir), or `None` if sandboxing is off.
+    pub async fn sandbox_for(&self, user_id: &str) -> Option<crate::sandbox::Sandbox> {
+        let uid = self.sandbox_uid(user_id).await?;
+        match crate::sandbox::prepare(uid, &self.config.env_dir) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(uid, error = %e, "could not prepare sandbox; running unsandboxed");
+                None
+            }
+        }
     }
 }
 

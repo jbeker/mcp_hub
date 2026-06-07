@@ -23,6 +23,7 @@ fn test_config() -> Config {
         master_key: [7u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
+        sandbox_uid_base: None,
         limits: Limits::default(),
     }
 }

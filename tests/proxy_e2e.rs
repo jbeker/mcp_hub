@@ -36,6 +36,7 @@ async fn spawn_hub() -> (String, AppState) {
         master_key: [1u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
+        sandbox_uid_base: None,
         limits: Limits::default(),
     };
     let state = AppState::new(config, pool).await.unwrap();

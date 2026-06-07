@@ -63,6 +63,34 @@ pub async fn count_admins(pool: &SqlitePool) -> Result<i64> {
     Ok(n)
 }
 
+/// The user's sandbox slot (a small stable per-user integer), if assigned.
+pub async fn sandbox_slot(pool: &SqlitePool, user_id: &str) -> Result<Option<i64>> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT sandbox_uid FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(slot,)| slot))
+}
+
+/// Assign a sandbox slot to every user that lacks one (startup backfill). Slots
+/// are dense and monotonic; new users get one at creation.
+pub async fn assign_sandbox_slots(pool: &SqlitePool) -> Result<()> {
+    let ids: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM users WHERE sandbox_uid IS NULL ORDER BY created_at, id")
+            .fetch_all(pool)
+            .await?;
+    for (id,) in ids {
+        sqlx::query(
+            "UPDATE users SET sandbox_uid = (SELECT COALESCE(MAX(sandbox_uid), -1) + 1 FROM users) WHERE id = ?",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Enable or disable a user. A disabled user cannot sign in or use the proxy.
 pub async fn set_disabled(pool: &SqlitePool, id: &str, disabled: bool) -> Result<()> {
     sqlx::query("UPDATE users SET disabled = ? WHERE id = ?")
@@ -98,7 +126,8 @@ pub async fn create_admin_if_first(
         let is_admin = n == 0;
         let created_at = now_unix();
         sqlx::query(
-            "INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, handle, display_name, is_admin, created_at, sandbox_uid) \
+             VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sandbox_uid), -1) + 1 FROM users))",
         )
         .bind(id)
         .bind(handle)
@@ -141,7 +170,8 @@ pub async fn create(
 ) -> Result<User> {
     let created_at = now_unix();
     sqlx::query(
-        "INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, handle, display_name, is_admin, created_at, sandbox_uid) \
+         VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sandbox_uid), -1) + 1 FROM users))",
     )
     .bind(id)
     .bind(handle)
@@ -322,5 +352,30 @@ mod tests {
 
         assert!(delete_credential(&pool, &u.id, "c1").await.unwrap());
         assert_eq!(count_credentials(&pool, &u.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sandbox_slots_are_assigned_and_distinct() {
+        let pool = pool().await;
+        let a = create(&pool, "a", "alice", "Alice", false).await.unwrap();
+        let b = create(&pool, "b", "bob", "Bob", false).await.unwrap();
+        let sa = sandbox_slot(&pool, &a.id).await.unwrap();
+        let sb = sandbox_slot(&pool, &b.id).await.unwrap();
+        assert!(sa.is_some() && sb.is_some());
+        assert_ne!(sa, sb);
+
+        // A user inserted without a slot is backfilled.
+        sqlx::query(
+            "INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES ('c','carol','Carol',0,99)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sandbox_slot(&pool, "c").await.unwrap().is_none());
+        assign_sandbox_slots(&pool).await.unwrap();
+        let sc = sandbox_slot(&pool, "c").await.unwrap();
+        assert!(sc.is_some());
+        assert_ne!(sc, sa);
+        assert_ne!(sc, sb);
     }
 }

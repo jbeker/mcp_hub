@@ -204,6 +204,7 @@ pub async fn update_instance(
     env_dir: &str,
     inst: &Instance,
     def: &ServerDef,
+    owner_uid: Option<u32>,
 ) -> Result<UpdateReport> {
     if !is_git_source(def) {
         bail!("'{}' is not a git-sourced server", inst.namespace);
@@ -232,6 +233,13 @@ pub async fn update_instance(
 
     match build_env(env_dir, &inst.id, repo, &commit).await {
         Ok(()) => {
+            // Hand the built venv to the owner's sandbox UID so it can run it.
+            if let Some(uid) = owner_uid {
+                let path = env_path(env_dir, &inst.id);
+                if let Err(e) = crate::sandbox::chown_recursive(&path.to_string_lossy(), uid, uid) {
+                    tracing::warn!(error = %e, "could not chown built venv to sandbox uid");
+                }
+            }
             instances::set_build_state(pool, &inst.id, "ready", Some(&commit)).await?;
             Ok(UpdateReport {
                 changed: true,

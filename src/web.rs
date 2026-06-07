@@ -597,7 +597,8 @@ pub async fn update_server(
         return error_page("this server is not git-sourced");
     }
     let _guard = state.build_lock.lock().await;
-    match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def).await {
+    let uid = state.sandbox_uid(&user.id).await;
+    match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, uid).await {
         Ok(_) => Redirect::to(&format!("/servers/{id}")).into_response(),
         Err(e) => error_page(&format!("update failed: {e}")),
     }

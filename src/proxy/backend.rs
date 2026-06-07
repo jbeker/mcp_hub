@@ -36,6 +36,7 @@ impl Backend {
         namespace: String,
         display_name: String,
         permit: OwnedSemaphorePermit,
+        sandbox: Option<&crate::sandbox::Sandbox>,
     ) -> Result<Backend> {
         let peer = match def.transport.as_str() {
             "stdio" => {
@@ -45,6 +46,7 @@ impl Backend {
                     .ok_or_else(|| anyhow!("stdio backend '{namespace}' has no command"))?;
                 let args = def.args.clone();
                 let env = env.clone();
+                let sandbox = sandbox.cloned();
                 let cmd = tokio::process::Command::new(&program).configure(|c| {
                     c.args(&args);
                     // Don't leak the hub's own environment into the child.
@@ -55,6 +57,17 @@ impl Backend {
                     // Preserve PATH so `uvx`/`npx` can find interpreters.
                     if let Ok(path) = std::env::var("PATH") {
                         c.env("PATH", path);
+                    }
+                    // Drop the child to its per-user sandbox UID and point its
+                    // caches/HOME at a writable per-UID directory.
+                    if let Some(sb) = &sandbox {
+                        c.uid(sb.uid);
+                        c.gid(sb.gid);
+                        c.env("HOME", &sb.cache_dir);
+                        c.env("USER", "mcp-sandbox");
+                        c.env("XDG_CACHE_HOME", &sb.cache_dir);
+                        c.env("UV_CACHE_DIR", format!("{}/uv", sb.cache_dir));
+                        c.env("npm_config_cache", format!("{}/npm", sb.cache_dir));
                     }
                 });
                 let transport = TokioChildProcess::new(cmd)

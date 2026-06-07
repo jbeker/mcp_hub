@@ -66,6 +66,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 shlex = "1"
 
+# Unix sandboxing (geteuid / chown for dropping stdio subprocesses to a UID)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

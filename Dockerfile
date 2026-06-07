@@ -54,9 +54,13 @@ COPY --from=build /app/target/release/mcp_hub /usr/local/bin/mcp_hub
 # Static web assets are read at runtime from the working directory.
 COPY static /app/static
 
+# The hub runs as root *on purpose*: it drops each user's stdio subprocesses to
+# an unprivileged per-user UID (HUB_SANDBOX_UID_BASE + the user's slot) so they
+# cannot read the master key or the secrets DB. Set the base to 0 to disable.
 ENV HUB_DB_PATH=/data/hub.db \
     HUB_ENV_DIR=/data/envs \
-    HUB_LISTEN=0.0.0.0:8080
+    HUB_LISTEN=0.0.0.0:8080 \
+    HUB_SANDBOX_UID_BASE=20000
 VOLUME ["/data"]
 EXPOSE 8080
 
