@@ -30,6 +30,8 @@ use crate::AppState;
 /// Name of the short-lived signed cookie tracking an in-flight ceremony.
 const CEREMONY_COOKIE: &str = "hub_ceremony";
 const CEREMONY_TTL_SECS: i64 = 300;
+/// Hard cap on simultaneously in-flight ceremonies (a memory-DoS backstop).
+const CEREMONY_CAP: usize = 4096;
 
 /// In-flight registration ceremony state.
 pub struct RegCeremony {
@@ -38,12 +40,49 @@ pub struct RegCeremony {
     pub handle: String,
     pub display_name: String,
     pub is_admin: bool,
+    pub created_at: i64,
 }
 
 /// In-flight authentication ceremony state.
 pub struct AuthCeremony {
     pub state: PasskeyAuthentication,
     pub user_id: String,
+    pub created_at: i64,
+}
+
+/// Ceremony state that can be expired by age.
+trait Expirable {
+    fn created_at(&self) -> i64;
+}
+impl Expirable for RegCeremony {
+    fn created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+impl Expirable for AuthCeremony {
+    fn created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+
+/// Insert a ceremony after evicting expired entries, rejecting if the map is
+/// full. This bounds memory use under a flood of `*/start` requests.
+fn insert_ceremony<T: Expirable>(
+    map: &Mutex<HashMap<String, T>>,
+    key: String,
+    value: T,
+) -> Result<(), ApiError> {
+    let now = crate::util::now_unix();
+    let mut guard = map.lock().unwrap();
+    guard.retain(|_, v| now - v.created_at() < CEREMONY_TTL_SECS);
+    if guard.len() >= CEREMONY_CAP {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many sign-in attempts in progress; please try again shortly",
+        ));
+    }
+    guard.insert(key, value);
+    Ok(())
 }
 
 pub type RegStore = Arc<Mutex<HashMap<String, RegCeremony>>>;
@@ -175,7 +214,8 @@ pub async fn register_start(
         .map_err(|e| bad(format!("could not start registration: {e}")))?;
 
     let cid = crate::util::new_id();
-    state.reg_states.lock().unwrap().insert(
+    insert_ceremony(
+        &state.reg_states,
         cid.clone(),
         RegCeremony {
             state: reg_state,
@@ -183,8 +223,9 @@ pub async fn register_start(
             handle,
             display_name,
             is_admin,
+            created_at: crate::util::now_unix(),
         },
-    );
+    )?;
 
     let jar = jar.add(ceremony_cookie(cid, state.config.cookie_secure()));
     Ok((jar, Json(ccr)))
@@ -279,13 +320,15 @@ pub async fn login_start(
         .map_err(|e| bad(format!("could not start authentication: {e}")))?;
 
     let cid = crate::util::new_id();
-    state.auth_states.lock().unwrap().insert(
+    insert_ceremony(
+        &state.auth_states,
         cid.clone(),
         AuthCeremony {
             state: auth_state,
             user_id: user.id.clone(),
+            created_at: crate::util::now_unix(),
         },
-    );
+    )?;
 
     let jar = jar.add(ceremony_cookie(cid, state.config.cookie_secure()));
     Ok((jar, Json(rcr)))
