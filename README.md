@@ -45,7 +45,9 @@ export HUB_BOOTSTRAP_ADMIN="yourhandle"                # first account must use 
 docker compose up -d
 ```
 
-Then open `https://hub.example.com/register`, create the admin account with a passkey, and start adding servers from the catalog.
+Then open `https://hub.example.com/register`, create the admin account with a passkey (the **first** account needs no invite and becomes the admin), and start adding servers from the catalog.
+
+Registration is **invite-only**: every account after the first must redeem a single-use invite code. As the admin, generate codes under **Manage invites** on the dashboard (or with `hub__create_invite`) and hand them out. See [Inviting users](#inviting-users).
 
 > The runtime image bundles **Node.js** (`npx`) and **uv** (`uvx`) because stdio backends run as child processes inside the container.
 
@@ -59,7 +61,7 @@ All configuration is via environment variables:
 | `HUB_MASTER_KEY` | yes | — | base64-encoded 32-byte key. Encrypts secrets at rest and signs cookies. |
 | `HUB_RP_ID` | no | host of base URL | WebAuthn relying-party id (registrable domain). |
 | `HUB_BOOTSTRAP_ADMIN` | no | — | If set, the first registration must use this handle (and becomes admin). |
-| `HUB_ALLOW_OPEN_REGISTRATION` | no | `false` | Allow self-registration after the first account exists. |
+| `HUB_ALLOW_OPEN_REGISTRATION` | no | `false` | Escape hatch: when `true`, anyone may self-register **without an invite**. Leave `false` to keep registration invite-only. |
 | `HUB_DB_PATH` | no | `/data/hub.db` | SQLite database path. |
 | `HUB_ENV_DIR` | no | `/data/envs` | Where prebuilt virtualenvs for git-sourced servers live (keep on the data volume). |
 | `HUB_LISTEN` | no | `0.0.0.0:8080` | Bind address. |
@@ -94,8 +96,33 @@ Once connected, your servers' tools appear namespaced (`zabbix__host_get`, …),
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage instances |
 | `hub__list_users` | admin | List users |
 | `hub__catalog_upsert` / `hub__catalog_remove` | admin | Manage the catalog |
+| `hub__create_invite` / `hub__list_invites` / `hub__revoke_invite` | admin | Manage invite codes |
 
 Newly added/enabled servers take effect on the next client session.
+
+## Inviting users
+
+Registration is closed by default: the first account bootstraps the admin, and
+every later account must redeem a **single-use invite code**.
+
+As an admin, create a code one of two ways:
+
+- **Web UI:** dashboard → **Manage invites** → *Generate invite*. The code is
+  shown **once** — copy it then.
+- **From an MCP client:** call `hub__create_invite` (optionally with a `note`);
+  the returned `code` is shown once.
+
+Hand the code to the new user. They register at `/register`, entering the code
+alongside their handle and display name. The code is consumed the moment their
+account is created, so it cannot be reused.
+
+Only the SHA-256 of each code is stored, so codes can never be recovered from the
+database — `hub__list_invites` and the web list show status and a short id, not
+the code. Revoke an unused code with `hub__revoke_invite` (or the **Revoke**
+button); used codes are kept for audit.
+
+To allow open self-registration instead (no invite needed), set
+`HUB_ALLOW_OPEN_REGISTRATION=true`.
 
 ## Running a server from a GitHub repo
 
@@ -156,6 +183,8 @@ Notes:
   that forbids inline scripts.
 - Backend config keys are restricted to each catalog entry's declared schema, so a user cannot
   inject arbitrary process environment (e.g. `LD_PRELOAD`) into a spawned backend.
+- Registration is invite-only. Invite codes carry 128 bits of entropy, are stored only as a
+  SHA-256 hash, and are consumed by a single atomic update so a code cannot be redeemed twice.
 - **Back up `HUB_MASTER_KEY`** — losing it makes every stored secret, signing key, and session
   unrecoverable. Run only behind a TLS-terminating reverse proxy, and rate-limit `/auth/*`,
   `/token`, and `/register` there.

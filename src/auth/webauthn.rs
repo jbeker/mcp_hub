@@ -24,7 +24,7 @@ use webauthn_rs::prelude::{
 };
 
 use crate::auth::session;
-use crate::users;
+use crate::{invites, users};
 use crate::AppState;
 
 /// Name of the short-lived signed cookie tracking an in-flight ceremony.
@@ -40,6 +40,9 @@ pub struct RegCeremony {
     pub handle: String,
     pub display_name: String,
     pub is_admin: bool,
+    /// Invite code to consume when the ceremony finishes (None for the
+    /// bootstrap admin or when open registration is enabled).
+    pub invite_code: Option<String>,
     pub created_at: i64,
 }
 
@@ -158,6 +161,10 @@ fn ceremony_id(jar: &SignedCookieJar) -> Option<String> {
 pub struct RegisterStart {
     pub handle: String,
     pub display_name: String,
+    /// Single-use invite code. Required for every account after the first,
+    /// unless open registration is explicitly enabled.
+    #[serde(default)]
+    pub invite_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -177,8 +184,12 @@ pub async fn register_start(
         return Err(bad("handle and display name are required"));
     }
 
-    // Registration policy: first user bootstraps admin; later users only if open.
+    // Registration policy: the first account bootstraps the admin and needs no
+    // invite. After that, registration is invite-only — each new account must
+    // present a valid, unused single-use code — unless open registration has
+    // been explicitly enabled.
     let count = users::count(&state.db).await.map_err(ApiError::from)?;
+    let mut invite_code: Option<String> = None;
     let is_admin = if count == 0 {
         if let Some(want) = &state.config.bootstrap_admin {
             if &handle != want {
@@ -189,13 +200,28 @@ pub async fn register_start(
             }
         }
         true
+    } else if state.config.allow_open_registration {
+        false
     } else {
-        if !state.config.allow_open_registration {
+        let code = req.invite_code.as_deref().map(str::trim).unwrap_or("");
+        if code.is_empty() {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
-                "registration is closed; ask an administrator for an account",
+                "an invite code is required to register; ask an administrator for one",
             ));
         }
+        // Advisory pre-check for a clear error; the code is consumed atomically
+        // at finish, which is the authoritative single-use guard.
+        if !invites::is_redeemable(&state.db, code)
+            .await
+            .map_err(ApiError::from)?
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "that invite code is invalid or has already been used",
+            ));
+        }
+        invite_code = Some(code.to_string());
         false
     };
 
@@ -223,6 +249,7 @@ pub async fn register_start(
             handle,
             display_name,
             is_admin,
+            invite_code,
             created_at: crate::util::now_unix(),
         },
     )?;
@@ -280,6 +307,18 @@ pub async fn register_finish(
         .await
     }
     .map_err(ApiError::from)?;
+
+    // Consume the invite now that the user row exists (used_by references it).
+    // The conditional UPDATE is the single-use guard: if a concurrent
+    // registration claimed the same code between start and finish, roll back the
+    // just-created user so neither a duplicate account nor a double-spend occurs.
+    if let Some(code) = &ceremony.invite_code {
+        if let Err(e) = invites::redeem(&state.db, code, &user.id).await {
+            let _ = users::delete(&state.db, &user.id).await;
+            return Err(ApiError::new(StatusCode::CONFLICT, e.to_string()));
+        }
+    }
+
     users::insert_credential(&state.db, &user.id, &passkey, "passkey")
         .await
         .map_err(ApiError::from)?;

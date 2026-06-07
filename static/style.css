@@ -96,3 +96,17 @@ ul.servers li {
 button.danger { color: var(--error); border-color: rgba(255, 107, 107, 0.4); }
 button[disabled] { opacity: 0.4; cursor: not-allowed; }
 .row a { font-size: 14px; }
+table.invites { width: 100%; border-collapse: collapse; }
+table.invites th, table.invites td {
+  text-align: left;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+table.invites th { color: var(--muted); font-weight: 600; }
+code.invite-code {
+  display: inline-block;
+  padding: 10px 14px;
+  font-size: 18px;
+  user-select: all;
+}

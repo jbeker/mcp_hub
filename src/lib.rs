@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod gitsrc;
 pub mod instances;
+pub mod invites;
 pub mod oauth;
 pub mod proxy;
 pub mod users;
@@ -96,6 +97,10 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/{id}/disable", post(web::disable_server))
         .route("/servers/{id}/update", post(web::update_server))
         .route("/servers/{id}/delete", post(web::delete_server))
+        // Invite management (admin)
+        .route("/invites", get(web::invites_page))
+        .route("/invites/create", post(web::create_invite))
+        .route("/invites/revoke", post(web::revoke_invite))
         // WebAuthn ceremonies
         .route("/auth/register/start", post(wa::register_start))
         .route("/auth/register/finish", post(wa::register_finish))

@@ -9,7 +9,7 @@ use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
 use crate::catalog::{self, CatalogServer};
-use crate::{instances, users};
+use crate::{instances, invites, users};
 use crate::AppState;
 
 /// Build the list of management tools available to the caller.
@@ -114,6 +114,27 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "(admin) Remove a catalog entry by slug.",
             schema(json!({"slug": {"type": "string"}}), &["slug"]),
         ));
+        t.push(tool(
+            "hub__create_invite",
+            "(admin) Generate a single-use invite code for registration. The \
+             plaintext code is returned once and cannot be retrieved later.",
+            schema(
+                json!({"note": {"type": "string", "description": "Optional label, e.g. who it is for"}}),
+                &[],
+            ),
+        ));
+        t.push(tool(
+            "hub__list_invites",
+            "(admin) List invite codes and their status (metadata only; the \
+             codes themselves are never shown again).",
+            schema(json!({}), &[]),
+        ));
+        t.push(tool(
+            "hub__revoke_invite",
+            "(admin) Revoke an unused invite by its id (the short id from \
+             hub__list_invites).",
+            schema(json!({"id": {"type": "string"}}), &["id"]),
+        ));
     }
     t
 }
@@ -154,6 +175,18 @@ pub async fn dispatch(
         "catalog_remove" => {
             require_admin(admin)?;
             catalog_remove(state, &args).await
+        }
+        "create_invite" => {
+            require_admin(admin)?;
+            create_invite(state, user_id, &args).await
+        }
+        "list_invites" => {
+            require_admin(admin)?;
+            list_invites(state).await
+        }
+        "revoke_invite" => {
+            require_admin(admin)?;
+            revoke_invite(state, &args).await
         }
         other => Err(McpError::invalid_params(
             format!("unknown management tool 'hub__{other}'"),
@@ -414,6 +447,55 @@ async fn catalog_remove(state: &AppState, args: &JsonObject) -> Result<CallToolR
         .ok_or_else(|| McpError::invalid_params(format!("no catalog entry '{slug}'"), None))?;
     catalog::delete(&state.db, &entry.id).await.map_err(internal)?;
     ok(json!({ "removed": true, "slug": slug }))
+}
+
+async fn create_invite(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let note = opt_str(args, "note").unwrap_or_default();
+    let (code, inv) = invites::create(&state.db, user_id, &note)
+        .await
+        .map_err(internal)?;
+    ok(json!({
+        "created": true,
+        "code": code,
+        "id": inv.short_id(),
+        "note": inv.note,
+        "note_advice": "single-use; this code is shown only once and cannot be retrieved later",
+    }))
+}
+
+async fn list_invites(state: &AppState) -> Result<CallToolResult, McpError> {
+    let out = invites::list(&state.db)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|i| {
+            json!({
+                "id": i.short_id(),
+                "note": i.note,
+                "used": i.used(),
+                "created_at": i.created_at,
+                "used_at": i.used_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    ok(json!({ "invites": out }))
+}
+
+async fn revoke_invite(state: &AppState, args: &JsonObject) -> Result<CallToolResult, McpError> {
+    let id = req_str(args, "id")?;
+    let revoked = invites::revoke(&state.db, &id).await.map_err(internal)?;
+    if revoked {
+        ok(json!({ "revoked": true, "id": id }))
+    } else {
+        Err(McpError::invalid_params(
+            format!("no unused invite with id '{id}' (used invites cannot be revoked)"),
+            None,
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

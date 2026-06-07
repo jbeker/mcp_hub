@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::auth::session;
 use crate::auth::{AuthUser, MaybeUser};
-use crate::{catalog, instances, AppState};
+use crate::{catalog, instances, invites, AppState};
 
 /// Optional `?next=` redirect target carried into the login/register pages.
 #[derive(Deserialize)]
@@ -94,11 +94,17 @@ pub async fn dashboard(
   <div class="row"><h2>Your MCP servers</h2><a href="/servers/catalog">Browse catalog →</a></div>
   {rows}
 </section>
+{admin_section}
 <p class="muted">Your MCP endpoint: <code>{mcp}</code></p>"#,
         csrf = csrf,
         handle = esc(&user.handle),
         badge = admin_badge,
         rows = rows,
+        admin_section = if user.is_admin {
+            r#"<section><div class="row"><h2>Administration</h2><a href="/invites">Manage invites →</a></div></section>"#
+        } else {
+            ""
+        },
         mcp = esc(&state.config.mcp_url()),
     );
     page("Dashboard", &body).into_response()
@@ -452,6 +458,139 @@ fn error_page(msg: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Invites (admin)
+// ---------------------------------------------------------------------------
+
+/// 403 page shown when a non-admin reaches an admin-only route.
+fn admin_forbidden() -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        page(
+            "Forbidden",
+            r#"<h1>Administrators only</h1><p>You do not have access to this page.</p><p><a href="/">← Back</a></p>"#,
+        ),
+    )
+        .into_response()
+}
+
+/// `/invites` — admin view: generate codes and review existing ones.
+pub async fn invites_page(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
+    if !user.is_admin {
+        return admin_forbidden();
+    }
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let list = invites::list(&state.db).await.unwrap_or_default();
+
+    let mut rows = String::new();
+    if list.is_empty() {
+        rows.push_str(r#"<p class="muted">No invites yet. Generate one above to let someone register.</p>"#);
+    } else {
+        rows.push_str("<table class=\"invites\"><thead><tr><th>ID</th><th>Note</th><th>Status</th><th></th></tr></thead><tbody>");
+        for inv in &list {
+            let (status, action) = if inv.used() {
+                ("used".to_string(), String::new())
+            } else {
+                (
+                    "available".to_string(),
+                    format!(
+                        r#"<form method="post" action="/invites/revoke" data-confirm="Revoke this invite?">{csrf}<input type="hidden" name="short_id" value="{sid}"><button class="ghost danger">Revoke</button></form>"#,
+                        csrf = csrf,
+                        sid = esc(inv.short_id()),
+                    ),
+                )
+            };
+            rows.push_str(&format!(
+                r#"<tr><td><code>{sid}</code></td><td>{note}</td><td>{status}</td><td>{action}</td></tr>"#,
+                sid = esc(inv.short_id()),
+                note = esc(&inv.note),
+                status = status,
+                action = action,
+            ));
+        }
+        rows.push_str("</tbody></table>");
+    }
+
+    let body = format!(
+        r#"<header class="row"><h1>Invites</h1><a href="/">← Back</a></header>
+<p class="muted">Registration is invite-only. Each code works once. The code is shown only when generated — copy it then.</p>
+<form method="post" action="/invites/create">
+  {csrf}
+  <label>Note (optional)<input name="note" placeholder="e.g. for Alice" autocomplete="off"></label>
+  <button type="submit">Generate invite</button>
+</form>
+<section style="margin-top:18px">{rows}</section>"#,
+        csrf = csrf,
+        rows = rows,
+    );
+    page("Invites", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateInviteForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `POST /invites/create` — generate a code and show it once.
+pub async fn create_invite(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<CreateInviteForm>,
+) -> Response {
+    if !user.is_admin {
+        return admin_forbidden();
+    }
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let (code, _) = match invites::create(&state.db, &user.id, form.note.trim()).await {
+        Ok(v) => v,
+        Err(e) => return error_page(&e.to_string()),
+    };
+    // Show the plaintext exactly once; it is never stored or shown again.
+    let body = format!(
+        r#"<header class="row"><h1>Invite created</h1><a href="/invites">← Back</a></header>
+<p>Share this code with the person you are inviting. It works once and <strong>will not be shown again</strong>:</p>
+<p><code class="invite-code">{code}</code></p>
+<p class="muted">They register at <code>{base}/register</code> using this code.</p>"#,
+        code = esc(&code),
+        base = esc(&state.config.base_url),
+    );
+    page("Invite created", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RevokeInviteForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub short_id: String,
+}
+
+/// `POST /invites/revoke` — revoke an unused invite.
+pub async fn revoke_invite(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<RevokeInviteForm>,
+) -> Response {
+    if !user.is_admin {
+        return admin_forbidden();
+    }
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let _ = invites::revoke(&state.db, form.short_id.trim()).await;
+    Redirect::to("/invites").into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Auth pages
 // ---------------------------------------------------------------------------
 
@@ -499,6 +638,8 @@ pub async fn register_page(
 <form id="register-form">
   <label>Handle<input id="reg-handle" name="handle" autocomplete="username" required></label>
   <label>Display name<input id="reg-display" name="display_name" required></label>
+  <label>Invite code<input id="reg-invite" name="invite_code" autocomplete="off"></label>
+  <p class="muted">Registration is invite-only. Leave the code blank only if you are setting up the very first (admin) account.</p>
   <button id="register-btn" type="submit">Create account &amp; passkey</button>
 </form>
 <p class="error" id="register-error"></p>

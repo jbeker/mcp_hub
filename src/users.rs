@@ -138,6 +138,19 @@ pub async fn create(
     })
 }
 
+/// Delete a user (cascades to credentials and sessions).
+///
+/// Used to roll back a half-finished registration when an invite turns out to
+/// have been consumed concurrently between the challenge and the response.
+pub async fn delete(pool: &SqlitePool, id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("deleting user")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Passkey credential storage
 // ---------------------------------------------------------------------------

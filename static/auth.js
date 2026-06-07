@@ -85,10 +85,11 @@ async function postJson(url, body) {
   return data;
 }
 
-async function doRegister(handle, displayName) {
+async function doRegister(handle, displayName, inviteCode) {
   const challenge = await postJson("/auth/register/start", {
     handle,
     display_name: displayName,
+    invite_code: inviteCode,
   });
   const publicKey = decodeCreationOptions(challenge.publicKey);
   const cred = await navigator.credentials.create({ publicKey });
@@ -112,9 +113,11 @@ function wire() {
       const err = document.getElementById("register-error");
       err.textContent = "";
       try {
+        const inviteEl = document.getElementById("reg-invite");
         await doRegister(
           document.getElementById("reg-handle").value.trim(),
-          document.getElementById("reg-display").value.trim()
+          document.getElementById("reg-display").value.trim(),
+          inviteEl ? inviteEl.value.trim() : ""
         );
       } catch (e) {
         err.textContent = e.message;

@@ -287,6 +287,63 @@ async fn management_tools_over_mcp() {
 }
 
 #[tokio::test]
+async fn admin_invite_tools_round_trip() {
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "admin1", "alice", "Alice", true)
+        .await
+        .unwrap();
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user.id, "client", &format!("{base}/mcp"), "mcp", true, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // Generate an invite; the plaintext code is returned exactly once.
+    let created = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__create_invite".into(),
+            arguments: args(serde_json::json!({"note": "for bob"})),
+        })
+        .await
+        .unwrap();
+    let created = created.structured_content.unwrap();
+    let code = created["code"].as_str().unwrap().to_string();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert!(!code.is_empty());
+
+    // It is redeemable and shows up as unused in the listing.
+    assert!(mcp_hub::invites::is_redeemable(&state.db, &code)
+        .await
+        .unwrap());
+    let listed = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_invites".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(listed_json.contains(&id));
+    assert!(listed_json.contains("\"used\":false"));
+    // The plaintext code is never echoed back by the listing.
+    assert!(!listed_json.contains(&code));
+
+    // Revoke it; afterwards it is no longer redeemable.
+    client
+        .call_tool(CallToolRequestParam {
+            name: "hub__revoke_invite".into(),
+            arguments: args(serde_json::json!({"id": id})),
+        })
+        .await
+        .unwrap();
+    assert!(!mcp_hub::invites::is_redeemable(&state.db, &code)
+        .await
+        .unwrap());
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn non_admin_cannot_use_admin_tools() {
     let (base, state) = spawn_hub().await;
     let user = users::create(&state.db, "u2", "bob", "Bob", false)
