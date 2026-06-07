@@ -1,7 +1,5 @@
 //! Server-rendered web UI pages.
 
-use std::collections::HashMap;
-
 use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::SignedCookieJar;
@@ -10,7 +8,7 @@ use serde::Deserialize;
 
 use crate::auth::session;
 use crate::auth::{AuthUser, MaybeUser};
-use crate::{catalog, instances, invites, users, AppState};
+use crate::{instances, invites, users, AppState};
 
 /// Optional `?next=` redirect target carried into the login/register pages.
 #[derive(Deserialize)]
@@ -68,7 +66,7 @@ pub async fn dashboard(
 
     let mut rows = String::new();
     if instances.is_empty() {
-        rows.push_str(r#"<p class="muted">No servers configured yet. Browse the catalog to add one.</p>"#);
+        rows.push_str(r#"<p class="muted">No servers yet. Add one to get started.</p>"#);
     } else {
         rows.push_str("<ul class=\"servers\">");
         for inst in &instances {
@@ -94,7 +92,7 @@ pub async fn dashboard(
 </header>
 <p>Signed in as <strong>{handle}</strong> {badge}</p>
 <section>
-  <div class="row"><h2>Your MCP servers</h2><a href="/servers/catalog">Browse catalog →</a></div>
+  <div class="row"><h2>Your MCP servers</h2><a href="/servers/new">+ Add a server</a></div>
   {rows}
 </section>
 {admin_section}
@@ -104,7 +102,7 @@ pub async fn dashboard(
         badge = admin_badge,
         rows = rows,
         admin_section = if user.is_admin {
-            r#"<section><div class="row"><h2>Administration</h2><span><a href="/catalog">Catalog</a> · <a href="/invites">Invites</a> · <a href="/users">Users</a></span></div></section>"#
+            r#"<section><div class="row"><h2>Administration</h2><span><a href="/invites">Invites</a> · <a href="/users">Users</a></span></div></section>"#
         } else {
             ""
         },
@@ -114,52 +112,194 @@ pub async fn dashboard(
 }
 
 // ---------------------------------------------------------------------------
-// Catalog browsing + adding instances
+// Adding + editing a user's own servers
 // ---------------------------------------------------------------------------
 
-/// `/servers/catalog` — pick a server to add.
-pub async fn catalog_page(
+/// Editable fields shared by the add and edit forms. `transport` is a `<select>`
+/// only when creating (it is fixed once a server exists).
+fn server_fields(
+    transport: &str,
+    transport_select: bool,
+    command_line: &str,
+    repo: &str,
+    git_ref: &str,
+    url: &str,
+    env: &str,
+) -> String {
+    let stdio_hidden = if transport == "http" { "hidden" } else { "" };
+    let http_hidden = if transport == "http" { "" } else { "hidden" };
+    let transport_field = if transport_select {
+        format!(
+            r#"<label>Transport<select name="transport" id="transport-select">
+    <option value="stdio" {s}>stdio (run a command)</option>
+    <option value="http" {h}>http (remote URL)</option>
+  </select></label>"#,
+            s = if transport == "http" { "" } else { "selected" },
+            h = if transport == "http" { "selected" } else { "" },
+        )
+    } else {
+        format!(
+            r#"<p class="muted">Transport: <code>{}</code></p><input type="hidden" name="transport" value="{0}">"#,
+            esc(transport)
+        )
+    };
+    format!(
+        r#"{transport_field}
+  <div class="stdio-only {stdio_hidden}">
+    <label>Command line<input name="command" value="{cmd}" placeholder="uvx your-mcp-server"></label>
+    <label>Repository (optional — builds a cached venv from a git repo)<input name="repo" value="{repo}" placeholder="https://github.com/you/your-mcp"></label>
+    <label>Git ref (branch or tag)<input name="git_ref" value="{git_ref}" placeholder="main"></label>
+  </div>
+  <div class="http-only {http_hidden}">
+    <label>Remote URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
+  </div>
+  <label>Environment variables (one <code>KEY=VALUE</code> per line)<textarea name="env" rows="6" placeholder="API_TOKEN=...">{env}</textarea></label>"#,
+        transport_field = transport_field,
+        stdio_hidden = stdio_hidden,
+        http_hidden = http_hidden,
+        cmd = esc(command_line),
+        repo = esc(repo),
+        git_ref = esc(git_ref),
+        url = esc(url),
+        env = esc(env),
+    )
+}
+
+/// `/servers/new` — form to add a server (any user).
+pub async fn new_server(
     State(state): State<AppState>,
     AuthUser(_user): AuthUser,
     jar: SignedCookieJar,
 ) -> Response {
     let csrf = session::csrf_field(&jar, &state.config.master_key);
-    let entries = catalog::list(&state.db).await.unwrap_or_default();
-    let mut cards = String::new();
-    for e in &entries {
-        let disabled = if e.supported { "" } else { "disabled" };
-        let note = if e.supported {
-            String::new()
-        } else {
-            r#"<p class="muted">Not supported in this version.</p>"#.to_string()
-        };
-        cards.push_str(&format!(
-            r#"<div class="catalog-entry">
-  <h3>{name} <span class="muted">({transport})</span></h3>
-  <p class="muted">{desc}</p>
-  {note}
-  <form method="post" action="/servers/add">
-    {csrf}
-    <input type="hidden" name="catalog_id" value="{id}">
-    <label>Namespace<input name="namespace" value="{slug}" required></label>
-    <label>Display name<input name="display_name" value="{name}" required></label>
-    <button type="submit" {disabled}>Add</button>
-  </form>
-</div>"#,
-            csrf = csrf,
-            name = esc(&e.name),
-            transport = esc(&e.transport),
-            desc = esc(&e.description),
-            note = note,
-            id = esc(&e.id),
-            slug = esc(&e.slug),
-            disabled = disabled,
-        ));
-    }
     let body = format!(
-        r#"<header class="row"><h1>Catalog</h1><a href="/">← Back</a></header>{cards}"#
+        r#"<header class="row"><h1>Add a server</h1><a href="/">← Back</a></header>
+<form id="server-form" method="post" action="/servers/create">
+  {csrf}
+  <label>Display name<input name="display_name" required></label>
+  <label>Namespace (tool prefix, e.g. <code>zabbix</code>)<input name="namespace" required></label>
+  {fields}
+  <button type="submit">Add server</button>
+</form>"#,
+        csrf = csrf,
+        fields = server_fields("stdio", true, "", "", "", "", ""),
     );
-    page("Catalog", &body).into_response()
+    page("Add a server", &body).into_response()
+}
+
+/// Form body for creating a server.
+#[derive(Deserialize)]
+pub struct CreateServerForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub git_ref: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub env: String,
+}
+
+/// `POST /servers/create`
+pub async fn create_server(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<CreateServerForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let (def, env) = match def_from_form(&form) {
+        Ok(v) => v,
+        Err(e) => return error_page(&e),
+    };
+    let display = if form.display_name.trim().is_empty() {
+        form.namespace.trim()
+    } else {
+        form.display_name.trim()
+    };
+    let inst = match instances::create(
+        &state.db,
+        &user.id,
+        None,
+        Some(&def),
+        form.namespace.trim(),
+        display,
+    )
+    .await
+    {
+        Ok(i) => i,
+        Err(e) => return error_page(&e.to_string()),
+    };
+    if let Err(e) = instances::replace_env(&state.db, &state.secrets, &inst.id, &env).await {
+        return error_page(&e.to_string());
+    }
+    Redirect::to(&format!("/servers/{}", inst.id)).into_response()
+}
+
+/// Build a `ServerDef` + env map from submitted command/url/repo/env fields.
+fn def_from_form(
+    form: &CreateServerForm,
+) -> Result<(instances::ServerDef, std::collections::BTreeMap<String, String>), String> {
+    let transport = form.transport.trim();
+    if !matches!(transport, "stdio" | "http") {
+        return Err("transport must be stdio or http".into());
+    }
+    let env = instances::parse_env(&form.env).map_err(|e| e.to_string())?;
+    let opt = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+
+    let (command, args, url, repo, git_ref) = if transport == "http" {
+        let url = opt(&form.url).ok_or("a remote URL is required for an http server")?;
+        instances::validate_remote_url(&url).map_err(|e| e.to_string())?;
+        (None, Vec::new(), Some(url), None, None)
+    } else {
+        let (command, args) =
+            instances::parse_command(&form.command).map_err(|e| e.to_string())?;
+        if command.is_none() {
+            return Err("a command line is required for a stdio server".into());
+        }
+        let repo = opt(&form.repo);
+        if let Some(r) = &repo {
+            url::Url::parse(r).map_err(|_| "repository must be a valid URL".to_string())?;
+        }
+        let git_ref = if repo.is_some() {
+            Some(opt(&form.git_ref).unwrap_or_else(|| "main".into()))
+        } else {
+            None
+        };
+        (command, args, None, repo, git_ref)
+    };
+
+    Ok((
+        instances::ServerDef {
+            name: form.display_name.trim().to_string(),
+            description: String::new(),
+            transport: transport.to_string(),
+            command,
+            args,
+            url,
+            runtime: String::new(),
+            repo,
+            git_ref,
+            entry: None,
+            module: None,
+        },
+        env,
+    ))
 }
 
 /// A form carrying only the CSRF token (for button-only POSTs).
@@ -181,47 +321,6 @@ fn forbidden() -> Response {
         .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct AddServerForm {
-    #[serde(default)]
-    pub csrf: String,
-    pub catalog_id: String,
-    pub namespace: String,
-    pub display_name: String,
-}
-
-/// `POST /servers/add`
-pub async fn add_server(
-    State(state): State<AppState>,
-    AuthUser(user): AuthUser,
-    jar: SignedCookieJar,
-    Form(form): Form<AddServerForm>,
-) -> Response {
-    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        return forbidden();
-    }
-    let entry = match catalog::get(&state.db, &form.catalog_id).await {
-        Ok(Some(e)) => e,
-        _ => return error_page("unknown catalog entry"),
-    };
-    if !entry.supported {
-        return error_page("that server is not supported in this version");
-    }
-    match instances::create(
-        &state.db,
-        &user.id,
-        Some(&entry.id),
-        None,
-        form.namespace.trim(),
-        form.display_name.trim(),
-    )
-    .await
-    {
-        Ok(inst) => Redirect::to(&format!("/servers/{}", inst.id)).into_response(),
-        Err(e) => error_page(&e.to_string()),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Instance detail + configuration
 // ---------------------------------------------------------------------------
@@ -241,53 +340,19 @@ pub async fn server_detail(
         Ok(d) => d,
         Err(e) => return error_page(&e.to_string()),
     };
-    let set_secrets = instances::secret_names(&state.db, &inst.id).await.unwrap_or_default();
+    let env = instances::env_for_edit(&state.db, &state.secrets, &inst.id)
+        .await
+        .unwrap_or_default();
 
-    let mut fields = String::new();
-    // http remotes get a per-instance URL field (defaulting to the catalog URL).
-    if def.transport == "http" {
-        let current = inst
-            .config
-            .get(instances::URL_KEY)
-            .cloned()
-            .or_else(|| def.url.clone())
-            .unwrap_or_default();
-        fields.push_str(&format!(
-            r#"<label>Remote URL *<input name="{key}" value="{val}" placeholder="https://your-server.example.com/mcp"></label>"#,
-            key = instances::URL_KEY,
-            val = esc(&current),
-        ));
-    }
-    for f in &def.secret_schema {
-        let label = if f.label.is_empty() { &f.name } else { &f.label };
-        let req = if f.required { " *" } else { "" };
-        if f.secret {
-            let placeholder = if set_secrets.contains(&f.name) {
-                "•••••• (leave blank to keep)"
-            } else {
-                ""
-            };
-            fields.push_str(&format!(
-                r#"<label>{label}{req}<input name="{name}" type="password" placeholder="{ph}"></label>"#,
-                label = esc(label),
-                req = req,
-                name = esc(&f.name),
-                ph = placeholder,
-            ));
-        } else {
-            let current = inst.config.get(&f.name).cloned().unwrap_or_default();
-            fields.push_str(&format!(
-                r#"<label>{label}{req}<input name="{name}" value="{val}"></label>"#,
-                label = esc(label),
-                req = req,
-                name = esc(&f.name),
-                val = esc(&current),
-            ));
-        }
-    }
-    if def.secret_schema.is_empty() && def.transport != "http" {
-        fields.push_str(r#"<p class="muted">This server needs no configuration.</p>"#);
-    }
+    let fields = server_fields(
+        &def.transport,
+        false,
+        &instances::render_command(&def.command, &def.args),
+        def.repo.as_deref().unwrap_or(""),
+        def.git_ref.as_deref().unwrap_or(""),
+        def.url.as_deref().unwrap_or(""),
+        &instances::render_env(&env),
+    );
 
     let toggle = if inst.enabled {
         format!(r#"<form method="post" action="/servers/{{id}}/disable">{csrf}<button class="ghost">Disable</button></form>"#)
@@ -354,7 +419,7 @@ pub async fn server_detail(
 fn command_line(
     state: &AppState,
     inst: &instances::Instance,
-    def: &catalog::ServerDef,
+    def: &instances::ServerDef,
 ) -> String {
     match crate::gitsrc::resolved_command(&state.config.env_dir, inst, def) {
         Some((program, args)) => {
@@ -417,55 +482,38 @@ fn runtime_banner(inst: &instances::Instance) -> String {
     )
 }
 
-/// `POST /servers/{id}/config` — save secret + non-secret fields.
+/// `POST /servers/{id}/config` — save an edit to the server's def + env.
 pub async fn save_config(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
     Path(id): Path<String>,
-    Form(form): Form<HashMap<String, String>>,
+    Form(form): Form<CreateServerForm>,
 ) -> Response {
-    if !session::check_csrf(&jar, &state.config.master_key, form.get("csrf").map(String::as_str).unwrap_or("")) {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
         return forbidden();
     }
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
         return error_page("server not found");
     };
-    let def = match instances::resolve_def(&state.db, &inst).await {
+    let existing = match instances::resolve_def(&state.db, &inst).await {
         Ok(d) => d,
         Err(e) => return error_page(&e.to_string()),
     };
-    // The per-instance remote URL for http backends (not part of secret_schema).
-    if def.transport == "http" {
-        if let Some(url) = form.get(instances::URL_KEY).map(|s| s.trim()) {
-            if !url.is_empty() {
-                if let Err(e) = instances::validate_remote_url(url) {
-                    return error_page(&e.to_string());
-                }
-                if let Err(e) =
-                    instances::set_config_value(&state.db, &inst.id, instances::URL_KEY, url).await
-                {
-                    return error_page(&e.to_string());
-                }
-            }
-        }
+    // Transport and namespace are fixed on edit; the form carries the rest.
+    let mut form = form;
+    form.transport = existing.transport.clone();
+    let (mut def, env) = match def_from_form(&form) {
+        Ok(v) => v,
+        Err(e) => return error_page(&e),
+    };
+    // Preserve the display name (not edited on this form).
+    def.name = existing.name.clone();
+    if let Err(e) = instances::update_def(&state.db, &inst.id, &def).await {
+        return error_page(&e.to_string());
     }
-    for f in &def.secret_schema {
-        let Some(value) = form.get(&f.name) else { continue };
-        if value.is_empty() {
-            // Blank secret means "leave unchanged"; blank non-secret clears it.
-            if f.secret {
-                continue;
-            }
-        }
-        let res = if f.secret {
-            instances::set_secret(&state.db, &state.secrets, &inst.id, &f.name, value).await
-        } else {
-            instances::set_config_value(&state.db, &inst.id, &f.name, value).await
-        };
-        if let Err(e) = res {
-            return error_page(&e.to_string());
-        }
+    if let Err(e) = instances::replace_env(&state.db, &state.secrets, &inst.id, &env).await {
+        return error_page(&e.to_string());
     }
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
@@ -929,328 +977,6 @@ pub async fn recover_page(MaybeUser(user): MaybeUser) -> Response {
 <p class="error" id="recover-error"></p>
 <p class="muted"><a href="/login">← Back to sign in</a></p>"#;
     page("Recover access", body).into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Catalog management (admin)
-// ---------------------------------------------------------------------------
-
-/// `/catalog` — admin list of catalog entries with edit/delete.
-pub async fn catalog_admin(
-    State(state): State<AppState>,
-    AuthUser(admin): AuthUser,
-    jar: SignedCookieJar,
-) -> Response {
-    if !admin.is_admin {
-        return admin_forbidden();
-    }
-    let csrf = session::csrf_field(&jar, &state.config.master_key);
-    let entries = catalog::list(&state.db).await.unwrap_or_default();
-
-    let mut rows = String::new();
-    if entries.is_empty() {
-        rows.push_str(r#"<p class="muted">The catalog is empty. Add an entry to make a server available to your users.</p>"#);
-    } else {
-        rows.push_str("<table class=\"invites\"><thead><tr><th>Slug</th><th>Name</th><th>Transport</th><th>Status</th><th></th></tr></thead><tbody>");
-        for e in &entries {
-            let status = if e.supported { "supported" } else { "unsupported" };
-            rows.push_str(&format!(
-                r#"<tr><td><code>{slug}</code></td><td>{name}</td><td>{transport}</td><td>{status}</td>
-<td><div class="row"><a href="/catalog/{id}/edit">Edit</a>
-<form method="post" action="/catalog/{id}/delete" data-confirm="Delete this catalog entry? (existing user instances are unaffected)">{csrf}<button class="ghost danger">Delete</button></form></div></td></tr>"#,
-                slug = esc(&e.slug),
-                name = esc(&e.name),
-                transport = esc(&e.transport),
-                status = status,
-                id = esc(&e.id),
-                csrf = csrf,
-            ));
-        }
-        rows.push_str("</tbody></table>");
-    }
-
-    let body = format!(
-        r#"<header class="row"><h1>Catalog</h1><a href="/">← Back</a></header>
-<p class="muted">Entries available to your users. Editing an entry changes how new connections launch; existing instances pick up changes on their next session.</p>
-<p><a href="/catalog/new">+ New catalog entry</a></p>
-{rows}"#,
-        rows = rows,
-    );
-    page("Catalog", &body).into_response()
-}
-
-/// `/catalog/new` — blank entry form.
-pub async fn catalog_new(
-    State(state): State<AppState>,
-    AuthUser(admin): AuthUser,
-    jar: SignedCookieJar,
-) -> Response {
-    if !admin.is_admin {
-        return admin_forbidden();
-    }
-    let csrf = session::csrf_field(&jar, &state.config.master_key);
-    page("New catalog entry", &catalog_form("New catalog entry", &csrf, None)).into_response()
-}
-
-/// `/catalog/{id}/edit` — edit an existing entry.
-pub async fn catalog_edit(
-    State(state): State<AppState>,
-    AuthUser(admin): AuthUser,
-    jar: SignedCookieJar,
-    Path(id): Path<String>,
-) -> Response {
-    if !admin.is_admin {
-        return admin_forbidden();
-    }
-    let csrf = session::csrf_field(&jar, &state.config.master_key);
-    let Some(entry) = catalog::get(&state.db, &id).await.ok().flatten() else {
-        return error_page("catalog entry not found");
-    };
-    page(
-        &format!("Edit {}", entry.name),
-        &catalog_form(&format!("Edit {}", entry.slug), &csrf, Some(&entry)),
-    )
-    .into_response()
-}
-
-#[derive(Deserialize)]
-pub struct CatalogForm {
-    #[serde(default)]
-    pub csrf: String,
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub slug: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub transport: String,
-    #[serde(default)]
-    pub runtime: String,
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub args: String,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub repo: String,
-    #[serde(default)]
-    pub git_ref: String,
-    #[serde(default)]
-    pub entry: String,
-    #[serde(default)]
-    pub module: String,
-    #[serde(default)]
-    pub secret_schema: String,
-    #[serde(default)]
-    pub supported: Option<String>,
-}
-
-/// `POST /catalog/save` — create or update an entry.
-pub async fn catalog_save(
-    State(state): State<AppState>,
-    AuthUser(admin): AuthUser,
-    jar: SignedCookieJar,
-    Form(form): Form<CatalogForm>,
-) -> Response {
-    if !admin.is_admin {
-        return admin_forbidden();
-    }
-    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        return forbidden();
-    }
-    let server = match catalog_from_form(&state, &form, &admin.id).await {
-        Ok(s) => s,
-        Err(e) => return error_page(&e),
-    };
-    match catalog::upsert(&state.db, &server, Some(&admin.id)).await {
-        Ok(_) => Redirect::to("/catalog").into_response(),
-        Err(e) => error_page(&e.to_string()),
-    }
-}
-
-/// `POST /catalog/{id}/delete` — remove an entry (user instances are untouched).
-pub async fn catalog_delete(
-    State(state): State<AppState>,
-    AuthUser(admin): AuthUser,
-    jar: SignedCookieJar,
-    Path(id): Path<String>,
-    Form(form): Form<CsrfForm>,
-) -> Response {
-    if !admin.is_admin {
-        return admin_forbidden();
-    }
-    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        return forbidden();
-    }
-    let _ = catalog::delete(&state.db, &id).await;
-    Redirect::to("/catalog").into_response()
-}
-
-/// Build (and validate) a `CatalogServer` from the submitted form.
-async fn catalog_from_form(
-    state: &AppState,
-    form: &CatalogForm,
-    _admin_id: &str,
-) -> Result<catalog::CatalogServer, String> {
-    let slug = form.slug.trim().to_string();
-    let name = form.name.trim().to_string();
-    if slug.is_empty() || name.is_empty() {
-        return Err("slug and name are required".into());
-    }
-    if !slug
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-    {
-        return Err("slug may only contain lowercase letters, digits, '-' and '_'".into());
-    }
-    let transport = form.transport.trim().to_string();
-    if !matches!(transport.as_str(), "stdio" | "http" | "git") {
-        return Err("transport must be stdio, http or git".into());
-    }
-
-    // Reject a new entry whose slug collides; preserve is_builtin when editing.
-    let existing = catalog::get_by_slug(&state.db, &slug).await.ok().flatten();
-    let is_new = form.id.trim().is_empty();
-    if is_new && existing.is_some() {
-        return Err(format!("a catalog entry with slug '{slug}' already exists"));
-    }
-    let is_builtin = existing.as_ref().map(|e| e.is_builtin).unwrap_or(false);
-
-    let args: Vec<String> = form
-        .args
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    let secret_schema: Vec<catalog::SecretField> = {
-        let raw = form.secret_schema.trim();
-        if raw.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(raw)
-                .map_err(|e| format!("secret schema must be a JSON array: {e}"))?
-        }
-    };
-
-    let opt = |s: &str| {
-        let t = s.trim();
-        (!t.is_empty()).then(|| t.to_string())
-    };
-
-    if transport == "git" && opt(&form.repo).is_none() {
-        return Err("a git entry needs a repository URL".into());
-    }
-    if transport == "git" && opt(&form.entry).is_none() && opt(&form.module).is_none() {
-        return Err("a git entry needs an entry script or a module".into());
-    }
-
-    Ok(catalog::CatalogServer {
-        id: form.id.trim().to_string(),
-        slug,
-        name,
-        description: form.description.trim().to_string(),
-        transport,
-        command: opt(&form.command),
-        args,
-        url: opt(&form.url),
-        runtime: form.runtime.trim().to_string(),
-        secret_schema,
-        repo: opt(&form.repo),
-        git_ref: opt(&form.git_ref),
-        entry: opt(&form.entry),
-        module: opt(&form.module),
-        is_builtin,
-        supported: form.supported.is_some(),
-    })
-}
-
-/// Render the create/edit form. `entry` is `None` for a new entry.
-fn catalog_form(title: &str, csrf: &str, entry: Option<&catalog::CatalogServer>) -> String {
-    let e = entry;
-    let v = |f: fn(&catalog::CatalogServer) -> String| e.map(f).unwrap_or_default();
-    let slug = v(|e| e.slug.clone());
-    let name = v(|e| e.name.clone());
-    let description = v(|e| e.description.clone());
-    let transport = e.map(|e| e.transport.clone()).unwrap_or_else(|| "stdio".into());
-    let runtime = v(|e| e.runtime.clone());
-    let command = v(|e| e.command.clone().unwrap_or_default());
-    let args = v(|e| e.args.join("\n"));
-    let url = v(|e| e.url.clone().unwrap_or_default());
-    let repo = v(|e| e.repo.clone().unwrap_or_default());
-    let git_ref = v(|e| e.git_ref.clone().unwrap_or_default());
-    let entry_script = v(|e| e.entry.clone().unwrap_or_default());
-    let module = v(|e| e.module.clone().unwrap_or_default());
-    let schema = e
-        .map(|e| serde_json::to_string_pretty(&e.secret_schema).unwrap_or_default())
-        .unwrap_or_else(|| "[]".into());
-    let supported = e.map(|e| e.supported).unwrap_or(true);
-    let id = v(|e| e.id.clone());
-    // Slug is the catalog key; lock it when editing so a rename can't orphan rows.
-    let slug_attr = if e.is_some() { "readonly" } else { "required" };
-    let opt = |t: &str, sel: &str| {
-        if t == sel {
-            "selected"
-        } else {
-            ""
-        }
-    };
-
-    format!(
-        r#"<header class="row"><h1>{title}</h1><a href="/catalog">← Catalog</a></header>
-<form method="post" action="/catalog/save">
-  {csrf}
-  <input type="hidden" name="id" value="{id}">
-  <label>Slug<input name="slug" value="{slug}" {slug_attr}></label>
-  <label>Name<input name="name" value="{name}" required></label>
-  <label>Description<input name="description" value="{description}"></label>
-  <label>Transport
-    <select name="transport">
-      <option value="stdio" {s_stdio}>stdio (subprocess)</option>
-      <option value="http" {s_http}>http (remote)</option>
-      <option value="git" {s_git}>git (built from a repo)</option>
-    </select>
-  </label>
-  <label>Runtime (informational, e.g. node / python / remote)<input name="runtime" value="{runtime}"></label>
-  <p class="muted"><strong>stdio</strong> — command + args run as a subprocess:</p>
-  <label>Command<input name="command" value="{command}" placeholder="uvx"></label>
-  <label>Args (one per line)<textarea name="args" rows="3">{args}</textarea></label>
-  <p class="muted"><strong>http</strong> — remote endpoint (users can override per instance with MCP_URL):</p>
-  <label>URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
-  <p class="muted"><strong>git</strong> — built once into a virtualenv on the data volume:</p>
-  <label>Repository URL<input name="repo" value="{repo}" placeholder="https://github.com/you/mcp"></label>
-  <label>Git ref (branch/tag)<input name="git_ref" value="{git_ref}" placeholder="main"></label>
-  <label>Entry script<input name="entry" value="{entry_script}" placeholder="my-mcp"></label>
-  <label>or Module (python -m)<input name="module" value="{module}"></label>
-  <label>Secret schema (JSON array of {{name,label,secret,required}})<textarea name="secret_schema" rows="6">{schema}</textarea></label>
-  <label class="checkbox"><input type="checkbox" name="supported" {supported_attr}> Supported (uncheck to hide from users)</label>
-  <button type="submit">Save</button>
-</form>"#,
-        title = esc(title),
-        csrf = csrf,
-        id = esc(&id),
-        slug = esc(&slug),
-        slug_attr = slug_attr,
-        name = esc(&name),
-        description = esc(&description),
-        s_stdio = opt(&transport, "stdio"),
-        s_http = opt(&transport, "http"),
-        s_git = opt(&transport, "git"),
-        runtime = esc(&runtime),
-        command = esc(&command),
-        args = esc(&args),
-        url = esc(&url),
-        repo = esc(&repo),
-        git_ref = esc(&git_ref),
-        entry_script = esc(&entry_script),
-        module = esc(&module),
-        schema = esc(&schema),
-        supported_attr = if supported { "checked" } else { "" },
-    )
 }
 
 // ---------------------------------------------------------------------------

@@ -119,3 +119,5 @@ code.invite-code {
 .status-danger { background: rgba(255, 107, 107, 0.15); color: var(--error); }
 pre.cmd { background: #11141a; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
 pre.cmd code { background: none; padding: 0; font-size: 13px; }
+
+.hidden { display: none; }

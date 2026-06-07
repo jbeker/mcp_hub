@@ -3,11 +3,72 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::catalog::{self, ServerDef};
 use crate::crypto::{Sealed, SecretBox};
 use crate::util::{new_id, now_unix};
+
+/// A resolved server definition — everything the proxy needs to launch (stdio)
+/// or connect (http) a backend. Stored per-instance in `custom_def_json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// `"stdio"` or `"http"`. (Legacy `"git"` is normalised to `"stdio"`.)
+    pub transport: String,
+    /// stdio: the program to exec (argv[0]).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// stdio: the remaining argv.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// http: the remote endpoint URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Informational runtime label (node / python / remote / …).
+    #[serde(default)]
+    pub runtime: String,
+    /// Optional git repository to build a cached venv from (stdio only).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Branch or tag to build (defaults to `main`).
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    // ---- Legacy git fields (old data). New servers use `command`/`args`. ----
+    #[serde(default)]
+    pub entry: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+}
+
+impl ServerDef {
+    /// Normalise legacy shapes: collapse `transport == "git"` to `"stdio"`, and
+    /// derive a command line from a legacy `entry`/`module` when none is set, so
+    /// the rest of the code only ever deals with `command` + `args`.
+    pub fn normalized(mut self) -> ServerDef {
+        if self.transport == "git" {
+            self.transport = "stdio".into();
+        }
+        if self.command.is_none() {
+            if let Some(entry) = self.entry.clone() {
+                self.command = Some(entry);
+            } else if let Some(module) = self.module.clone() {
+                self.command = Some("python".into());
+                let mut args = vec!["-m".to_string(), module];
+                args.append(&mut self.args);
+                self.args = args;
+            }
+        }
+        self
+    }
+
+    /// True for a git-sourced stdio backend (has a non-empty repo, not http).
+    pub fn is_git(&self) -> bool {
+        self.transport != "http" && self.repo.as_deref().is_some_and(|r| !r.trim().is_empty())
+    }
+}
 
 /// Namespace reserved for the built-in management interface (see M6).
 pub const RESERVED_NAMESPACE: &str = "hub";
@@ -226,19 +287,119 @@ pub async fn delete(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the runtime definition (from catalog or the inline custom def).
-pub async fn resolve_def(pool: &SqlitePool, inst: &Instance) -> Result<ServerDef> {
-    if let Some(def) = &inst.custom_def {
-        return Ok(def.clone());
+/// Resolve the runtime definition. Every instance now carries its own def in
+/// `custom_def_json`; the `pool` argument is retained for call-site stability.
+pub async fn resolve_def(_pool: &SqlitePool, inst: &Instance) -> Result<ServerDef> {
+    inst.custom_def
+        .clone()
+        .map(ServerDef::normalized)
+        .ok_or_else(|| anyhow!("server '{}' has no definition", inst.namespace))
+}
+
+/// One-time data migration (idempotent): convert any instance that still points
+/// at the retired catalog into a self-contained def. Snapshots the catalog row
+/// into `custom_def_json`, folds the instance's non-secret `config_json` (and any
+/// `MCP_URL` override) into the encrypted env, and clears the catalog link. The
+/// instance's existing encrypted secrets are keyed by instance id and untouched.
+pub async fn migrate_catalog_instances(pool: &SqlitePool, secrets: &SecretBox) -> Result<()> {
+    type CatRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let pending: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, catalog_server_id, config_json FROM user_server_instances \
+         WHERE custom_def_json IS NULL AND catalog_server_id IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for (inst_id, cat_id, config_json) in pending {
+        let cat: Option<CatRow> = sqlx::query_as(
+            "SELECT name, description, transport, command, args_json, url, runtime, repo, git_ref, entry, module \
+             FROM catalog_servers WHERE id = ?",
+        )
+        .bind(&cat_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((name, description, transport, command, args_json, url, runtime, repo, git_ref, entry, module)) =
+            cat
+        else {
+            continue; // catalog row already gone; leave the instance as-is
+        };
+        let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
+        let mut def = ServerDef {
+            name,
+            description,
+            transport,
+            command,
+            args,
+            url,
+            runtime,
+            repo,
+            git_ref,
+            entry,
+            module,
+        }
+        .normalized();
+
+        // Preserve the user's per-instance config: MCP_URL became the http URL;
+        // everything else becomes an encrypted env var (without overwriting a
+        // real secret of the same name).
+        let mut config: BTreeMap<String, String> =
+            serde_json::from_str(&config_json).unwrap_or_default();
+        if def.transport == "http" {
+            if let Some(u) = config.remove("MCP_URL").filter(|u| !u.trim().is_empty()) {
+                def.url = Some(u);
+            }
+        }
+        for (key, value) in &config {
+            let sealed = secrets.seal(value.as_bytes())?;
+            sqlx::query(
+                "INSERT INTO instance_secrets (id, instance_id, key_name, nonce, ciphertext) \
+                 VALUES (?, ?, ?, ?, ?) ON CONFLICT(instance_id, key_name) DO NOTHING",
+            )
+            .bind(new_id())
+            .bind(&inst_id)
+            .bind(key)
+            .bind(&sealed.nonce)
+            .bind(&sealed.ciphertext)
+            .execute(pool)
+            .await?;
+        }
+
+        let json = serde_json::to_string(&def)?;
+        sqlx::query(
+            "UPDATE user_server_instances \
+             SET custom_def_json = ?, catalog_server_id = NULL, config_json = '{}' WHERE id = ?",
+        )
+        .bind(json)
+        .bind(&inst_id)
+        .execute(pool)
+        .await?;
+        tracing::info!(instance = %inst_id, "migrated catalog-backed instance to a self-contained def");
     }
-    let cid = inst
-        .catalog_server_id
-        .as_deref()
-        .ok_or_else(|| anyhow!("instance has neither catalog reference nor custom def"))?;
-    let entry = catalog::get(pool, cid)
-        .await?
-        .ok_or_else(|| anyhow!("catalog entry no longer exists"))?;
-    Ok(entry.to_def())
+    Ok(())
+}
+
+/// Replace an instance's stored definition (after an edit).
+pub async fn update_def(pool: &SqlitePool, instance_id: &str, def: &ServerDef) -> Result<()> {
+    let json = serde_json::to_string(def)?;
+    sqlx::query("UPDATE user_server_instances SET custom_def_json = ?, catalog_server_id = NULL WHERE id = ?")
+        .bind(json)
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .context("updating server definition")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +442,110 @@ pub async fn set_secret(
     .await
     .context("storing secret")?;
     Ok(())
+}
+
+/// Replace an instance's entire environment with `env` (each value encrypted).
+/// Keys not in `env` are removed; this is the "save the whole ENV box" path.
+pub async fn replace_env(
+    pool: &SqlitePool,
+    secrets: &SecretBox,
+    instance_id: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM instance_secrets WHERE instance_id = ?")
+        .bind(instance_id)
+        .execute(&mut *tx)
+        .await?;
+    for (key, value) in env {
+        let sealed = secrets.seal(value.as_bytes())?;
+        sqlx::query(
+            "INSERT INTO instance_secrets (id, instance_id, key_name, nonce, ciphertext) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(new_id())
+        .bind(instance_id)
+        .bind(key)
+        .bind(&sealed.nonce)
+        .bind(&sealed.ciphertext)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await.context("saving environment")?;
+    Ok(())
+}
+
+/// Decrypt an instance's environment for display in the edit form.
+pub async fn env_for_edit(
+    pool: &SqlitePool,
+    secrets: &SecretBox,
+    instance_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    let rows: Vec<(String, Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT key_name, nonce, ciphertext FROM instance_secrets WHERE instance_id = ?")
+            .bind(instance_id)
+            .fetch_all(pool)
+            .await?;
+    let mut out = BTreeMap::new();
+    for (key, nonce, ciphertext) in rows {
+        let plain = secrets.open(&Sealed { nonce, ciphertext })?;
+        out.insert(key, String::from_utf8(plain).context("env value was not UTF-8")?);
+    }
+    Ok(out)
+}
+
+/// Parse a `KEY=VALUE` env block (one per line; blanks and `#` comments skipped).
+pub fn parse_env(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow!("line {}: expected KEY=VALUE", i + 1))?;
+        let key = key.trim();
+        let valid = !key.is_empty()
+            && key.chars().enumerate().all(|(j, c)| {
+                if j == 0 {
+                    c.is_ascii_alphabetic() || c == '_'
+                } else {
+                    c.is_ascii_alphanumeric() || c == '_'
+                }
+            });
+        if !valid {
+            bail!("line {}: '{key}' is not a valid environment variable name", i + 1);
+        }
+        map.insert(key.to_string(), value.trim().to_string());
+    }
+    Ok(map)
+}
+
+/// Render an env map back into a `KEY=VALUE` block for the edit form.
+pub fn render_env(env: &BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse a single command-line string into `(command, args)` (shell tokenised).
+pub fn parse_command(line: &str) -> Result<(Option<String>, Vec<String>)> {
+    let parts = shlex::split(line.trim())
+        .ok_or_else(|| anyhow!("could not parse the command line (check your quoting)"))?;
+    let mut it = parts.into_iter();
+    let command = it.next();
+    Ok((command, it.collect()))
+}
+
+/// Render `(command, args)` back into a single shell-quoted command line.
+pub fn render_command(command: &Option<String>, args: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = command {
+        parts.push(c.clone());
+    }
+    parts.extend(args.iter().cloned());
+    shlex::try_join(parts.iter().map(String::as_str)).unwrap_or_else(|_| parts.join(" "))
 }
 
 /// Names of secret keys that have a stored value (never returns the values).

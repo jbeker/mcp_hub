@@ -1,7 +1,6 @@
 //! MCP Hub library: shared modules and the HTTP router.
 
 pub mod auth;
-pub mod catalog;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -54,9 +53,8 @@ impl AppState {
         let secrets = SecretBox::new(&config.master_key);
         let webauthn = Arc::new(wa::build(&config.base_url, &config.rp_id)?);
         let signer = Arc::new(Signer::load_or_create(&db, &secrets, &config.base_url).await?);
-        if config.seed_catalog {
-            crate::catalog::seed_builtins_if_empty(&db).await?;
-        }
+        // Convert any legacy catalog-backed instances into self-contained defs.
+        crate::instances::migrate_catalog_instances(&db, &secrets).await?;
         let cookie_key = derive_cookie_key(&config.master_key);
         let backend_slots = Arc::new(Semaphore::new(config.limits.max_backends_global));
         Ok(Self {
@@ -97,20 +95,14 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account/passkeys/remove", post(web::remove_passkey))
         .route("/account/sessions/revoke-others", post(web::revoke_other_sessions))
         .route("/account/connections/revoke", post(web::revoke_connection))
-        // Catalog administration (admin)
-        .route("/catalog", get(web::catalog_admin))
-        .route("/catalog/new", get(web::catalog_new))
-        .route("/catalog/save", post(web::catalog_save))
-        .route("/catalog/{id}/edit", get(web::catalog_edit))
-        .route("/catalog/{id}/delete", post(web::catalog_delete))
         // User administration (admin)
         .route("/users", get(web::users_page))
         .route("/users/disable", post(web::disable_user))
         .route("/users/enable", post(web::enable_user))
         .route("/users/delete", post(web::delete_user))
-        // Server management UI
-        .route("/servers/catalog", get(web::catalog_page))
-        .route("/servers/add", post(web::add_server))
+        // Server management UI (every user manages their own)
+        .route("/servers/new", get(web::new_server))
+        .route("/servers/create", post(web::create_server))
         .route("/servers/{id}", get(web::server_detail))
         .route("/servers/{id}/config", post(web::save_config))
         .route("/servers/{id}/enable", post(web::enable_server))

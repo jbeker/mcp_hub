@@ -64,6 +64,7 @@ rmcp = { version = "0.9", features = [
 # Misc
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
+shlex = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

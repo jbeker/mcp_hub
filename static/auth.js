@@ -183,6 +183,17 @@ function wire() {
       }
     });
   }
+  // Add-server form: show stdio vs http fields based on the transport select.
+  const transport = document.getElementById("transport-select");
+  if (transport) {
+    const sync = () => {
+      const isHttp = transport.value === "http";
+      document.querySelectorAll(".stdio-only").forEach((el) => el.classList.toggle("hidden", isHttp));
+      document.querySelectorAll(".http-only").forEach((el) => el.classList.toggle("hidden", !isHttp));
+    };
+    transport.addEventListener("change", sync);
+    sync();
+  }
   // Confirm-before-submit for forms marked with data-confirm (replaces the
   // inline onsubmit handlers that a strict CSP would block).
   document.querySelectorAll("form[data-confirm]").forEach((f) => {

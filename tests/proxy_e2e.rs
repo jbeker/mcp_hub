@@ -2,7 +2,7 @@
 //! HTTP with an OAuth bearer token. Covers backend aggregation and the built-in
 //! `hub__` management interface.
 
-use mcp_hub::catalog::ServerDef;
+use mcp_hub::instances::ServerDef;
 use mcp_hub::config::{Config, Limits};
 use mcp_hub::{build_router, db, instances, users, AppState};
 use rmcp::model::{CallToolRequestParam, GetPromptRequestParam, ReadResourceRequestParam};
@@ -36,7 +36,6 @@ async fn spawn_hub() -> (String, AppState) {
         master_key: [1u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
-        seed_catalog: true,
         limits: Limits::default(),
     };
     let state = AppState::new(config, pool).await.unwrap();
@@ -80,15 +79,14 @@ async fn unbuilt_git_backend_is_skipped() {
     let def = ServerDef {
         name: "Git Server".into(),
         description: String::new(),
-        transport: "git".into(),
-        command: None,
+        transport: "stdio".into(),
+        command: Some("example-mcp".into()),
         args: vec![],
         url: None,
         runtime: "python".into(),
-        secret_schema: vec![],
         repo: Some("https://github.com/example/mcp".into()),
         git_ref: Some("main".into()),
-        entry: Some("example-mcp".into()),
+        entry: None,
         module: None,
     };
     instances::create(&state.db, &user.id, None, Some(&def), "git", "Git Server")
@@ -146,7 +144,6 @@ async fn proxy_aggregates_a_stdio_backend() {
         args: vec![],
         url: None,
         runtime: "binary".into(),
-        secret_schema: vec![],
         repo: None,
         git_ref: None,
         entry: None,
@@ -220,7 +217,6 @@ async fn failed_backend_reports_error_status() {
         args: vec![],
         url: None,
         runtime: "binary".into(),
-        secret_schema: vec![],
         repo: None,
         git_ref: None,
         entry: None,
@@ -277,7 +273,6 @@ async fn proxy_aggregates_resources_and_prompts() {
         args: vec![],
         url: None,
         runtime: "binary".into(),
-        secret_schema: vec![],
         repo: None,
         git_ref: None,
         entry: None,
@@ -377,34 +372,19 @@ async fn management_tools_over_mcp() {
         .unwrap();
     assert_eq!(who.structured_content.unwrap()["handle"], "alice");
 
-    // The catalog is reachable over MCP.
-    let cat = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_catalog".into(),
-            arguments: None,
-        })
-        .await
-        .unwrap();
-    let cat_json = serde_json::to_string(&cat.structured_content).unwrap();
-    assert!(cat_json.contains("zabbix"), "catalog: {cat_json}");
-
-    // Add a server, configure a secret, then list it back.
+    // Add a user-defined stdio server, set its env, then list it back.
     let added = client
         .call_tool(CallToolRequestParam {
             name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({"catalog_slug": "zabbix", "namespace": "zbx", "display_name": "My Zabbix"})),
+            arguments: args(serde_json::json!({
+                "namespace": "zbx", "transport": "stdio",
+                "command": "uvx zabbix-mcp-server", "display_name": "My Zabbix",
+                "env": {"ZABBIX_TOKEN": "s3cr3t"}
+            })),
         })
         .await
         .unwrap();
     assert_eq!(added.structured_content.unwrap()["added"], true);
-
-    client
-        .call_tool(CallToolRequestParam {
-            name: "hub__set_secret".into(),
-            arguments: args(serde_json::json!({"namespace": "zbx", "key": "ZABBIX_TOKEN", "value": "s3cr3t"})),
-        })
-        .await
-        .unwrap();
 
     let listed = client
         .call_tool(CallToolRequestParam {
@@ -415,27 +395,34 @@ async fn management_tools_over_mcp() {
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
     assert!(listed_json.contains("zbx"));
-    assert!(listed_json.contains("ZABBIX_TOKEN")); // secret name listed, value not
-    assert!(!listed_json.contains("s3cr3t")); // value never returned
+    assert!(listed_json.contains("zabbix-mcp-server")); // command is shown
+    assert!(listed_json.contains("ZABBIX_TOKEN")); // env key name listed...
+    assert!(!listed_json.contains("s3cr3t")); // ...value never returned
 
-    // An env key outside the server's schema is refused (no PYTHONSTARTUP etc.).
-    let injected = client
+    // Replacing the env keeps only the new keys.
+    client
         .call_tool(CallToolRequestParam {
-            name: "hub__set_secret".into(),
-            arguments: args(serde_json::json!({"namespace": "zbx", "key": "LD_PRELOAD", "value": "/tmp/x.so"})),
+            name: "hub__set_env".into(),
+            arguments: args(serde_json::json!({"namespace": "zbx", "env": {"ZABBIX_URL": "https://z/api"}})),
         })
-        .await;
-    let blocked = match injected {
-        Err(_) => true,
-        Ok(r) => r.is_error == Some(true),
-    };
-    assert!(blocked, "undeclared env key must be rejected");
+        .await
+        .unwrap();
+    let relisted = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__list_my_servers".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let relisted_json = serde_json::to_string(&relisted.structured_content).unwrap();
+    assert!(relisted_json.contains("ZABBIX_URL"));
+    assert!(!relisted_json.contains("ZABBIX_TOKEN"));
 
     // Reserved namespace cannot be claimed via the management interface.
     let reserved = client
         .call_tool(CallToolRequestParam {
             name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({"catalog_slug": "zabbix", "namespace": "hub"})),
+            arguments: args(serde_json::json!({"namespace": "hub", "transport": "stdio", "command": "x"})),
         })
         .await;
     let rejected = match reserved {
@@ -583,63 +570,47 @@ async fn admin_can_disable_and_delete_users() {
 }
 
 #[tokio::test]
-async fn http_remote_url_is_configurable() {
+async fn http_server_add_and_edit() {
     let (base, state) = spawn_hub().await;
-    let admin = users::create(&state.db, "admin1", "alice", "Alice", true)
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&admin.id, "c", &format!("{base}/mcp"), "mcp", true, 3600)
+        .issue_access_token(&user.id, "c", &format!("{base}/mcp"), "mcp", false, 3600)
         .unwrap();
     let client = connect(&base, token).await;
 
-    // 'memory' is a built-in http remote.
+    // Add an http server with its own URL — a bad URL is rejected.
+    let bad = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__add_server".into(),
+            arguments: args(serde_json::json!({"namespace": "mem", "transport": "http", "url": "not-a-url"})),
+        })
+        .await;
+    assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
+
     client
         .call_tool(CallToolRequestParam {
             name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({"catalog_slug": "memory", "namespace": "mem"})),
-        })
-        .await
-        .unwrap();
-
-    // The per-instance remote URL is settable via MCP_URL even though it is not
-    // in the catalog's secret_schema.
-    let set_url = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__configure".into(),
             arguments: args(serde_json::json!({
-                "namespace": "mem",
-                "values": {"MCP_URL": "https://my-memory.example.net/mcp"}
+                "namespace": "mem", "transport": "http",
+                "url": "https://memory.example.net/mcp",
+                "env": {"AUTHORIZATION": "Bearer t"}
             })),
         })
         .await
         .unwrap();
-    assert_ne!(set_url.is_error, Some(true));
 
-    // A non-URL value is rejected...
-    let bad_url = client
+    // Edit the URL.
+    client
         .call_tool(CallToolRequestParam {
-            name: "hub__configure".into(),
-            arguments: args(serde_json::json!({
-                "namespace": "mem", "values": {"MCP_URL": "not-a-url"}
-            })),
+            name: "hub__edit_server".into(),
+            arguments: args(serde_json::json!({"namespace": "mem", "url": "https://other.example.net/mcp"})),
         })
-        .await;
-    assert!(bad_url.is_err() || bad_url.unwrap().is_error == Some(true));
+        .await
+        .unwrap();
 
-    // ...and an undeclared, non-URL key is still rejected (schema restriction).
-    let injected = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__configure".into(),
-            arguments: args(serde_json::json!({
-                "namespace": "mem", "values": {"PYTHONSTARTUP": "/tmp/x"}
-            })),
-        })
-        .await;
-    assert!(injected.is_err() || injected.unwrap().is_error == Some(true));
-
-    // The URL shows up in the instance config.
     let listed = client
         .call_tool(CallToolRequestParam {
             name: "hub__list_my_servers".into(),
@@ -648,7 +619,8 @@ async fn http_remote_url_is_configurable() {
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
-    assert!(json.contains("my-memory.example.net"), "got {json}");
+    assert!(json.contains("other.example.net"), "got {json}");
+    assert!(json.contains("\"transport\":\"http\""), "got {json}");
 
     let _ = client.cancel().await;
 }

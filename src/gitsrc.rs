@@ -8,8 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use sqlx::SqlitePool;
 use tokio::process::Command;
 
-use crate::catalog::ServerDef;
-use crate::instances::{self, Instance};
+use crate::instances::{self, Instance, ServerDef};
 
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -26,9 +25,9 @@ pub fn env_path(env_dir: &str, instance_id: &str) -> PathBuf {
     Path::new(env_dir).join(instance_id)
 }
 
-/// True if `def` is a git-sourced backend.
+/// True if `def` is a git-sourced backend (a stdio server with a repo).
 pub fn is_git_source(def: &ServerDef) -> bool {
-    def.transport == "git"
+    def.is_git()
 }
 
 /// The exact `(program, args)` a stdio or git backend will be launched with,
@@ -39,7 +38,7 @@ pub fn resolved_command(
     inst: &Instance,
     def: &ServerDef,
 ) -> Option<(String, Vec<String>)> {
-    if is_git_source(def) {
+    if def.is_git() {
         let ready = inst.build_status == "ready" && env_path(env_dir, &inst.id).exists();
         if !ready {
             return None;
@@ -89,23 +88,21 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the program and args to launch a built git backend.
+/// Resolve the program and args to launch a built git backend: the command's
+/// first token resolves to `<venv>/bin/<command>` so console scripts and
+/// `python` come from the built environment; the rest of the command line is
+/// passed through unchanged.
 pub fn launch_command(env_dir: &str, instance_id: &str, def: &ServerDef) -> Result<(String, Vec<String>)> {
     let bin = env_path(env_dir, instance_id).join("bin");
-    if let Some(entry) = def.entry.as_deref().filter(|s| !s.is_empty()) {
-        validate_name(entry)?;
-        let program = bin.join(entry);
-        Ok((program.to_string_lossy().into_owned(), vec![]))
-    } else if let Some(module) = def.module.as_deref().filter(|s| !s.is_empty()) {
-        validate_name(module)?;
-        let python = bin.join("python");
-        Ok((
-            python.to_string_lossy().into_owned(),
-            vec!["-m".into(), module.into()],
-        ))
-    } else {
-        bail!("git source has neither an entry script nor a module")
-    }
+    let command = def
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("git source has no command"))?;
+    validate_name(command)?;
+    let program = bin.join(command);
+    Ok((program.to_string_lossy().into_owned(), def.args.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,41 +256,40 @@ pub fn remove_env(env_dir: &str, instance_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::ServerDef;
 
-    fn git_def(entry: Option<&str>, module: Option<&str>) -> ServerDef {
+    fn git_def(command: Option<&str>, args: &[&str]) -> ServerDef {
         ServerDef {
             name: "x".into(),
             description: String::new(),
-            transport: "git".into(),
-            command: None,
-            args: vec![],
+            transport: "stdio".into(),
+            command: command.map(String::from),
+            args: args.iter().map(|s| s.to_string()).collect(),
             url: None,
             runtime: "python".into(),
-            secret_schema: vec![],
             repo: Some("https://github.com/o/r".into()),
             git_ref: Some("main".into()),
-            entry: entry.map(String::from),
-            module: module.map(String::from),
+            entry: None,
+            module: None,
         }
     }
 
     #[test]
-    fn launch_uses_entry_or_module() {
-        let (p, a) = launch_command("/envs", "abc", &git_def(Some("my-mcp"), None)).unwrap();
+    fn launch_resolves_command_in_the_venv() {
+        let (p, a) = launch_command("/envs", "abc", &git_def(Some("my-mcp"), &[])).unwrap();
         assert!(p.ends_with("/envs/abc/bin/my-mcp"));
         assert!(a.is_empty());
 
-        let (p, a) = launch_command("/envs", "abc", &git_def(None, Some("pkg.server"))).unwrap();
+        let (p, a) =
+            launch_command("/envs", "abc", &git_def(Some("python"), &["-m", "pkg.server"])).unwrap();
         assert!(p.ends_with("/envs/abc/bin/python"));
         assert_eq!(a, vec!["-m".to_string(), "pkg.server".to_string()]);
     }
 
     #[test]
-    fn launch_rejects_bad_names_and_missing_target() {
-        assert!(launch_command("/envs", "abc", &git_def(Some("../evil"), None)).is_err());
-        assert!(launch_command("/envs", "abc", &git_def(Some("a b"), None)).is_err());
-        assert!(launch_command("/envs", "abc", &git_def(None, None)).is_err());
+    fn launch_rejects_bad_names_and_missing_command() {
+        assert!(launch_command("/envs", "abc", &git_def(Some("../evil"), &[])).is_err());
+        assert!(launch_command("/envs", "abc", &git_def(Some("a b"), &[])).is_err());
+        assert!(launch_command("/envs", "abc", &git_def(None, &[])).is_err());
     }
 
     #[test]
@@ -336,7 +332,7 @@ mod tests {
         build_env(&env_dir, "inst1", &repo_url, &sha).await.unwrap();
 
         // The built env survived the relocation and the entry point runs.
-        let def = git_def(Some("echo-mcp"), None);
+        let def = git_def(Some("echo-mcp"), &[]);
         let (program, args) = launch_command(&env_dir, "inst1", &def).unwrap();
         let out = Sync::new(&program).args(&args).output().unwrap();
         assert!(out.status.success());

@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
-use crate::catalog::{self, CatalogServer};
-use crate::{instances, invites, users};
+use crate::instances::{self, ServerDef};
+use crate::{invites, users};
 use crate::AppState;
 
 /// Build the list of management tools available to the caller.
@@ -17,49 +19,54 @@ pub fn tools(admin: bool) -> Vec<Tool> {
     let mut t = vec![
         tool("hub__whoami", "Show the current user and their configured servers.", schema(json!({}), &[])),
         tool(
-            "hub__list_catalog",
-            "List MCP servers available in the hub catalog.",
-            schema(json!({}), &[]),
-        ),
-        tool(
             "hub__list_my_servers",
-            "List your configured server instances and their status.",
+            "List your configured servers, their launch command and status.",
             schema(json!({}), &[]),
         ),
         tool(
             "hub__add_server",
-            "Add a server from the catalog to your account.",
+            "Add one of your own MCP servers. For stdio, give a 'command' line \
+             (and optionally a 'repo' to build a cached venv from); for http, give \
+             a 'url'. 'env' is a map of environment variables (encrypted).",
             schema(
                 json!({
-                    "catalog_slug": {"type": "string", "description": "Catalog entry slug, e.g. 'zabbix'"},
-                    "namespace": {"type": "string", "description": "Unique namespace prefix for the server's tools"},
-                    "display_name": {"type": "string"}
+                    "namespace": {"type": "string", "description": "Unique tool-name prefix, e.g. 'zabbix'"},
+                    "transport": {"type": "string", "enum": ["stdio", "http"]},
+                    "command": {"type": "string", "description": "stdio: the command line, e.g. 'uvx zabbix-mcp-server'"},
+                    "url": {"type": "string", "description": "http: the remote endpoint URL"},
+                    "repo": {"type": "string", "description": "stdio (optional): git repo to build a cached venv from"},
+                    "git_ref": {"type": "string", "description": "branch/tag for 'repo' (default main)"},
+                    "display_name": {"type": "string"},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}}
                 }),
-                &["catalog_slug", "namespace"],
+                &["namespace", "transport"],
             ),
         ),
         tool(
-            "hub__configure",
-            "Set one or more configuration/secret values on one of your servers. \
-             For an http remote, set 'MCP_URL' to point it at your own endpoint.",
+            "hub__edit_server",
+            "Change one of your servers' command/url/repo (omitted fields are \
+             left unchanged).",
             schema(
                 json!({
                     "namespace": {"type": "string"},
-                    "values": {"type": "object", "description": "Map of config key -> value", "additionalProperties": {"type": "string"}}
+                    "command": {"type": "string"},
+                    "url": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "git_ref": {"type": "string"}
                 }),
-                &["namespace", "values"],
+                &["namespace"],
             ),
         ),
         tool(
-            "hub__set_secret",
-            "Set a single encrypted secret value on one of your servers.",
+            "hub__set_env",
+            "Replace the full set of environment variables on one of your servers \
+             (encrypted at rest). Pass the complete map; omitted keys are removed.",
             schema(
                 json!({
                     "namespace": {"type": "string"},
-                    "key": {"type": "string"},
-                    "value": {"type": "string"}
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}}
                 }),
-                &["namespace", "key", "value"],
+                &["namespace", "env"],
             ),
         ),
         tool(
@@ -90,30 +97,6 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "hub__list_users",
             "(admin) List all hub users.",
             schema(json!({}), &[]),
-        ));
-        t.push(tool(
-            "hub__catalog_upsert",
-            "(admin) Create or update a catalog entry.",
-            schema(
-                json!({
-                    "slug": {"type": "string"},
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "transport": {"type": "string", "enum": ["stdio", "http"]},
-                    "command": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "url": {"type": "string"},
-                    "runtime": {"type": "string"},
-                    "supported": {"type": "boolean"},
-                    "secret_schema": {"type": "array"}
-                }),
-                &["slug", "name", "transport"],
-            ),
-        ));
-        t.push(tool(
-            "hub__catalog_remove",
-            "(admin) Remove a catalog entry by slug.",
-            schema(json!({"slug": {"type": "string"}}), &["slug"]),
         ));
         t.push(tool(
             "hub__create_invite",
@@ -180,11 +163,10 @@ pub async fn dispatch(
     let args = args.unwrap_or_default();
     match op {
         "whoami" => whoami(state, user_id).await,
-        "list_catalog" => list_catalog(state).await,
         "list_my_servers" => list_my_servers(state, user_id).await,
         "add_server" => add_server(state, user_id, &args).await,
-        "configure" => configure(state, user_id, &args).await,
-        "set_secret" => set_secret(state, user_id, &args).await,
+        "edit_server" => edit_server(state, user_id, &args).await,
+        "set_env" => set_env(state, user_id, &args).await,
         "update_server" => update_server(state, user_id, &args).await,
         "enable" => set_enabled(state, user_id, &args, true).await,
         "disable" => set_enabled(state, user_id, &args, false).await,
@@ -192,14 +174,6 @@ pub async fn dispatch(
         "list_users" => {
             require_admin(admin)?;
             list_users(state).await
-        }
-        "catalog_upsert" => {
-            require_admin(admin)?;
-            catalog_upsert(state, user_id, &args).await
-        }
-        "catalog_remove" => {
-            require_admin(admin)?;
-            catalog_remove(state, &args).await
         }
         "create_invite" => {
             require_admin(admin)?;
@@ -259,52 +233,33 @@ async fn whoami(state: &AppState, user_id: &str) -> Result<CallToolResult, McpEr
     }))
 }
 
-async fn list_catalog(state: &AppState) -> Result<CallToolResult, McpError> {
-    let entries = catalog::list(&state.db).await.map_err(internal)?;
-    let out = entries
-        .into_iter()
-        .map(|e| {
-            json!({
-                "slug": e.slug,
-                "name": e.name,
-                "description": e.description,
-                "transport": e.transport,
-                "supported": e.supported,
-                "required_config": e.secret_schema.iter().map(|f| json!({
-                    "name": f.name, "label": f.label, "secret": f.secret, "required": f.required
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-    ok(json!({ "catalog": out }))
-}
-
 async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResult, McpError> {
     let instances = instances::list_for_user(&state.db, user_id)
         .await
         .map_err(internal)?;
     let mut out = Vec::new();
     for i in instances {
-        let secrets = instances::secret_names(&state.db, &i.id)
+        let env_keys = instances::secret_names(&state.db, &i.id)
             .await
             .map_err(internal)?;
+        let def = instances::resolve_def(&state.db, &i).await.ok();
         // The exact launch command for stdio/git backends (None for http).
-        let command = match instances::resolve_def(&state.db, &i).await {
-            Ok(def) => crate::gitsrc::resolved_command(&state.config.env_dir, &i, &def)
-                .map(|(program, args)| {
-                    let mut v = vec![program];
-                    v.extend(args);
-                    v
-                }),
-            Err(_) => None,
-        };
+        let command = def.as_ref().and_then(|def| {
+            crate::gitsrc::resolved_command(&state.config.env_dir, &i, def).map(|(program, args)| {
+                let mut v = vec![program];
+                v.extend(args);
+                v
+            })
+        });
         out.push(json!({
             "namespace": i.namespace,
             "display_name": i.display_name,
             "enabled": i.enabled,
-            "config": i.config,
-            "secrets_set": secrets,
+            "transport": def.as_ref().map(|d| d.transport.clone()),
+            "url": def.as_ref().and_then(|d| d.url.clone()),
+            "repo": def.as_ref().and_then(|d| d.repo.clone()),
             "command": command,
+            "env_keys": env_keys,
             "build_status": i.build_status,
             "built_commit": i.built_commit,
             "runtime_status": i.runtime_status,
@@ -315,110 +270,142 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
     ok(json!({ "servers": out }))
 }
 
+/// Build a `ServerDef` from add-server args (transport stdio | http).
+fn def_from_args(args: &JsonObject, display_name: &str) -> Result<ServerDef, McpError> {
+    let transport = req_str(args, "transport")?;
+    if !matches!(transport.as_str(), "stdio" | "http") {
+        return Err(McpError::invalid_params("transport must be stdio or http", None));
+    }
+    if transport == "http" {
+        let url = req_str(args, "url")?;
+        instances::validate_remote_url(&url).map_err(bad_request)?;
+        Ok(ServerDef {
+            name: display_name.to_string(),
+            description: String::new(),
+            transport,
+            command: None,
+            args: vec![],
+            url: Some(url),
+            runtime: String::new(),
+            repo: None,
+            git_ref: None,
+            entry: None,
+            module: None,
+        })
+    } else {
+        let line = req_str(args, "command")?;
+        let (command, cmd_args) = instances::parse_command(&line).map_err(bad_request)?;
+        if command.is_none() {
+            return Err(McpError::invalid_params("a command line is required", None));
+        }
+        let repo = opt_str(args, "repo");
+        if let Some(r) = &repo {
+            url::Url::parse(r)
+                .map_err(|_| McpError::invalid_params("repo must be a valid URL", None))?;
+        }
+        let git_ref = repo
+            .as_ref()
+            .map(|_| opt_str(args, "git_ref").unwrap_or_else(|| "main".into()));
+        Ok(ServerDef {
+            name: display_name.to_string(),
+            description: String::new(),
+            transport,
+            command,
+            args: cmd_args,
+            url: None,
+            runtime: String::new(),
+            repo,
+            git_ref,
+            entry: None,
+            module: None,
+        })
+    }
+}
+
+/// Parse an `env` object argument into a validated KEY=VALUE map.
+fn env_from_args(args: &JsonObject) -> Result<BTreeMap<String, String>, McpError> {
+    let Some(obj) = args.get("env") else {
+        return Ok(BTreeMap::new());
+    };
+    let obj = obj
+        .as_object()
+        .ok_or_else(|| McpError::invalid_params("'env' must be an object", None))?;
+    let mut text = String::new();
+    for (k, v) in obj {
+        let value = v
+            .as_str()
+            .ok_or_else(|| McpError::invalid_params(format!("env '{k}' must be a string"), None))?;
+        text.push_str(&format!("{k}={value}\n"));
+    }
+    instances::parse_env(&text).map_err(bad_request)
+}
+
 async fn add_server(
     state: &AppState,
     user_id: &str,
     args: &JsonObject,
 ) -> Result<CallToolResult, McpError> {
-    let slug = req_str(args, "catalog_slug")?;
     let namespace = req_str(args, "namespace")?;
     let display_name = opt_str(args, "display_name").unwrap_or_else(|| namespace.clone());
+    let def = def_from_args(args, &display_name)?;
+    let env = env_from_args(args)?;
 
-    let entry = catalog::get_by_slug(&state.db, &slug)
+    let inst = instances::create(&state.db, user_id, None, Some(&def), &namespace, &display_name)
         .await
-        .map_err(internal)?
-        .ok_or_else(|| McpError::invalid_params(format!("no catalog entry '{slug}'"), None))?;
-    if !entry.supported {
-        return Err(McpError::invalid_params(
-            format!("catalog entry '{slug}' is not supported in this version"),
-            None,
-        ));
-    }
-    let inst =
-        instances::create(&state.db, user_id, Some(&entry.id), None, &namespace, &display_name)
-            .await
-            .map_err(bad_request)?;
-    ok(json!({ "added": true, "namespace": inst.namespace, "next": "use hub__configure or hub__set_secret to provide credentials, then hub__enable" }))
+        .map_err(bad_request)?;
+    instances::replace_env(&state.db, &state.secrets, &inst.id, &env)
+        .await
+        .map_err(internal)?;
+    ok(json!({ "added": true, "namespace": inst.namespace }))
 }
 
-async fn configure(
+async fn edit_server(
     state: &AppState,
     user_id: &str,
     args: &JsonObject,
 ) -> Result<CallToolResult, McpError> {
     let namespace = req_str(args, "namespace")?;
-    let values = args
-        .get("values")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| McpError::invalid_params("'values' must be an object", None))?;
-
     let inst = find_instance(state, user_id, &namespace).await?;
-    let def = instances::resolve_def(&state.db, &inst)
-        .await
-        .map_err(internal)?;
+    let mut def = instances::resolve_def(&state.db, &inst).await.map_err(internal)?;
 
-    for (key, val) in values {
-        let value = val.as_str().ok_or_else(|| {
-            McpError::invalid_params(format!("value for '{key}' must be a string"), None)
-        })?;
-        // The remote URL of an http backend is settable on any http instance
-        // (it is a connection target, not injected process environment).
-        if key == instances::URL_KEY && def.transport == "http" {
-            instances::validate_remote_url(value).map_err(bad_request)?;
-            instances::set_config_value(&state.db, &inst.id, key, value)
-                .await
-                .map_err(internal)?;
-            continue;
-        }
-        // Only keys declared by the server's schema may be set. These keys
-        // become process environment variables, so accepting arbitrary names
-        // would let a user inject PYTHONSTARTUP / NODE_OPTIONS / LD_PRELOAD etc.
-        let field = def.secret_schema.iter().find(|f| &f.name == key).ok_or_else(|| {
-            McpError::invalid_params(
-                format!("'{key}' is not a configuration key for this server"),
-                None,
-            )
-        })?;
-        if field.secret {
-            instances::set_secret(&state.db, &state.secrets, &inst.id, key, value)
-                .await
-                .map_err(internal)?;
-        } else {
-            instances::set_config_value(&state.db, &inst.id, key, value)
-                .await
-                .map_err(internal)?;
+    if let Some(line) = opt_str(args, "command") {
+        let (command, cmd_args) = instances::parse_command(&line).map_err(bad_request)?;
+        def.command = command;
+        def.args = cmd_args;
+    }
+    if let Some(url) = opt_str(args, "url") {
+        instances::validate_remote_url(&url).map_err(bad_request)?;
+        def.url = Some(url);
+    }
+    if let Some(repo) = opt_str(args, "repo") {
+        url::Url::parse(&repo)
+            .map_err(|_| McpError::invalid_params("repo must be a valid URL", None))?;
+        def.repo = Some(repo);
+        if def.git_ref.is_none() {
+            def.git_ref = Some("main".into());
         }
     }
-    ok(json!({ "configured": true, "namespace": namespace, "keys": values.keys().collect::<Vec<_>>() }))
+    if let Some(git_ref) = opt_str(args, "git_ref") {
+        def.git_ref = Some(git_ref);
+    }
+    instances::update_def(&state.db, &inst.id, &def)
+        .await
+        .map_err(internal)?;
+    ok(json!({ "edited": true, "namespace": namespace }))
 }
 
-async fn set_secret(
+async fn set_env(
     state: &AppState,
     user_id: &str,
     args: &JsonObject,
 ) -> Result<CallToolResult, McpError> {
     let namespace = req_str(args, "namespace")?;
-    let key = req_str(args, "key")?;
-    let value = req_str(args, "value")?;
     let inst = find_instance(state, user_id, &namespace).await?;
-    let def = instances::resolve_def(&state.db, &inst)
+    let env = env_from_args(args)?;
+    instances::replace_env(&state.db, &state.secrets, &inst.id, &env)
         .await
         .map_err(internal)?;
-    // The key must be a declared secret field (see configure() for why).
-    let declared = def
-        .secret_schema
-        .iter()
-        .any(|f| f.name == key && f.secret);
-    if !declared {
-        return Err(McpError::invalid_params(
-            format!("'{key}' is not a secret field for this server"),
-            None,
-        ));
-    }
-    instances::set_secret(&state.db, &state.secrets, &inst.id, &key, &value)
-        .await
-        .map_err(internal)?;
-    ok(json!({ "set": true, "namespace": namespace, "key": key }))
+    ok(json!({ "set": true, "namespace": namespace, "keys": env.keys().collect::<Vec<_>>() }))
 }
 
 async fn update_server(
@@ -558,32 +545,6 @@ async fn delete_user(
         .await
         .map_err(internal)?;
     ok(json!({ "deleted": true, "handle": handle }))
-}
-
-async fn catalog_upsert(
-    state: &AppState,
-    user_id: &str,
-    args: &JsonObject,
-) -> Result<CallToolResult, McpError> {
-    let mut server: CatalogServer =
-        serde_json::from_value(Value::Object(args.clone())).map_err(|e| {
-            McpError::invalid_params(format!("invalid catalog entry: {e}"), None)
-        })?;
-    server.is_builtin = false;
-    let id = catalog::upsert(&state.db, &server, Some(user_id))
-        .await
-        .map_err(internal)?;
-    ok(json!({ "upserted": true, "slug": server.slug, "id": id }))
-}
-
-async fn catalog_remove(state: &AppState, args: &JsonObject) -> Result<CallToolResult, McpError> {
-    let slug = req_str(args, "slug")?;
-    let entry = catalog::get_by_slug(&state.db, &slug)
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| McpError::invalid_params(format!("no catalog entry '{slug}'"), None))?;
-    catalog::delete(&state.db, &entry.id).await.map_err(internal)?;
-    ok(json!({ "removed": true, "slug": slug }))
 }
 
 async fn create_invite(

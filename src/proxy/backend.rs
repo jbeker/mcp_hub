@@ -15,7 +15,7 @@ use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioC
 use rmcp::RoleClient;
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::catalog::ServerDef;
+use crate::instances::ServerDef;
 
 /// A live connection to one backend MCP server.
 pub struct Backend {

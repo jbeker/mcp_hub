@@ -103,26 +103,9 @@ impl HubProxy {
                     continue;
                 }
             };
-            // For http remotes, let the instance override the catalog's URL with
-            // its own endpoint (see instances::URL_KEY).
-            if def.transport == "http" {
-                if let Some(u) = inst
-                    .config
-                    .get(instances::URL_KEY)
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                {
-                    def.url = Some(u.to_string());
-                }
-                if def.url.as_deref().unwrap_or("").trim().is_empty() {
-                    self.mark_status(
-                        inst,
-                        "error",
-                        Some("no remote URL set — configure it on the server page"),
-                    )
-                    .await;
-                    continue;
-                }
+            if def.transport == "http" && def.url.as_deref().unwrap_or("").trim().is_empty() {
+                self.mark_status(inst, "error", Some("no remote URL set")).await;
+                continue;
             }
             // Git-sourced backends run from their prebuilt virtualenv. Rewrite
             // the def to a direct stdio exec; skip if it has not been built yet.
