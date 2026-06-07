@@ -99,7 +99,7 @@ impl HubProxy {
             let mut def = match instances::resolve_def(&self.state.db, inst).await {
                 Ok(d) => d,
                 Err(e) => {
-                    self.mark_status(inst, "error", Some(&format!("resolve failed: {e}"))).await;
+                    self.mark_status(inst, "error", Some(&format!("resolve failed: {e:#}"))).await;
                     continue;
                 }
             };
@@ -116,7 +116,7 @@ impl HubProxy {
                             def.args = args;
                         }
                         Err(e) => {
-                            self.mark_status(inst, "error", Some(&format!("git launch failed: {e}"))).await;
+                            self.mark_status(inst, "error", Some(&format!("git launch failed: {e:#}"))).await;
                             continue;
                         }
                     }
@@ -129,7 +129,7 @@ impl HubProxy {
             {
                 Ok(e) => e,
                 Err(e) => {
-                    self.mark_status(inst, "error", Some(&format!("config error: {e}"))).await;
+                    self.mark_status(inst, "error", Some(&format!("config error: {e:#}"))).await;
                     continue;
                 }
             };
@@ -147,7 +147,7 @@ impl HubProxy {
                     out.push(b);
                 }
                 Err(e) => {
-                    self.mark_status(inst, "error", Some(&format!("failed to start: {e}"))).await;
+                    self.mark_status(inst, "error", Some(&format!("failed to start: {e:#}"))).await;
                 }
             }
         }
@@ -267,7 +267,7 @@ impl ServerHandler for HubProxy {
         backend
             .call_tool(original.to_string(), request.arguments)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
     async fn list_resources(
@@ -335,7 +335,7 @@ impl ServerHandler for HubProxy {
         backend
             .read_resource(original.to_string())
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 
     async fn list_prompts(
@@ -377,6 +377,6 @@ impl ServerHandler for HubProxy {
         backend
             .get_prompt(original.to_string(), request.arguments)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }
 }
