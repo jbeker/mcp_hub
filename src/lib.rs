@@ -49,7 +49,7 @@ impl AppState {
     pub async fn new(config: Config, db: sqlx::SqlitePool) -> anyhow::Result<Self> {
         let secrets = SecretBox::new(&config.master_key);
         let webauthn = Arc::new(wa::build(&config.base_url, &config.rp_id)?);
-        let signer = Arc::new(Signer::load_or_create(&db, &config.base_url).await?);
+        let signer = Arc::new(Signer::load_or_create(&db, &secrets, &config.base_url).await?);
         crate::catalog::seed_builtins(&db).await?;
         let cookie_key = derive_cookie_key(&config.master_key);
         let backend_slots = Arc::new(Semaphore::new(config.limits.max_backends_global));

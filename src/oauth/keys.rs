@@ -6,11 +6,13 @@
 //! JWKS so any standards-compliant client can verify too.
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::crypto::{Sealed, SecretBox, NONCE_LEN};
 use crate::util::now_unix;
 
 /// Claims carried by an access token.
@@ -40,16 +42,21 @@ pub struct Signer {
 
 impl Signer {
     /// Load the active signing key, generating and persisting one if none exists.
-    pub async fn load_or_create(pool: &SqlitePool, issuer: &str) -> Result<Self> {
-        if let Some((kid, pem)) = load_active(pool).await? {
+    ///
+    /// The private key is encrypted at rest with the master key (`secrets`), so a
+    /// database compromise alone cannot forge tokens.
+    pub async fn load_or_create(pool: &SqlitePool, secrets: &SecretBox, issuer: &str) -> Result<Self> {
+        if let Some((kid, stored)) = load_active(pool).await? {
+            let pem = unseal_pem(secrets, &stored)?;
             Self::from_pem(&kid, issuer, &pem)
         } else {
             let (kid, pem) = generate_pem()?;
+            let stored = seal_pem(secrets, &pem)?;
             sqlx::query(
                 "INSERT INTO oauth_signing_keys (kid, private_pkcs8_b64, created_at, active) VALUES (?, ?, ?, 1)",
             )
             .bind(&kid)
-            .bind(&pem)
+            .bind(&stored)
             .bind(now_unix())
             .execute(pool)
             .await
@@ -144,6 +151,34 @@ async fn load_active(pool: &SqlitePool) -> Result<Option<(String, String)>> {
     Ok(row)
 }
 
+/// Encrypt a PKCS#8 PEM for storage: base64(nonce || ciphertext).
+fn seal_pem(secrets: &SecretBox, pem: &str) -> Result<String> {
+    let sealed = secrets.seal(pem.as_bytes())?;
+    let mut blob = sealed.nonce;
+    blob.extend_from_slice(&sealed.ciphertext);
+    Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+}
+
+/// Decrypt a stored signing key. Accepts a legacy plaintext PEM for forward
+/// compatibility with databases created before keys were encrypted.
+fn unseal_pem(secrets: &SecretBox, stored: &str) -> Result<String> {
+    if stored.starts_with("-----BEGIN") {
+        return Ok(stored.to_string());
+    }
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(stored.trim())
+        .context("decoding stored signing key")?;
+    if blob.len() <= NONCE_LEN {
+        return Err(anyhow!("stored signing key is truncated"));
+    }
+    let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
+    let plain = secrets.open(&Sealed {
+        nonce: nonce.to_vec(),
+        ciphertext: ciphertext.to_vec(),
+    })?;
+    String::from_utf8(plain).context("signing key was not valid UTF-8")
+}
+
 /// Generate a new ES256 key and return `(kid, pkcs8_pem)`.
 fn generate_pem() -> Result<(String, String)> {
     use rand::rngs::OsRng;
@@ -189,6 +224,27 @@ mod tests {
         assert!(s
             .verify_access_token(&token, "https://evil.example.com/mcp")
             .is_err());
+    }
+
+    #[test]
+    fn sealed_key_round_trips_and_resists_wrong_master() {
+        let (_kid, pem) = generate_pem().unwrap();
+        let good = SecretBox::new(&[7u8; 32]);
+        let stored = seal_pem(&good, &pem).unwrap();
+        assert!(!stored.contains("BEGIN"), "stored key must be ciphertext");
+        assert_eq!(unseal_pem(&good, &stored).unwrap(), pem);
+
+        // A different master key cannot recover the signing key.
+        let bad = SecretBox::new(&[8u8; 32]);
+        assert!(unseal_pem(&bad, &stored).is_err());
+    }
+
+    #[test]
+    fn legacy_plaintext_pem_still_loads() {
+        let (_kid, pem) = generate_pem().unwrap();
+        let secrets = SecretBox::new(&[1u8; 32]);
+        // A pre-encryption database stored the raw PEM.
+        assert_eq!(unseal_pem(&secrets, &pem).unwrap(), pem);
     }
 
     #[test]
