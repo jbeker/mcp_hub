@@ -98,11 +98,20 @@ Newly added/enabled servers take effect on the next client session.
 
 ## Security notes
 
-- Secrets are encrypted with XChaCha20-Poly1305 using `HUB_MASTER_KEY`; plaintext only
-  exists in memory while a backend is being launched, and is never logged.
-- Access tokens are short-lived ES256 JWTs bound to the `/mcp` resource (audience); refresh
-  tokens are stored hashed.
-- **Back up `HUB_MASTER_KEY`** — losing it makes every stored secret and session unrecoverable.
+- Secrets **and the OAuth signing key** are encrypted at rest with XChaCha20-Poly1305 using
+  `HUB_MASTER_KEY`; plaintext only exists in memory while a backend is being launched, and is
+  never logged. A database compromise alone cannot decrypt secrets or forge tokens.
+- Access tokens are short-lived (15 min) ES256 JWTs bound to the `/mcp` resource (audience) and
+  pinned to the active key id; refresh tokens are stored hashed and **rotated with reuse
+  detection** — replaying a rotated token revokes the whole session.
+- OAuth uses PKCE (S256, mandatory), exact-match `redirect_uri`, and a per-session **CSRF token**
+  on the consent and management forms. Responses carry `X-Frame-Options`, `nosniff`, and a CSP
+  that forbids inline scripts.
+- Backend config keys are restricted to each catalog entry's declared schema, so a user cannot
+  inject arbitrary process environment (e.g. `LD_PRELOAD`) into a spawned backend.
+- **Back up `HUB_MASTER_KEY`** — losing it makes every stored secret, signing key, and session
+  unrecoverable. Run only behind a TLS-terminating reverse proxy, and rate-limit `/auth/*`,
+  `/token`, and `/register` there.
 - Some MCP servers are inherently local to a developer's machine (e.g. IDE bridges, desktop-app
   tools) and are not meant to be centralized here.
 - Backends needing interactive upstream OAuth (e.g. GitHub's hosted MCP) are flagged

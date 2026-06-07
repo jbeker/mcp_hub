@@ -10,7 +10,9 @@ use crate::oauth::{store, token_hash, verify_pkce_s256, OAuthError};
 use crate::users;
 use crate::AppState;
 
-const ACCESS_TTL_SECS: i64 = 3600;
+// Short access-token lifetime bounds the window in which a revoked admin or a
+// stolen bearer token remains usable; rotation keeps long-lived sessions alive.
+const ACCESS_TTL_SECS: i64 = 60 * 15;
 const REFRESH_TTL_SECS: i64 = 60 * 60 * 24 * 30;
 
 #[derive(Deserialize)]
