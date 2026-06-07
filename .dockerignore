@@ -1,0 +1,7 @@
+target
+data
+.git
+.env
+*.db
+*.db-wal
+*.db-shm

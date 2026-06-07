@@ -1,0 +1,98 @@
+:root {
+  --bg: #0f1115;
+  --card: #181b22;
+  --fg: #e6e8ed;
+  --muted: #8b91a0;
+  --accent: #5b8cff;
+  --error: #ff6b6b;
+  --border: #262b35;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: #e6e8ed;
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 24px;
+}
+.card {
+  width: 100%;
+  max-width: 480px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px;
+}
+h1 { margin: 0 0 16px; font-size: 22px; }
+h2 { font-size: 16px; margin: 24px 0 8px; }
+.row { display: flex; align-items: center; justify-content: space-between; }
+label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 13px; }
+input {
+  width: 100%;
+  padding: 10px 12px;
+  background: #11141a;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: #e6e8ed;
+  font-size: 15px;
+}
+button {
+  margin-top: 18px;
+  width: 100%;
+  padding: 11px 14px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.ghost {
+  width: auto;
+  margin: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
+}
+button:hover { filter: brightness(1.08); }
+a { color: var(--accent); text-decoration: none; }
+.muted { color: var(--muted); font-size: 13px; }
+.error { color: var(--error); min-height: 1.2em; font-size: 13px; }
+.badge {
+  display: inline-block;
+  background: rgba(91, 140, 255, 0.18);
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 1px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+code {
+  background: #11141a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 13px;
+}
+ul.servers { list-style: none; padding: 0; }
+ul.servers li {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.catalog-entry {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin: 14px 0;
+}
+.catalog-entry h3 { margin: 0 0 6px; font-size: 16px; }
+button.danger { color: var(--error); border-color: rgba(255, 107, 107, 0.4); }
+button[disabled] { opacity: 0.4; cursor: not-allowed; }
+.row a { font-size: 14px; }
