@@ -189,6 +189,37 @@ async fn mcp_with_pat_for_disabled_user_is_401() {
 }
 
 #[tokio::test]
+async fn mcp_with_unknown_session_is_404_not_401() {
+    // After a hub restart the in-memory sessions are gone. A client still sending
+    // its old Mcp-Session-Id must get 404 (session expired → re-initialize), not
+    // 401 (which a client may treat as an auth failure and fail to recover from).
+    let state = test_state().await;
+    let user = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user.id, "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", "stale-session-that-no-longer-exists")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn mcp_with_token_for_unknown_user_is_401() {
     // A correctly-signed token whose subject has no account (e.g. deleted) is
     // rejected, since the proxy re-checks the user on every request.

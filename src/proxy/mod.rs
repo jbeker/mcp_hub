@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -47,7 +47,29 @@ pub fn mcp_router(state: AppState) -> Router {
 
     Router::new()
         .fallback_service(service)
+        // Inner: rewrite the service's session-expiry 401 to 404 (see
+        // `session_expiry_to_404`). Outer: the bearer-auth check, whose own 401
+        // short-circuits before reaching the mapper.
+        .layer(from_fn(session_expiry_to_404))
         .layer(from_fn_with_state(state, require_bearer))
+}
+
+/// rmcp's `StreamableHttpService` returns **401** for an unknown/expired
+/// Streamable-HTTP session. The MCP spec says that must be **404** so the client
+/// transparently re-initializes a new session instead of treating it as an auth
+/// failure (which is why a stale Claude session wouldn't self-heal after a hub
+/// restart). Within that service every 401 is session-related — real
+/// authentication is handled by the outer [`require_bearer`] layer, whose 401
+/// short-circuits before `next` and so never reaches here — so remapping any 401
+/// seen at this layer to 404 is correct.
+async fn session_expiry_to_404(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        let (mut parts, body) = resp.into_parts();
+        parts.status = StatusCode::NOT_FOUND;
+        return Response::from_parts(parts, body);
+    }
+    resp
 }
 
 /// Reject requests without a valid credential, attaching the resolved user to
