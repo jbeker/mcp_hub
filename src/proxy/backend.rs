@@ -242,7 +242,16 @@ fn stdio_command(
         .command
         .clone()
         .ok_or_else(|| anyhow!("stdio backend has no command"))?;
-    let args = def.args.clone();
+    // Substitute `${VAR}` references in the command line against the configured
+    // env (secrets + non-secret config) so a user can write e.g.
+    // `${TOOL_HOME}/bin/server` or `--token=${API_TOKEN}`. Unknown references
+    // are left literal (see `expand_vars`).
+    let program = crate::util::expand_vars(&program, env);
+    let args: Vec<String> = def
+        .args
+        .iter()
+        .map(|a| crate::util::expand_vars(a, env))
+        .collect();
     let env = env.clone();
     let sandbox = sandbox.cloned();
     Ok(tokio::process::Command::new(&program).configure(|c| {
