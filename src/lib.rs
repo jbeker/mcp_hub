@@ -133,6 +133,7 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account/passkeys/remove", post(web::remove_passkey))
         .route("/account/sessions/revoke-others", post(web::revoke_other_sessions))
         .route("/account/connections/revoke", post(web::revoke_connection))
+        .route("/account/connections/label", post(web::update_connection_label))
         .route("/account/tokens/create", post(web::create_token))
         .route("/account/tokens/revoke", post(web::revoke_token))
         // User administration (admin)

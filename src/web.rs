@@ -18,7 +18,7 @@ pub struct NextQuery {
 }
 
 /// Wrap page content in the shared HTML shell.
-fn page(title: &str, body: &str) -> Html<String> {
+fn page_with(title: &str, body: &str, class: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html>
 <html lang="en">
@@ -29,11 +29,22 @@ fn page(title: &str, body: &str) -> Html<String> {
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <main class="card">{body}</main>
+  <main class="{class}">{body}</main>
   <script src="/static/auth.js"></script>
 </body>
 </html>"#
     ))
+}
+
+/// A standard, narrow page — used for the auth flows and one-off confirmations.
+fn page(title: &str, body: &str) -> Html<String> {
+    page_with(title, body, "card")
+}
+
+/// A wider page for content-heavy views (dashboard, account, users, invites,
+/// server detail) whose lists and forms are cramped in the narrow card.
+fn page_wide(title: &str, body: &str) -> Html<String> {
+    page_with(title, body, "card wide")
 }
 
 fn esc(s: &str) -> String {
@@ -108,7 +119,7 @@ pub async fn dashboard(
         },
         mcp = esc(&state.config.mcp_url()),
     );
-    page("Dashboard", &body).into_response()
+    page_wide("Dashboard", &body).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +424,7 @@ pub async fn server_detail(
         git_section = git_section,
         toggle = toggle,
     );
-    page(&inst.display_name, &body).into_response()
+    page_wide(&inst.display_name, &body).into_response()
 }
 
 /// For stdio/git backends, show the exact command that will be executed.
@@ -784,7 +795,7 @@ pub async fn invites_page(
         csrf = csrf,
         rows = rows,
     );
-    page("Invites", &body).into_response()
+    page_wide("Invites", &body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -931,19 +942,67 @@ pub async fn account_page(
     let connections = crate::oauth::store::list_user_connections(&state.db, &user.id)
         .await
         .unwrap_or_default();
+    let now = crate::util::now_unix();
     let mut conn_rows = String::new();
     if connections.is_empty() {
         conn_rows.push_str(r#"<p class="muted">No MCP clients are connected.</p>"#);
     } else {
-        conn_rows.push_str("<ul class=\"servers\">");
+        conn_rows.push_str("<ul class=\"conns\">");
         for c in &connections {
-            let name = c.client_name.clone().unwrap_or_else(|| c.client_id.clone());
+            // The original name the client declared at registration.
+            let dcr_name = c.client_name.clone().unwrap_or_default();
+            // What to show as the heading: the user's custom name wins, then the
+            // DCR name, then the opaque client_id as a last resort.
+            let title = if !c.custom_name.is_empty() {
+                c.custom_name.clone()
+            } else if !dcr_name.is_empty() {
+                dcr_name.clone()
+            } else {
+                c.client_id.clone()
+            };
+            // When a custom name overrides the DCR name, keep the original
+            // visible so the user can still recognise which client it is.
+            let orig = if !c.custom_name.is_empty() && !dcr_name.is_empty() {
+                format!("“{}” · ", esc(&dcr_name))
+            } else {
+                String::new()
+            };
+
+            let mut redirects = String::new();
+            if !c.redirect_uris.is_empty() {
+                redirects.push_str(r#"<div class="conn-redirects muted">"#);
+                for uri in &c.redirect_uris {
+                    redirects.push_str(&format!("<code>{}</code>", esc(uri)));
+                }
+                redirects.push_str("</div>");
+            }
+
             conn_rows.push_str(&format!(
-                r#"<li><span><code>{name}</code></span>
-  <form method="post" action="/account/connections/revoke" data-confirm="Disconnect this client?">{csrf}<input type="hidden" name="client_id" value="{cid}"><button class="ghost danger">Disconnect</button></form></li>"#,
-                name = esc(&name),
-                csrf = csrf,
+                r#"<li>
+  <div class="conn-head">
+    <span class="conn-title"><code>{title}</code></span>
+    <form method="post" action="/account/connections/revoke" data-confirm="Disconnect this client?">{csrf}<input type="hidden" name="client_id" value="{cid}"><button class="ghost danger">Disconnect</button></form>
+  </div>
+  <div class="conn-meta muted">{orig}<code>{cid}</code> · last accessed {last} · connected {first}</div>
+  {redirects}
+  <form class="conn-edit" method="post" action="/account/connections/label">
+    {csrf}
+    <input type="hidden" name="client_id" value="{cid}">
+    <label>Name<br><input type="text" name="name" value="{cname}" placeholder="{cname_ph}" maxlength="60"></label>
+    <label>Note<br><input type="text" name="note" value="{note}" placeholder="e.g. work laptop" maxlength="200"></label>
+    <button class="ghost" type="submit">Save</button>
+  </form>
+</li>"#,
+                title = esc(&title),
+                orig = orig,
                 cid = esc(&c.client_id),
+                last = ago(now - c.last_seen),
+                first = ago(now - c.first_seen),
+                redirects = redirects,
+                csrf = csrf,
+                cname = esc(&c.custom_name),
+                cname_ph = esc(&dcr_name),
+                note = esc(&c.note),
             ));
         }
         conn_rows.push_str("</ul>");
@@ -958,7 +1017,6 @@ pub async fn account_page(
     let pats = crate::tokens::list_for_user(&state.db, &user.id)
         .await
         .unwrap_or_default();
-    let now = crate::util::now_unix();
     let mut pat_rows = String::new();
     if pats.is_empty() {
         pat_rows.push_str(r#"<p class="muted">No tokens yet.</p>"#);
@@ -1044,7 +1102,7 @@ pub async fn account_page(
             String::new()
         },
     );
-    page("Account", &body).into_response()
+    page_wide("Account", &body).into_response()
 }
 
 /// `POST /account/sessions/revoke-others` — end every session but this one.
@@ -1081,6 +1139,45 @@ pub async fn revoke_connection(
     }
     let _ =
         crate::oauth::store::revoke_user_client(&state.db, &user.id, form.client_id.trim()).await;
+    Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct LabelConnectionForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// `POST /account/connections/label` — set a custom name + note for one of the
+/// user's connected OAuth clients. Editing is only allowed for clients the user
+/// actually has a live connection to.
+pub async fn update_connection_label(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Form(form): Form<LabelConnectionForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let client_id = form.client_id.trim();
+    // Match the input lengths to the form maxlength attributes.
+    let name: String = form.name.trim().chars().take(60).collect();
+    let note: String = form.note.trim().chars().take(200).collect();
+    // Don't let a user attach labels to client IDs they aren't connected to.
+    match crate::oauth::store::user_has_connection(&state.db, &user.id, client_id).await {
+        Ok(true) => {
+            let _ =
+                crate::oauth::store::set_client_label(&state.db, &user.id, client_id, &name, &note)
+                    .await;
+        }
+        _ => return error_page("no such connected client"),
+    }
     Redirect::to("/account").into_response()
 }
 
@@ -1289,7 +1386,7 @@ pub async fn users_page(
 {rows}"#,
         rows = rows,
     );
-    page("Users", &body).into_response()
+    page_wide("Users", &body).into_response()
 }
 
 #[derive(Deserialize)]

@@ -26,6 +26,9 @@ body {
   border-radius: 14px;
   padding: 28px;
 }
+/* Content-heavy pages (dashboard, account, users, invites, server detail) get
+   more room; auth pages keep the narrow card. */
+.card.wide { max-width: 960px; }
 h1 { margin: 0 0 16px; font-size: 22px; }
 h2 { font-size: 16px; margin: 24px 0 8px; }
 .row { display: flex; align-items: center; justify-content: space-between; }
@@ -119,5 +122,27 @@ code.invite-code {
 .status-danger { background: rgba(255, 107, 107, 0.15); color: var(--error); }
 pre.cmd { background: #11141a; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
 pre.cmd code { background: none; padding: 0; font-size: 13px; }
+
+/* Connected MCP client rows: stacked title / meta / redirects / edit form. */
+ul.conns { list-style: none; padding: 0; margin: 8px 0 0; }
+ul.conns li {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.conn-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.conn-title { font-weight: 600; }
+.conn-meta { margin: 4px 0 0; }
+.conn-redirects { margin: 6px 0 0; font-size: 12px; word-break: break-all; }
+.conn-redirects code { display: inline-block; margin: 2px 6px 2px 0; }
+.conn-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+.conn-edit label { margin: 0; flex: 1 1 180px; }
+.conn-edit button { margin-top: 0; width: auto; }
+.conn-head form { margin: 0; }
 
 .hidden { display: none; }

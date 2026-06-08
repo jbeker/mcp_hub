@@ -248,7 +248,16 @@ pub async fn revoke_family(pool: &SqlitePool, family_id: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Connection {
     pub client_id: String,
+    /// The name the client declared at registration (DCR metadata); often a
+    /// generic default shared across installs.
     pub client_name: Option<String>,
+    /// The redirect URIs registered for this client — useful for telling
+    /// otherwise-identical clients apart (Desktop vs Code vs claude.ai vs iOS).
+    pub redirect_uris: Vec<String>,
+    /// User-set custom name (empty if none).
+    pub custom_name: String,
+    /// User-set freeform note (empty if none).
+    pub note: String,
     pub first_seen: i64,
     pub last_seen: i64,
 }
@@ -267,20 +276,83 @@ pub async fn list_user_connections(pool: &SqlitePool, user_id: &str) -> Result<V
 
     let mut out = Vec::with_capacity(rows.len());
     for (client_id, first_seen, last_seen) in rows {
-        // The human-friendly name comes from the client's DCR metadata.
-        let client_name = get_client(pool, &client_id).await?.and_then(|c| {
+        // The human-friendly name + redirect URIs come from the client's DCR record.
+        let client = get_client(pool, &client_id).await?;
+        let client_name = client.as_ref().and_then(|c| {
             c.metadata
                 .get("client_name")
                 .and_then(|v| v.as_str().map(String::from))
         });
+        let redirect_uris = client.map(|c| c.redirect_uris).unwrap_or_default();
+        let (custom_name, note) = get_client_label(pool, user_id, &client_id).await?;
         out.push(Connection {
             client_id,
             client_name,
+            redirect_uris,
+            custom_name,
+            note,
             first_seen,
             last_seen,
         });
     }
     Ok(out)
+}
+
+/// Fetch a user's custom name + note for one client. Returns empty strings when
+/// no label has been set.
+pub async fn get_client_label(
+    pool: &SqlitePool,
+    user_id: &str,
+    client_id: &str,
+) -> Result<(String, String)> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT name, note FROM oauth_client_labels WHERE user_id = ? AND client_id = ?")
+            .bind(user_id)
+            .bind(client_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.unwrap_or_default())
+}
+
+/// Set (upsert) a user's custom name + note for one client.
+pub async fn set_client_label(
+    pool: &SqlitePool,
+    user_id: &str,
+    client_id: &str,
+    name: &str,
+    note: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO oauth_client_labels (user_id, client_id, name, note, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, client_id) DO UPDATE SET name = ?, note = ?, updated_at = ?",
+    )
+    .bind(user_id)
+    .bind(client_id)
+    .bind(name)
+    .bind(note)
+    .bind(now_unix())
+    .bind(name)
+    .bind(note)
+    .bind(now_unix())
+    .execute(pool)
+    .await
+    .context("upserting oauth client label")?;
+    Ok(())
+}
+
+/// Whether the user currently has a live connection (non-expired refresh token)
+/// to a given client — guards label edits against arbitrary client IDs.
+pub async fn user_has_connection(pool: &SqlitePool, user_id: &str, client_id: &str) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM oauth_refresh_tokens WHERE user_id = ? AND client_id = ? AND expires_at > ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(client_id)
+    .bind(now_unix())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// Revoke a single connection: delete the user's refresh tokens for one client.
