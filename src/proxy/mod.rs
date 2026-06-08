@@ -28,6 +28,8 @@ pub struct AuthedUser {
     /// access token (which is not tied to a registered client). Lets a client
     /// manage its own connection label and nothing else.
     pub client_id: Option<String>,
+    /// Where the request came from, for audit logging.
+    pub request: crate::auth::RequestInfo,
 }
 
 /// Build the router serving the `/mcp` Streamable HTTP endpoint, gated by an
@@ -53,6 +55,7 @@ pub fn mcp_router(state: AppState) -> Router {
 /// `Authorization: Bearer` header: a personal access token (opaque, prefixed —
 /// for clients that can't do OAuth) or an OAuth access token (ES256 JWT).
 async fn require_bearer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let info = crate::auth::RequestInfo::from_headers(req.headers());
     let token = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -60,7 +63,7 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
 
     let Some(token) = token else {
-        return unauthorized(&state);
+        return reject(&state, &info, "no_bearer");
     };
 
     // A personal access token is opaque; the prefix lets us route it without a
@@ -71,9 +74,9 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
             Ok(Some((user_id, token_id))) => {
                 // Best-effort usage bookkeeping; never fail auth on this write.
                 let _ = crate::tokens::touch(&state.db, &token_id).await;
-                authorize(&state, req, next, &user_id, None, None).await
+                authorize(&state, req, next, &user_id, None, None, info).await
             }
-            _ => unauthorized(&state),
+            _ => reject(&state, &info, "bad_token"),
         };
     }
 
@@ -83,9 +86,26 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         .verify_access_token(token, &state.config.mcp_url())
     {
         Ok(c) => c,
-        Err(_) => return unauthorized(&state),
+        Err(_) => return reject(&state, &info, "bad_token"),
     };
-    authorize(&state, req, next, &claims.sub, Some(claims.admin), Some(claims.client_id)).await
+    authorize(
+        &state,
+        req,
+        next,
+        &claims.sub,
+        Some(claims.admin),
+        Some(claims.client_id),
+        info,
+    )
+    .await
+}
+
+/// Log an `auth.unauthorized` audit event and return the 401 challenge.
+fn reject(state: &AppState, info: &crate::auth::RequestInfo, reason: &str) -> Response {
+    crate::audit::event("auth.unauthorized")
+        .request(info)
+        .denied(reason);
+    unauthorized(state)
 }
 
 /// Confirm the account still exists and is enabled, then forward the request
@@ -93,6 +113,7 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
 /// account deletion/disabling take effect within seconds (rather than waiting
 /// out a JWT's lifetime or a PAT's expiry). `admin_claim` carries an OAuth
 /// token's baked admin flag; for PATs it is `None` and the live row is used.
+#[allow(clippy::too_many_arguments)]
 async fn authorize(
     state: &AppState,
     mut req: Request,
@@ -100,6 +121,7 @@ async fn authorize(
     user_id: &str,
     admin_claim: Option<bool>,
     client_id: Option<String>,
+    info: crate::auth::RequestInfo,
 ) -> Response {
     match crate::users::find_by_id(&state.db, user_id).await {
         Ok(Some(user)) if !user.disabled => {
@@ -107,10 +129,11 @@ async fn authorize(
                 user_id: user.id,
                 admin: admin_claim.unwrap_or(user.is_admin),
                 client_id,
+                request: info,
             });
             next.run(req).await
         }
-        _ => unauthorized(state),
+        _ => reject(state, &info, "user_unavailable"),
     }
 }
 

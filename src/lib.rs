@@ -1,5 +1,6 @@
 //! MCP Hub library: shared modules and the HTTP router.
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod crypto;

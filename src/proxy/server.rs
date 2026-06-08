@@ -26,6 +26,8 @@ pub struct HubProxy {
 /// The user-specific state, established on the first authenticated request.
 struct Bound {
     user_id: String,
+    /// Resolved once at bind time so per-call audit events can name the actor.
+    handle: String,
     admin: bool,
     backends: Vec<Backend>,
 }
@@ -59,9 +61,23 @@ impl HubProxy {
             }
         }
         let backends = self.build_backends(&authed.user_id).await;
-        tracing::info!(user = %authed.user_id, backends = backends.len(), "bound proxy session");
+        // Resolve the handle once so per-call audit events can name the actor.
+        let handle = crate::users::find_by_id(&self.state.db, &authed.user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.handle)
+            .unwrap_or_default();
+        crate::audit::event("mcp.bind")
+            .actor(&handle)
+            .actor_id(&authed.user_id)
+            .client_id(authed.client_id.as_deref())
+            .request(&authed.request)
+            .object(&backends.len().to_string())
+            .ok();
         *guard = Some(Bound {
             user_id: authed.user_id,
+            handle,
             admin: authed.admin,
             backends,
         });
@@ -266,24 +282,23 @@ impl ServerHandler for HubProxy {
 
         // Management tools are handled in-process by the hub itself.
         if management::is_management_tool(&request.name) {
-            let (user_id, admin) = {
+            let (user_id, handle, admin) = {
                 let guard = self.bound.lock().await;
                 let bound = guard.as_ref().expect("bound after ensure_bound");
-                (bound.user_id.clone(), bound.admin)
+                (bound.user_id.clone(), bound.handle.clone(), bound.admin)
             };
-            // The calling client comes from the live request token (a client may
-            // only manage its own connection label), not the per-user bound state.
-            let client_id = Self::authed(&context)?.client_id;
-            let op = request.name.strip_prefix("hub__").unwrap_or_default();
-            return management::dispatch(
-                &self.state,
-                &user_id,
+            // The calling client + origin come from the live request token (a
+            // client may only manage its own connection label), not bound state.
+            let authed = Self::authed(&context)?;
+            let caller = management::Caller {
+                user_id: &user_id,
+                handle: &handle,
                 admin,
-                client_id.as_deref(),
-                op,
-                request.arguments,
-            )
-            .await;
+                client_id: authed.client_id.as_deref(),
+                request: &authed.request,
+            };
+            let op = request.name.strip_prefix("hub__").unwrap_or_default();
+            return management::dispatch(&self.state, &caller, op, request.arguments).await;
         }
 
         let (ns, original) = request.name.split_once("__").ok_or_else(|| {
@@ -295,6 +310,9 @@ impl ServerHandler for HubProxy {
 
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
+        // Proxied backend tool calls are high-volume; keep them out of the
+        // info-level audit stream and log them at debug instead.
+        tracing::debug!(user = %bound.user_id, tool = %request.name, "proxied tool call");
         let backend = bound
             .backends
             .iter()

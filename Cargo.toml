@@ -29,7 +29,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Crypto (stable lines, rand_core 0.6 compatible)
 chacha20poly1305 = "0.10"

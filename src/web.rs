@@ -1,14 +1,37 @@
 //! Server-rendered web UI pages.
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::SignedCookieJar;
 use axum::Form;
 use serde::Deserialize;
 
 use crate::auth::session;
-use crate::auth::{AuthUser, MaybeUser};
+use crate::auth::{AuthUser, MaybeUser, RequestInfo};
 use crate::{instances, invites, users, AppState};
+
+/// Emit a successful-action audit event for a web (browser-session) actor.
+fn audit_ok(action: &str, user: &users::User, headers: &HeaderMap, object: &str) {
+    let info = RequestInfo::from_headers(headers);
+    crate::audit::event(action)
+        .actor(&user.handle)
+        .actor_id(&user.id)
+        .request(&info)
+        .object(object)
+        .ok();
+}
+
+/// Emit a refused-action audit event (CSRF / authz / validation) for a web actor.
+fn audit_denied(action: &str, user: &users::User, headers: &HeaderMap, object: &str, reason: &str) {
+    let info = RequestInfo::from_headers(headers);
+    crate::audit::event(action)
+        .actor(&user.handle)
+        .actor_id(&user.id)
+        .request(&info)
+        .object(object)
+        .denied(reason);
+}
 
 /// Optional `?next=` redirect target carried into the login/register pages.
 #[derive(Deserialize)]
@@ -226,9 +249,11 @@ pub async fn create_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<CreateServerForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.add", &user, &headers, form.namespace.trim(), "csrf");
         return forbidden();
     }
     let (def, env) = match def_from_form(&form) {
@@ -256,6 +281,7 @@ pub async fn create_server(
     if let Err(e) = instances::replace_env(&state.db, &state.secrets, &inst.id, &env).await {
         return error_page(&e.to_string());
     }
+    audit_ok("server.add", &user, &headers, form.namespace.trim());
     Redirect::to(&format!("/servers/{}", inst.id)).into_response()
 }
 
@@ -503,10 +529,12 @@ pub async fn save_config(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<CreateServerForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.edit", &user, &headers, &id, "csrf");
         return forbidden();
     }
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
@@ -531,19 +559,23 @@ pub async fn save_config(
     if let Err(e) = instances::replace_env(&state.db, &state.secrets, &inst.id, &env).await {
         return error_page(&e.to_string());
     }
+    audit_ok("server.edit", &user, &headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
 
 async fn set_enabled_and_redirect(
     state: &AppState,
-    user_id: &str,
+    user: &users::User,
+    headers: &HeaderMap,
     id: &str,
     enabled: bool,
 ) -> Response {
-    if instances::get_owned(&state.db, id, user_id).await.ok().flatten().is_none() {
+    let Some(inst) = instances::get_owned(&state.db, id, &user.id).await.ok().flatten() else {
         return error_page("server not found");
-    }
+    };
     let _ = instances::set_enabled(&state.db, id, enabled).await;
+    let action = if enabled { "server.enable" } else { "server.disable" };
+    audit_ok(action, user, headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
 
@@ -551,43 +583,50 @@ pub async fn enable_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.enable", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    set_enabled_and_redirect(&state, &user.id, &id, true).await
+    set_enabled_and_redirect(&state, &user, &headers, &id, true).await
 }
 
 pub async fn disable_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.disable", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    set_enabled_and_redirect(&state, &user.id, &id, false).await
+    set_enabled_and_redirect(&state, &user, &headers, &id, false).await
 }
 
 pub async fn delete_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.remove", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    if instances::get_owned(&state.db, &id, &user.id).await.ok().flatten().is_none() {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
         return error_page("server not found");
-    }
+    };
     let _ = instances::delete(&state.db, &id).await;
     crate::gitsrc::remove_env(&state.config.env_dir, &id);
+    audit_ok("server.remove", &user, &headers, &inst.namespace);
     Redirect::to("/").into_response()
 }
 
@@ -596,10 +635,12 @@ pub async fn update_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.update", &user, &headers, &id, "csrf");
         return forbidden();
     }
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
@@ -618,8 +659,14 @@ pub async fn update_server(
         Err(e) => return error_page(&format!("sandbox unavailable: {e:#}")),
     };
     match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, sandbox.as_ref()).await {
-        Ok(_) => Redirect::to(&format!("/servers/{id}")).into_response(),
-        Err(e) => error_page(&format!("update failed: {e}")),
+        Ok(_) => {
+            audit_ok("server.update", &user, &headers, &inst.namespace);
+            Redirect::to(&format!("/servers/{id}")).into_response()
+        }
+        Err(e) => {
+            audit_denied("server.update", &user, &headers, &inst.namespace, "error");
+            error_page(&format!("update failed: {e}"))
+        }
     }
 }
 
@@ -631,10 +678,12 @@ pub async fn test_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.test", &user, &headers, &id, "csrf");
         return forbidden();
     }
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
@@ -642,6 +691,11 @@ pub async fn test_server(
     };
     let (status, detail) = probe_instance(&state, &user.id, &inst).await;
     let _ = instances::set_runtime_status(&state.db, &inst.id, status, detail.as_deref()).await;
+    if status == "ok" {
+        audit_ok("server.test", &user, &headers, &inst.namespace);
+    } else {
+        audit_denied("server.test", &user, &headers, &inst.namespace, status);
+    }
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
 
@@ -810,12 +864,15 @@ pub async fn create_recovery(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<RecoveryForm>,
 ) -> Response {
     if !user.is_admin {
+        audit_denied("recovery.create", &user, &headers, form.handle.trim(), "not_admin");
         return admin_forbidden();
     }
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("recovery.create", &user, &headers, form.handle.trim(), "csrf");
         return forbidden();
     }
     let target = match crate::users::find_by_handle(&state.db, form.handle.trim()).await {
@@ -827,6 +884,7 @@ pub async fn create_recovery(
         Ok(v) => v,
         Err(e) => return error_page(&e.to_string()),
     };
+    audit_ok("recovery.create", &user, &headers, &target.handle);
     let body = format!(
         r#"<header class="row"><h1>Recovery code created</h1><a href="/invites">← Back</a></header>
 <p>Give this one-time code to <strong>{handle}</strong>. It works once and <strong>will not be shown again</strong>:</p>
@@ -852,18 +910,22 @@ pub async fn create_invite(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<CreateInviteForm>,
 ) -> Response {
     if !user.is_admin {
+        audit_denied("invite.create", &user, &headers, "", "not_admin");
         return admin_forbidden();
     }
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("invite.create", &user, &headers, "", "csrf");
         return forbidden();
     }
-    let (code, _) = match invites::create(&state.db, &user.id, form.note.trim()).await {
+    let (code, inv) = match invites::create(&state.db, &user.id, form.note.trim()).await {
         Ok(v) => v,
         Err(e) => return error_page(&e.to_string()),
     };
+    audit_ok("invite.create", &user, &headers, inv.short_id());
     // Show the plaintext exactly once; it is never stored or shown again.
     let body = format!(
         r#"<header class="row"><h1>Invite created</h1><a href="/invites">← Back</a></header>
@@ -888,15 +950,19 @@ pub async fn revoke_invite(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<RevokeInviteForm>,
 ) -> Response {
     if !user.is_admin {
+        audit_denied("invite.revoke", &user, &headers, form.short_id.trim(), "not_admin");
         return admin_forbidden();
     }
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("invite.revoke", &user, &headers, form.short_id.trim(), "csrf");
         return forbidden();
     }
     let _ = invites::revoke(&state.db, form.short_id.trim()).await;
+    audit_ok("invite.revoke", &user, &headers, form.short_id.trim());
     Redirect::to("/invites").into_response()
 }
 
@@ -1138,13 +1204,16 @@ pub async fn revoke_other_sessions(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("session.revoke_others", &user, &headers, "", "csrf");
         return forbidden();
     }
     let keep = session::current_session_id(&jar).unwrap_or_default();
     let _ = session::delete_others(&state.db, &user.id, &keep).await;
+    audit_ok("session.revoke_others", &user, &headers, "");
     Redirect::to("/account").into_response()
 }
 
@@ -1160,13 +1229,16 @@ pub async fn revoke_connection(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<RevokeConnectionForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("connection.revoke", &user, &headers, form.client_id.trim(), "csrf");
         return forbidden();
     }
     let _ =
         crate::oauth::store::revoke_user_client(&state.db, &user.id, form.client_id.trim()).await;
+    audit_ok("connection.revoke", &user, &headers, form.client_id.trim());
     Redirect::to("/account").into_response()
 }
 
@@ -1188,9 +1260,11 @@ pub async fn update_connection_label(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<LabelConnectionForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("client.label", &user, &headers, form.client_id.trim(), "csrf");
         return forbidden();
     }
     let client_id = form.client_id.trim();
@@ -1206,6 +1280,7 @@ pub async fn update_connection_label(
         }
         _ => return error_page("no such connected client"),
     }
+    audit_ok("client.label", &user, &headers, client_id);
     Redirect::to("/account").into_response()
 }
 
@@ -1225,9 +1300,11 @@ pub async fn create_token(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<CreateTokenForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("token.create", &user, &headers, "", "csrf");
         return forbidden();
     }
     let name = form.name.trim();
@@ -1241,6 +1318,7 @@ pub async fn create_token(
         Ok(v) => v,
         Err(e) => return error_page(&format!("could not create token: {e}")),
     };
+    audit_ok("token.create", &user, &headers, name);
 
     // Reveal the secret exactly once. It is never recoverable after this page.
     let example = format!(
@@ -1276,12 +1354,15 @@ pub async fn revoke_token(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<RevokeTokenForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("token.revoke", &user, &headers, form.token_id.trim(), "csrf");
         return forbidden();
     }
     let _ = crate::tokens::revoke(&state.db, &user.id, form.token_id.trim()).await;
+    audit_ok("token.revoke", &user, &headers, form.token_id.trim());
     Redirect::to("/account").into_response()
 }
 
@@ -1341,9 +1422,11 @@ pub async fn remove_passkey(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<RemovePasskeyForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("passkey.remove", &user, &headers, form.cred_id.trim(), "csrf");
         return forbidden();
     }
     // Never let a user remove their last passkey — that is an unrecoverable
@@ -1354,6 +1437,7 @@ pub async fn remove_passkey(
         Err(e) => return error_page(&e.to_string()),
     }
     let _ = users::delete_credential(&state.db, &user.id, form.cred_id.trim()).await;
+    audit_ok("passkey.remove", &user, &headers, form.cred_id.trim());
     Redirect::to("/account").into_response()
 }
 
@@ -1448,12 +1532,16 @@ async fn resolve_admin_target(
     state: &AppState,
     admin: &users::User,
     jar: &SignedCookieJar,
+    headers: &HeaderMap,
+    action: &str,
     form: &UserActionForm,
 ) -> Result<users::User, Response> {
     if !admin.is_admin {
+        audit_denied(action, admin, headers, form.handle.trim(), "not_admin");
         return Err(admin_forbidden());
     }
     if !session::check_csrf(jar, &state.config.master_key, &form.csrf) {
+        audit_denied(action, admin, headers, form.handle.trim(), "csrf");
         return Err(forbidden());
     }
     let target = match users::find_by_handle(&state.db, form.handle.trim()).await {
@@ -1474,15 +1562,18 @@ pub async fn disable_user(
     State(state): State<AppState>,
     AuthUser(admin): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<UserActionForm>,
 ) -> Response {
-    let target = match resolve_admin_target(&state, &admin, &jar, &form).await {
+    let target = match resolve_admin_target(&state, &admin, &jar, &headers, "user.disable", &form).await {
         Ok(t) => t,
         Err(r) => return r,
     };
     if let Err(e) = deactivate_user(&state, &target.id).await {
+        audit_denied("user.disable", &admin, &headers, &target.handle, "error");
         return error_page(&e.to_string());
     }
+    audit_ok("user.disable", &admin, &headers, &target.handle);
     Redirect::to("/users").into_response()
 }
 
@@ -1491,13 +1582,15 @@ pub async fn enable_user(
     State(state): State<AppState>,
     AuthUser(admin): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<UserActionForm>,
 ) -> Response {
-    let target = match resolve_admin_target(&state, &admin, &jar, &form).await {
+    let target = match resolve_admin_target(&state, &admin, &jar, &headers, "user.enable", &form).await {
         Ok(t) => t,
         Err(r) => return r,
     };
     let _ = users::set_disabled(&state.db, &target.id, false).await;
+    audit_ok("user.enable", &admin, &headers, &target.handle);
     Redirect::to("/users").into_response()
 }
 
@@ -1506,15 +1599,18 @@ pub async fn delete_user(
     State(state): State<AppState>,
     AuthUser(admin): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<UserActionForm>,
 ) -> Response {
-    let target = match resolve_admin_target(&state, &admin, &jar, &form).await {
+    let target = match resolve_admin_target(&state, &admin, &jar, &headers, "user.delete", &form).await {
         Ok(t) => t,
         Err(r) => return r,
     };
     if let Err(e) = purge_user(&state, &target.id).await {
+        audit_denied("user.delete", &admin, &headers, &target.handle, "error");
         return error_page(&e.to_string());
     }
+    audit_ok("user.delete", &admin, &headers, &target.handle);
     Redirect::to("/users").into_response()
 }
 

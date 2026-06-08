@@ -6,6 +6,7 @@
 //! to the client.
 
 use axum::extract::{Query, RawQuery, State};
+use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Form;
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
@@ -182,9 +183,16 @@ pub async fn decision(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Form(form): Form<Decision>,
 ) -> Response {
+    let info = crate::auth::RequestInfo::from_headers(&headers);
     if !crate::auth::session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        crate::audit::event("oauth.consent")
+            .actor(&user.handle)
+            .actor_id(&user.id)
+            .request(&info)
+            .denied("csrf");
         return error_page("invalid security token; please restart authorization");
     }
     let Some(raw) = jar.get(AUTHREQ_COOKIE).map(|c| c.value().to_string()) else {
@@ -202,6 +210,13 @@ pub async fn decision(
     let st = pending.state.as_deref().unwrap_or("");
 
     if form.decision != "approve" {
+        crate::audit::event("oauth.consent")
+            .actor(&user.handle)
+            .actor_id(&user.id)
+            .client_id(Some(&pending.client_id))
+            .request(&info)
+            .object(&pending.client_id)
+            .denied("declined");
         return (
             jar,
             redirect_with(&pending.redirect_uri, &[("error", "access_denied"), ("state", st)]),
@@ -225,6 +240,14 @@ pub async fn decision(
     {
         return (jar, crate::oauth::OAuthError::from(e).into_response()).into_response();
     }
+
+    crate::audit::event("oauth.consent")
+        .actor(&user.handle)
+        .actor_id(&user.id)
+        .client_id(Some(&pending.client_id))
+        .request(&info)
+        .object(&pending.client_id)
+        .ok();
 
     let mut params = vec![("code", code.as_str())];
     if !st.is_empty() {

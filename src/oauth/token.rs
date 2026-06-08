@@ -163,7 +163,11 @@ async fn refresh_token(
             // A rotated-out token was replayed: revoke the entire family so a
             // thief who raced the legitimate client cannot keep refreshing.
             store::revoke_family(&state.db, &family_id).await?;
-            tracing::warn!(family = %family_id, client = %client_id, "refresh token reuse detected; family revoked");
+            crate::audit::event("oauth.refresh_reuse")
+                .client_id(Some(client_id))
+                .request(info)
+                .object(client_id)
+                .denied("reuse");
             return Err(OAuthError::invalid_grant(
                 "refresh token reuse detected; the session has been revoked",
             ));
@@ -217,6 +221,14 @@ async fn issue_tokens(
         info,
     )
     .await?;
+
+    crate::audit::event("oauth.token")
+        .actor(&user.handle)
+        .actor_id(&user.id)
+        .client_id(Some(client_id))
+        .request(info)
+        .object(client_id)
+        .ok();
 
     Ok(serde_json::json!({
         "access_token": access,

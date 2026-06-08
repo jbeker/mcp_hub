@@ -5,7 +5,7 @@
 //! though we also support confidential clients with a generated secret.
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
@@ -33,6 +33,7 @@ pub struct RegistrationRequest {
 /// `POST /register`
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RegistrationRequest>,
 ) -> Result<impl IntoResponse, OAuthError> {
     // Open DCR is unauthenticated; cap total clients so it cannot fill the DB.
@@ -104,7 +105,10 @@ pub async fn register(
     )
     .await?;
 
-    tracing::info!(client_id = %client_id, auth_method = %auth_method, "registered oauth client");
+    crate::audit::event("oauth.register")
+        .request(&crate::auth::RequestInfo::from_headers(&headers))
+        .object(&client_id)
+        .ok();
 
     let mut body = serde_json::json!({
         "client_id": client_id,

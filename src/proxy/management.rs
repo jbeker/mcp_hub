@@ -10,9 +10,20 @@ use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
+use crate::auth::RequestInfo;
 use crate::instances::{self, ServerDef};
 use crate::{invites, users};
 use crate::AppState;
+
+/// Who is making a management call, for authorization and audit logging.
+pub struct Caller<'a> {
+    pub user_id: &'a str,
+    pub handle: &'a str,
+    pub admin: bool,
+    /// The OAuth client this call came through (`None` for a personal token).
+    pub client_id: Option<&'a str>,
+    pub request: &'a RequestInfo,
+}
 
 /// Build the list of management tools available to the caller.
 pub fn tools(admin: bool) -> Vec<Tool> {
@@ -186,39 +197,69 @@ pub fn is_management_tool(full_name: &str) -> bool {
 }
 
 /// Dispatch a management tool call. `op` is the name without the `hub__` prefix.
-/// `client_id` is the OAuth client the request authenticated as (`None` for a
-/// personal access token); the self-service `*_my_client` tools use it to scope
-/// changes to the caller's own connection.
+/// The caller's OAuth `client_id` (`None` for a personal access token) scopes the
+/// self-service `*_my_client` tools. Mutating tools emit a structured audit event.
 pub async fn dispatch(
     state: &AppState,
-    user_id: &str,
-    admin: bool,
-    client_id: Option<&str>,
+    caller: &Caller<'_>,
     op: &str,
     args: Option<JsonObject>,
 ) -> Result<CallToolResult, McpError> {
     let args = args.unwrap_or_default();
+    let result = run(state, caller, op, &args).await;
+
+    // Log mutating actions (reads return None from `action_for` and are skipped).
+    if let Some(action) = action_for(op) {
+        let object = if op == "set_my_client" {
+            caller.client_id.unwrap_or("").to_string()
+        } else {
+            audit_object(&args)
+        };
+        let ev = crate::audit::event(action)
+            .actor(caller.handle)
+            .actor_id(caller.user_id)
+            .client_id(caller.client_id)
+            .request(caller.request)
+            .object(&object);
+        match &result {
+            Ok(r) if r.is_error == Some(true) => ev.failed("tool_error"),
+            Ok(_) => ev.ok(),
+            Err(e) => ev.failed(e.message.as_ref()),
+        }
+    }
+    result
+}
+
+async fn run(
+    state: &AppState,
+    caller: &Caller<'_>,
+    op: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let user_id = caller.user_id;
+    let admin = caller.admin;
+    let client_id = caller.client_id;
     match op {
         "whoami" => whoami(state, user_id).await,
         "get_my_client" => get_my_client(state, user_id, client_id).await,
-        "set_my_client" => set_my_client(state, user_id, client_id, &args).await,
+        "set_my_client" => set_my_client(state, user_id, client_id, args).await,
         "list_my_servers" => list_my_servers(state, user_id).await,
-        "add_server" => add_server(state, user_id, &args).await,
-        "edit_server" => edit_server(state, user_id, &args).await,
-        "set_env" => set_env(state, user_id, &args).await,
-        "update_server" => update_server(state, user_id, &args).await,
-        "enable" => set_enabled(state, user_id, &args, true).await,
-        "disable" => set_enabled(state, user_id, &args, false).await,
-        "remove" => remove(state, user_id, &args).await,
+        "add_server" => add_server(state, user_id, args).await,
+        "edit_server" => edit_server(state, user_id, args).await,
+        "set_env" => set_env(state, user_id, args).await,
+        "update_server" => update_server(state, user_id, args).await,
+        "enable" => set_enabled(state, user_id, args, true).await,
+        "disable" => set_enabled(state, user_id, args, false).await,
+        "remove" => remove(state, user_id, args).await,
         "list_tokens" => list_tokens(state, user_id).await,
-        "revoke_token" => revoke_token(state, user_id, &args).await,
+        "revoke_token" => revoke_token(state, user_id, args).await,
         "list_users" => {
             require_admin(admin)?;
             list_users(state).await
         }
         "create_invite" => {
             require_admin(admin)?;
-            create_invite(state, user_id, &args).await
+            create_invite(state, user_id, args).await
         }
         "list_invites" => {
             require_admin(admin)?;
@@ -226,29 +267,64 @@ pub async fn dispatch(
         }
         "revoke_invite" => {
             require_admin(admin)?;
-            revoke_invite(state, &args).await
+            revoke_invite(state, args).await
         }
         "create_recovery" => {
             require_admin(admin)?;
-            create_recovery(state, user_id, &args).await
+            create_recovery(state, user_id, args).await
         }
         "disable_user" => {
             require_admin(admin)?;
-            set_user_disabled(state, user_id, &args, true).await
+            set_user_disabled(state, user_id, args, true).await
         }
         "enable_user" => {
             require_admin(admin)?;
-            set_user_disabled(state, user_id, &args, false).await
+            set_user_disabled(state, user_id, args, false).await
         }
         "delete_user" => {
             require_admin(admin)?;
-            delete_user(state, user_id, &args).await
+            delete_user(state, user_id, args).await
         }
         other => Err(McpError::invalid_params(
             format!("unknown management tool 'hub__{other}'"),
             None,
         )),
     }
+}
+
+/// Map a management op to its audit action verb. Read-only ops return `None`
+/// (not logged); mutating ops share the same vocabulary as the web handlers.
+fn action_for(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "add_server" => "server.add",
+        "edit_server" => "server.edit",
+        "set_env" => "server.set_env",
+        "update_server" => "server.update",
+        "enable" => "server.enable",
+        "disable" => "server.disable",
+        "remove" => "server.remove",
+        "revoke_token" => "token.revoke",
+        "set_my_client" => "client.label",
+        "create_invite" => "invite.create",
+        "revoke_invite" => "invite.revoke",
+        "create_recovery" => "recovery.create",
+        "disable_user" => "user.disable",
+        "enable_user" => "user.enable",
+        "delete_user" => "user.delete",
+        // Reads (whoami, list_*, get_my_client) are not audited.
+        _ => return None,
+    })
+}
+
+/// Best-effort identifier of the object a management call acted on, pulled from
+/// the common argument keys.
+fn audit_object(args: &JsonObject) -> String {
+    for key in ["namespace", "handle", "token_id", "id"] {
+        if let Some(v) = args.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            return v.to_string();
+        }
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------

@@ -429,7 +429,12 @@ pub async fn register_finish(
                     return Err(ApiError::new(StatusCode::CONFLICT, e.to_string()));
                 }
             }
-            tracing::info!(handle = %user.handle, is_admin = user.is_admin, "registered new user");
+            crate::audit::event("auth.register")
+                .actor(&user.handle)
+                .actor_id(&user.id)
+                .request(&info)
+                .object(if user.is_admin { "admin" } else { "user" })
+                .ok();
             user.id
         }
         RegPurpose::AddCredential { recovery_code } => {
@@ -440,9 +445,17 @@ pub async fn register_finish(
                 invites::redeem(&state.db, code, &user_id)
                     .await
                     .map_err(|e| ApiError::new(StatusCode::CONFLICT, e.to_string()))?;
-                tracing::info!(handle = %ceremony.handle, "recovered account via recovery code");
+                crate::audit::event("recovery.use")
+                    .actor(&ceremony.handle)
+                    .actor_id(&user_id)
+                    .request(&info)
+                    .ok();
             } else {
-                tracing::info!(handle = %ceremony.handle, "enrolled additional passkey");
+                crate::audit::event("passkey.add")
+                    .actor(&ceremony.handle)
+                    .actor_id(&user_id)
+                    .request(&info)
+                    .ok();
             }
             user_id
         }
@@ -533,10 +546,22 @@ pub async fn login_finish(
         .remove(&cid)
         .ok_or_else(|| bad("login expired; please try again"))?;
 
-    let result = state
+    let result = match state
         .webauthn
         .finish_passkey_authentication(&cred, &ceremony.state)
-        .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, format!("login failed: {e}")))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::audit::event("auth.login_failed")
+                .actor_id(&ceremony.user_id)
+                .request(&info)
+                .denied("bad_assertion");
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                format!("login failed: {e}"),
+            ));
+        }
+    };
 
     // Advance the stored signature counter if the authenticator reports a change.
     if result.needs_update() {
@@ -562,6 +587,17 @@ pub async fn login_finish(
     let sid = session::create(&state.db, &ceremony.user_id, &info)
         .await
         .map_err(ApiError::from)?;
+    let handle = users::find_by_id(&state.db, &ceremony.user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.handle)
+        .unwrap_or_default();
+    crate::audit::event("auth.login")
+        .actor(&handle)
+        .actor_id(&ceremony.user_id)
+        .request(&info)
+        .ok();
     let secure = state.config.cookie_secure();
     let redirect = session::take_next(&jar);
     let jar = jar
@@ -582,13 +618,24 @@ pub struct LogoutForm {
 pub async fn logout(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     axum::Form(form): axum::Form<LogoutForm>,
 ) -> axum::response::Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
         return (StatusCode::FORBIDDEN, "invalid security token").into_response();
     }
+    let info = super::RequestInfo::from_headers(&headers);
     if let Some(sid) = jar.get(session::SESSION_COOKIE).map(|c| c.value().to_string()) {
+        // Resolve the actor before deleting the session, for the audit log.
+        let user = session::user_for_session(&state.db, &sid).await.ok().flatten();
         let _ = session::delete(&state.db, &sid).await;
+        if let Some(u) = user {
+            crate::audit::event("auth.logout")
+                .actor(&u.handle)
+                .actor_id(&u.id)
+                .request(&info)
+                .ok();
+        }
     }
     let jar = jar.add(session::clear_session_cookie(state.config.cookie_secure()));
     (jar, axum::response::Redirect::to("/login")).into_response()
