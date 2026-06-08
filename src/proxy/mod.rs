@@ -28,8 +28,24 @@ pub struct AuthedUser {
     /// access token (which is not tied to a registered client). Lets a client
     /// manage its own connection label and nothing else.
     pub client_id: Option<String>,
+    /// The personal access token id this request authenticated with, or `None`
+    /// for an OAuth token. Mutually exclusive with `client_id`.
+    pub pat_id: Option<String>,
     /// Where the request came from, for audit logging.
     pub request: crate::auth::RequestInfo,
+}
+
+impl AuthedUser {
+    /// The credential this request used, as `(type, id)` for backend access
+    /// control: `("oauth", client_id)` or `("pat", token_id)`. `None` only if
+    /// neither is set (which shouldn't happen for an authenticated request).
+    pub fn credential(&self) -> Option<(&str, &str)> {
+        if let Some(c) = self.client_id.as_deref() {
+            Some((crate::access::OAUTH, c))
+        } else {
+            self.pat_id.as_deref().map(|p| (crate::access::PAT, p))
+        }
+    }
 }
 
 /// Build the router serving the `/mcp` Streamable HTTP endpoint, gated by an
@@ -96,7 +112,7 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
             Ok(Some((user_id, token_id))) => {
                 // Best-effort usage bookkeeping; never fail auth on this write.
                 let _ = crate::tokens::touch(&state.db, &token_id).await;
-                authorize(&state, req, next, &user_id, None, None, info).await
+                authorize(&state, req, next, &user_id, None, None, Some(token_id), info).await
             }
             _ => reject(&state, &info, "bad_token"),
         };
@@ -117,6 +133,7 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         &claims.sub,
         Some(claims.admin),
         Some(claims.client_id),
+        None,
         info,
     )
     .await
@@ -143,6 +160,7 @@ async fn authorize(
     user_id: &str,
     admin_claim: Option<bool>,
     client_id: Option<String>,
+    pat_id: Option<String>,
     info: crate::auth::RequestInfo,
 ) -> Response {
     match crate::users::find_by_id(&state.db, user_id).await {
@@ -151,6 +169,7 @@ async fn authorize(
                 user_id: user.id,
                 admin: admin_claim.unwrap_or(user.is_admin),
                 client_id,
+                pat_id,
                 request: info,
             });
             next.run(req).await

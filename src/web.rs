@@ -1012,6 +1012,11 @@ pub async fn account_page(
     }
     rows.push_str("</ul>");
 
+    // The user's backends, for the per-credential access toggles below.
+    let user_instances = instances::list_for_user(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
+
     // Connected MCP clients (OAuth) and browser sessions, each revocable.
     let connections = crate::oauth::store::list_user_connections(&state.db, &user.id)
         .await
@@ -1050,6 +1055,23 @@ pub async fn account_page(
                 redirects.push_str("</div>");
             }
 
+            // Which backends this client may use (a checkbox per backend).
+            let denied = crate::access::denied_instances(
+                &state.db,
+                crate::access::OAUTH,
+                &c.client_id,
+            )
+            .await
+            .unwrap_or_default();
+            let access = access_form(
+                "/account/connections/access",
+                "client_id",
+                &c.client_id,
+                &user_instances,
+                &denied,
+                &csrf,
+            );
+
             conn_rows.push_str(&format!(
                 r#"<li>
   <div class="conn-head">
@@ -1065,6 +1087,7 @@ pub async fn account_page(
     <label>Note<br><input type="text" name="note" value="{note}" maxlength="200"></label>
     <button class="ghost" type="submit">Save</button>
   </form>
+  {access}
 </li>"#,
                 title = esc(&title),
                 orig = orig,
@@ -1073,6 +1096,7 @@ pub async fn account_page(
                 first = ago(now - c.first_seen),
                 origin = origin_detail(&c.last_ip, &c.last_user_agent),
                 redirects = redirects,
+                access = access,
                 csrf = csrf,
                 cname = esc(&c.custom_name),
                 cname_ph = esc(&dcr_name),
@@ -1113,7 +1137,7 @@ pub async fn account_page(
     if pats.is_empty() {
         pat_rows.push_str(r#"<p class="muted">No tokens yet.</p>"#);
     } else {
-        pat_rows.push_str("<ul class=\"servers\">");
+        pat_rows.push_str("<ul class=\"conns\">");
         for t in &pats {
             let name = if t.name.is_empty() { "token" } else { &t.name };
             let used = match t.last_used_at {
@@ -1125,12 +1149,30 @@ pub async fn account_page(
             } else {
                 format!("expires in {}", duration(t.expires_at - now))
             };
+            // Which backends this token may use (a checkbox per backend).
+            let denied = crate::access::denied_instances(&state.db, crate::access::PAT, &t.id)
+                .await
+                .unwrap_or_default();
+            let access = access_form(
+                "/account/tokens/access",
+                "token_id",
+                &t.id,
+                &user_instances,
+                &denied,
+                &csrf,
+            );
             pat_rows.push_str(&format!(
-                r#"<li><span><code>{name}</code> <span class="muted">· {used} · {expiry}</span></span>
-  <form method="post" action="/account/tokens/revoke" data-confirm="Revoke this token?">{csrf}<input type="hidden" name="token_id" value="{id}"><button class="ghost danger">Revoke</button></form></li>"#,
+                r#"<li>
+  <div class="conn-head">
+    <span class="conn-title"><code>{name}</code> <span class="muted">· {used} · {expiry}</span></span>
+    <form method="post" action="/account/tokens/revoke" data-confirm="Revoke this token?">{csrf}<input type="hidden" name="token_id" value="{id}"><button class="ghost danger">Revoke</button></form>
+  </div>
+  {access}
+</li>"#,
                 name = esc(name),
                 used = used,
                 expiry = expiry,
+                access = access,
                 csrf = csrf,
                 id = esc(&t.id),
             ));
@@ -1284,6 +1326,79 @@ pub async fn update_connection_label(
     Redirect::to("/account").into_response()
 }
 
+/// Compute the denied instance ids from an access form: every backend the user
+/// owns that was NOT checked (`allow_<instance_id>` absent from the submission).
+async fn denied_from_form(
+    state: &AppState,
+    user_id: &str,
+    submitted: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let instances = instances::list_for_user(&state.db, user_id)
+        .await
+        .unwrap_or_default();
+    instances
+        .into_iter()
+        .filter(|i| !submitted.contains_key(&format!("allow_{}", i.id)))
+        .map(|i| i.id)
+        .collect()
+}
+
+/// `POST /account/connections/access` — set which backends an OAuth client may use.
+pub async fn update_connection_access(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let csrf = form.get("csrf").map(String::as_str).unwrap_or_default();
+    if !session::check_csrf(&jar, &state.config.master_key, csrf) {
+        return forbidden();
+    }
+    let client_id = form.get("client_id").map(|s| s.trim()).unwrap_or_default();
+    // Only a client the user is actually connected to.
+    if !matches!(
+        crate::oauth::store::user_has_connection(&state.db, &user.id, client_id).await,
+        Ok(true)
+    ) {
+        return error_page("no such connected client");
+    }
+    let denied = denied_from_form(&state, &user.id, &form).await;
+    let _ = crate::access::set_denials(&state.db, &user.id, crate::access::OAUTH, client_id, &denied)
+        .await;
+    audit_ok("client.access", &user, &headers, client_id);
+    Redirect::to("/account").into_response()
+}
+
+/// `POST /account/tokens/access` — set which backends a personal access token may use.
+pub async fn update_token_access(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let csrf = form.get("csrf").map(String::as_str).unwrap_or_default();
+    if !session::check_csrf(&jar, &state.config.master_key, csrf) {
+        return forbidden();
+    }
+    let token_id = form.get("token_id").map(|s| s.trim()).unwrap_or_default();
+    // Only one of the user's own tokens.
+    let owned = crate::tokens::list_for_user(&state.db, &user.id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|t| t.id == token_id);
+    if !owned {
+        return error_page("no such token");
+    }
+    let denied = denied_from_form(&state, &user.id, &form).await;
+    let _ = crate::access::set_denials(&state.db, &user.id, crate::access::PAT, token_id, &denied)
+        .await;
+    audit_ok("token.access", &user, &headers, token_id);
+    Redirect::to("/account").into_response()
+}
+
 #[derive(Deserialize)]
 pub struct CreateTokenForm {
     #[serde(default)]
@@ -1362,6 +1477,13 @@ pub async fn revoke_token(
         return forbidden();
     }
     let _ = crate::tokens::revoke(&state.db, &user.id, form.token_id.trim()).await;
+    // Drop any backend-access denials for the now-deleted token.
+    let _ = crate::access::clear_for_credential(
+        &state.db,
+        crate::access::PAT,
+        form.token_id.trim(),
+    )
+    .await;
     audit_ok("token.revoke", &user, &headers, form.token_id.trim());
     Redirect::to("/account").into_response()
 }
@@ -1396,6 +1518,41 @@ fn origin_detail(ip: &Option<String>, ua: &Option<String>) -> String {
     } else {
         format!(" · {}", parts.join(" · "))
     }
+}
+
+/// Render the per-credential backend-access form: a checkbox per backend, checked
+/// when the credential is allowed it (i.e. not in `denied`). Each box uses a
+/// distinct `allow_<instance_id>` name so it deserializes cleanly. Empty when the
+/// user has no backends.
+fn access_form(
+    action: &str,
+    id_field: &str,
+    id_value: &str,
+    instances: &[instances::Instance],
+    denied: &std::collections::HashSet<String>,
+    csrf: &str,
+) -> String {
+    if instances.is_empty() {
+        return String::new();
+    }
+    let mut boxes = String::new();
+    for i in instances {
+        let checked = if denied.contains(&i.id) { "" } else { " checked" };
+        boxes.push_str(&format!(
+            r#"<label class="checkbox"><input type="checkbox" name="allow_{id}" value="on"{checked}> <code>{ns}</code></label>"#,
+            id = esc(&i.id),
+            checked = checked,
+            ns = esc(&i.namespace),
+        ));
+    }
+    format!(
+        r#"<form class="access" method="post" action="{action}">{csrf}<input type="hidden" name="{id_field}" value="{idv}"><span class="muted">Backends:</span><div class="access-grid">{boxes}</div><button class="ghost" type="submit">Save access</button></form>"#,
+        action = action,
+        csrf = csrf,
+        id_field = id_field,
+        idv = esc(id_value),
+        boxes = boxes,
+    )
 }
 
 /// Render a remaining duration coarsely ("N days" / "N hours").

@@ -8,6 +8,8 @@ use rmcp::model::{
     PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam, ReadResourceResult,
     ServerCapabilities, ServerInfo,
 };
+use std::collections::HashSet;
+
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio::sync::Mutex;
@@ -46,6 +48,22 @@ impl HubProxy {
             .get::<axum::http::request::Parts>()
             .and_then(|p| p.extensions.get::<AuthedUser>().cloned())
             .ok_or_else(|| McpError::invalid_request("missing authentication", None))
+    }
+
+    /// The instance ids the request's credential (OAuth client or PAT) is denied,
+    /// for per-credential backend access control. Empty = full access (the default
+    /// and the case for any request without a recognizable credential). Looked up
+    /// per request so a user's toggle on the Account page takes effect immediately.
+    async fn denied_instances(&self, ctx: &RequestContext<RoleServer>) -> HashSet<String> {
+        let cred = Self::authed(ctx)
+            .ok()
+            .and_then(|a| a.credential().map(|(t, id)| (t.to_string(), id.to_string())));
+        match cred {
+            Some((t, id)) => crate::access::denied_instances(&self.state.db, &t, &id)
+                .await
+                .unwrap_or_default(),
+            None => HashSet::new(),
+        }
     }
 
     /// Ensure backends are connected for the request's user (lazy, once).
@@ -179,6 +197,7 @@ impl HubProxy {
             match Backend::spawn(
                 &def,
                 &env,
+                inst.id.clone(),
                 inst.namespace.clone(),
                 inst.display_name.clone(),
                 permit,
@@ -254,12 +273,13 @@ impl ServerHandler for HubProxy {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         self.ensure_bound(&context).await?;
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
 
-        // The built-in management tools always come first.
+        // The built-in management tools always come first and are never restricted.
         let mut tools = management::tools(bound.admin);
-        for b in &bound.backends {
+        for b in bound.backends.iter().filter(|b| !denied.contains(&b.instance_id)) {
             match b.list_namespaced_tools().await {
                 Ok(mut t) => tools.append(&mut t),
                 Err(e) => {
@@ -308,15 +328,17 @@ impl ServerHandler for HubProxy {
             )
         })?;
 
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
         // Proxied backend tool calls are high-volume; keep them out of the
         // info-level audit stream and log them at debug instead.
         tracing::debug!(user = %bound.user_id, tool = %request.name, "proxied tool call");
+        // A backend the credential is denied is treated as if it doesn't exist.
         let backend = bound
             .backends
             .iter()
-            .find(|b| b.namespace == ns)
+            .find(|b| b.namespace == ns && !denied.contains(&b.instance_id))
             .ok_or_else(|| {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
@@ -333,10 +355,11 @@ impl ServerHandler for HubProxy {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         self.ensure_bound(&context).await?;
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
         let mut resources = Vec::new();
-        for b in &bound.backends {
+        for b in bound.backends.iter().filter(|b| !denied.contains(&b.instance_id)) {
             match b.list_namespaced_resources().await {
                 Ok(mut r) => resources.append(&mut r),
                 // A backend without the resources capability errors here; that
@@ -356,10 +379,11 @@ impl ServerHandler for HubProxy {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         self.ensure_bound(&context).await?;
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
         let mut resource_templates = Vec::new();
-        for b in &bound.backends {
+        for b in bound.backends.iter().filter(|b| !denied.contains(&b.instance_id)) {
             match b.list_namespaced_resource_templates().await {
                 Ok(mut t) => resource_templates.append(&mut t),
                 Err(e) => tracing::debug!(namespace = %b.namespace, error = %e, "no templates"),
@@ -384,11 +408,16 @@ impl ServerHandler for HubProxy {
             )
         })?;
 
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
-        let backend = bound.backends.iter().find(|b| b.namespace == ns).ok_or_else(|| {
-            McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
-        })?;
+        let backend = bound
+            .backends
+            .iter()
+            .find(|b| b.namespace == ns && !denied.contains(&b.instance_id))
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
+            })?;
         backend
             .read_resource(original.to_string())
             .await
@@ -401,10 +430,11 @@ impl ServerHandler for HubProxy {
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
         self.ensure_bound(&context).await?;
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
         let mut prompts = Vec::new();
-        for b in &bound.backends {
+        for b in bound.backends.iter().filter(|b| !denied.contains(&b.instance_id)) {
             match b.list_namespaced_prompts().await {
                 Ok(mut p) => prompts.append(&mut p),
                 Err(e) => tracing::debug!(namespace = %b.namespace, error = %e, "no prompts"),
@@ -426,11 +456,16 @@ impl ServerHandler for HubProxy {
             McpError::invalid_params("prompt name must be namespaced as <server>__<prompt>", None)
         })?;
 
+        let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
         let bound = guard.as_ref().expect("bound after ensure_bound");
-        let backend = bound.backends.iter().find(|b| b.namespace == ns).ok_or_else(|| {
-            McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
-        })?;
+        let backend = bound
+            .backends
+            .iter()
+            .find(|b| b.namespace == ns && !denied.contains(&b.instance_id))
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
+            })?;
         backend
             .get_prompt(original.to_string(), request.arguments)
             .await

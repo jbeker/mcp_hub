@@ -19,6 +19,8 @@ use crate::instances::ServerDef;
 
 /// A live connection to one backend MCP server.
 pub struct Backend {
+    /// The owning instance's stable id (for per-credential access control).
+    pub instance_id: String,
     pub namespace: String,
     pub display_name: String,
     peer: RunningService<RoleClient, ()>,
@@ -33,6 +35,7 @@ impl Backend {
     pub async fn spawn(
         def: &ServerDef,
         env: &BTreeMap<String, String>,
+        instance_id: String,
         namespace: String,
         display_name: String,
         permit: OwnedSemaphorePermit,
@@ -59,6 +62,7 @@ impl Backend {
             other => bail!("unsupported transport '{other}' for backend '{namespace}'"),
         };
         Ok(Backend {
+            instance_id,
             namespace,
             display_name,
             peer,

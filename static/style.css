@@ -165,4 +165,11 @@ ul.conns li {
 .conn-edit button { margin-top: 0; width: auto; }
 .conn-head form { margin: 0; }
 
+/* Per-credential backend-access toggles (checkbox per backend). */
+.access { margin-top: 10px; }
+.access .muted { font-size: 13px; }
+.access-grid { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 6px 0; }
+.access-grid label.checkbox { margin: 0; font-size: 13px; }
+.access button { margin-top: 4px; width: auto; }
+
 .hidden { display: none; }

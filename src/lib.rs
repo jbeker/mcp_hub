@@ -1,5 +1,6 @@
 //! MCP Hub library: shared modules and the HTTP router.
 
+pub mod access;
 pub mod audit;
 pub mod auth;
 pub mod config;
@@ -135,8 +136,10 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account/sessions/revoke-others", post(web::revoke_other_sessions))
         .route("/account/connections/revoke", post(web::revoke_connection))
         .route("/account/connections/label", post(web::update_connection_label))
+        .route("/account/connections/access", post(web::update_connection_access))
         .route("/account/tokens/create", post(web::create_token))
         .route("/account/tokens/revoke", post(web::revoke_token))
+        .route("/account/tokens/access", post(web::update_token_access))
         // User administration (admin)
         .route("/users", get(web::users_page))
         .route("/users/disable", post(web::disable_user))

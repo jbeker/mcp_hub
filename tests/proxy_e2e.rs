@@ -653,6 +653,116 @@ async fn self_service_client_tools_reject_personal_access_tokens() {
     let _ = client.cancel().await;
 }
 
+/// Create a user with the mock stdio backend under namespace "mock"; returns
+/// (base, state, user_id, instance_id).
+async fn hub_with_mock_backend() -> (String, AppState, String, String) {
+    let exe = mock_server_path();
+    assert!(std::path::Path::new(&exe).exists(), "build the mock example first");
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let def = ServerDef {
+        name: "Mock".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some(exe),
+        args: vec![],
+        url: None,
+        runtime: "binary".into(),
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    };
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
+        .await
+        .unwrap();
+    (base, state, user.id, inst.id)
+}
+
+#[tokio::test]
+async fn denied_backend_is_hidden_from_oauth_client() {
+    let (base, state, user_id, inst_id) = hub_with_mock_backend().await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user_id, "client-x", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // Full access by default.
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
+
+    // Deny this client the mock backend.
+    mcp_hub::access::set_denials(&state.db, &user_id, mcp_hub::access::OAUTH, "client-x", &[inst_id])
+        .await
+        .unwrap();
+
+    // The backend's tool is now gone, but hub__ management stays.
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+    assert!(names.contains(&"hub__whoami".to_string()));
+
+    // And a direct call is refused.
+    let blocked = client
+        .call_tool(CallToolRequestParam {
+            name: "mock__echo".into(),
+            arguments: args(serde_json::json!({ "msg": "hi" })),
+        })
+        .await;
+    assert!(blocked.is_err(), "denied backend call should fail");
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn denied_backend_is_hidden_from_pat() {
+    let (base, state, user_id, inst_id) = hub_with_mock_backend().await;
+    let (pat, secret) = mcp_hub::tokens::create(&state.db, &user_id, "laptop", 3600)
+        .await
+        .unwrap();
+    let client = connect(&base, secret).await;
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
+
+    // Deny this PAT the mock backend (exercises the pat_id credential path).
+    mcp_hub::access::set_denials(&state.db, &user_id, mcp_hub::access::PAT, &pat.id, &[inst_id])
+        .await
+        .unwrap();
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+    assert!(names.contains(&"hub__whoami".to_string()));
+
+    let _ = client.cancel().await;
+}
+
 #[tokio::test]
 async fn admin_can_disable_and_delete_users() {
     let (base, state) = spawn_hub().await;
