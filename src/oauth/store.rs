@@ -157,11 +157,12 @@ pub async fn insert_refresh(
     resource: Option<&str>,
     family_id: &str,
     ttl_secs: i64,
+    info: &crate::auth::RequestInfo,
 ) -> Result<()> {
     let now = now_unix();
     sqlx::query(
-        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scope, resource, family_id, consumed, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scope, resource, family_id, consumed, created_at, expires_at, last_ip, last_user_agent)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
     )
     .bind(token_hash)
     .bind(client_id)
@@ -171,6 +172,8 @@ pub async fn insert_refresh(
     .bind(family_id)
     .bind(now)
     .bind(now + ttl_secs)
+    .bind(info.ip.as_deref())
+    .bind(info.user_agent.as_deref())
     .execute(pool)
     .await
     .context("inserting refresh token")?;
@@ -260,6 +263,10 @@ pub struct Connection {
     pub note: String,
     pub first_seen: i64,
     pub last_seen: i64,
+    /// IP / User-Agent of the most recent (non-expired) refresh — the client's
+    /// last-seen origin.
+    pub last_ip: Option<String>,
+    pub last_user_agent: Option<String>,
 }
 
 /// List the OAuth clients a user has live refresh tokens for — i.e. the MCP
@@ -285,6 +292,17 @@ pub async fn list_user_connections(pool: &SqlitePool, user_id: &str) -> Result<V
         });
         let redirect_uris = client.map(|c| c.redirect_uris).unwrap_or_default();
         let (custom_name, note) = get_client_label(pool, user_id, &client_id).await?;
+        // The IP/UA of the newest live refresh token = the connection's last-seen origin.
+        let (last_ip, last_user_agent): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT last_ip, last_user_agent FROM oauth_refresh_tokens \
+             WHERE user_id = ? AND client_id = ? AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(&client_id)
+        .bind(now_unix())
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or((None, None));
         out.push(Connection {
             client_id,
             client_name,
@@ -293,6 +311,8 @@ pub async fn list_user_connections(pool: &SqlitePool, user_id: &str) -> Result<V
             note,
             first_seen,
             last_seen,
+            last_ip,
+            last_user_agent,
         });
     }
     Ok(out)

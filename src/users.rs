@@ -253,18 +253,42 @@ pub struct CredentialInfo {
     pub id: String,
     pub name: String,
     pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub last_ip: Option<String>,
+    pub last_user_agent: Option<String>,
 }
 
 /// List a user's registered passkeys (metadata only), oldest first.
 pub async fn list_credentials(pool: &SqlitePool, user_id: &str) -> Result<Vec<CredentialInfo>> {
     let rows = sqlx::query_as::<_, CredentialInfo>(
-        "SELECT id, name, created_at FROM webauthn_credentials \
-         WHERE user_id = ? ORDER BY created_at",
+        "SELECT id, name, created_at, last_used_at, last_ip, last_user_agent \
+         FROM webauthn_credentials WHERE user_id = ? ORDER BY created_at",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Record that a passkey just completed an authentication: stamp the time and
+/// the request's IP / User-Agent. Looked up by the raw credential id bytes.
+pub async fn touch_credential(
+    pool: &SqlitePool,
+    cred_id: &[u8],
+    info: &crate::auth::RequestInfo,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE webauthn_credentials \
+         SET last_used_at = ?, last_ip = ?, last_user_agent = ? WHERE credential_id = ?",
+    )
+    .bind(now_unix())
+    .bind(info.ip.as_deref())
+    .bind(info.user_agent.as_deref())
+    .bind(cred_id)
+    .execute(pool)
+    .await
+    .context("recording credential use")?;
+    Ok(())
 }
 
 /// Count a user's registered passkeys (used to refuse removing the last one).

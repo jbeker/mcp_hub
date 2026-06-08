@@ -123,6 +123,26 @@ code.invite-code {
 pre.cmd { background: #11141a; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
 pre.cmd code { background: none; padding: 0; font-size: 13px; }
 
+/* Inline action buttons that shouldn't span the full card width. */
+button.inline { width: auto; }
+.row button.inline { margin-top: 0; }
+
+/* Secondary detail line under a list item's title (added/last-used/IP/UA). */
+.meta { font-size: 12px; margin-top: 3px; word-break: break-word; }
+
+/* Create-token form: name grows, the Expires dropdown stays usable, button auto. */
+form.token-create {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+form.token-create label { margin: 0; }
+form.token-create label.name { flex: 1 1 200px; }
+form.token-create label.expires { flex: 0 0 130px; }
+form.token-create button.inline { margin-top: 0; }
+
 /* Connected MCP client rows: stacked title / meta / redirects / edit form. */
 ul.conns { list-style: none; padding: 0; margin: 8px 0 0; }
 ul.conns li {

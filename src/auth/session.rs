@@ -115,17 +115,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Create a session row for a user and return its id.
-pub async fn create(pool: &SqlitePool, user_id: &str) -> Result<String> {
+/// Create a session row for a user and return its id. The request's IP and
+/// User-Agent are stored as the session's origin (shown on the Account page).
+pub async fn create(pool: &SqlitePool, user_id: &str, info: &super::RequestInfo) -> Result<String> {
     let id = new_id();
     let now = now_unix();
     sqlx::query(
-        "INSERT INTO web_sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO web_sessions (id, user_id, created_at, expires_at, last_ip, last_user_agent)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(user_id)
     .bind(now)
     .bind(now + SESSION_TTL_SECS)
+    .bind(info.ip.as_deref())
+    .bind(info.user_agent.as_deref())
     .execute(pool)
     .await
     .context("creating session")?;
@@ -146,12 +150,17 @@ pub struct SessionInfo {
     pub id: String,
     pub created_at: i64,
     pub expires_at: i64,
+    pub last_ip: Option<String>,
+    pub last_user_agent: Option<String>,
 }
+
+/// Columns selected from `web_sessions` for the account listing.
+type SessionRow = (String, i64, i64, Option<String>, Option<String>);
 
 /// List a user's active (unexpired) sessions, newest first.
 pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> Result<Vec<SessionInfo>> {
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT id, created_at, expires_at FROM web_sessions \
+    let rows: Vec<SessionRow> = sqlx::query_as(
+        "SELECT id, created_at, expires_at, last_ip, last_user_agent FROM web_sessions \
          WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC",
     )
     .bind(user_id)
@@ -160,11 +169,15 @@ pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> Result<Vec<Sessi
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, created_at, expires_at)| SessionInfo {
-            id,
-            created_at,
-            expires_at,
-        })
+        .map(
+            |(id, created_at, expires_at, last_ip, last_user_agent)| SessionInfo {
+                id,
+                created_at,
+                expires_at,
+                last_ip,
+                last_user_agent,
+            },
+        )
         .collect())
 }
 

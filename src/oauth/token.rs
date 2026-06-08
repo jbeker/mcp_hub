@@ -1,11 +1,12 @@
 //! The token endpoint: authorization_code (with PKCE) and refresh_token grants.
 
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, HeaderMap};
 use axum::response::IntoResponse;
 use axum::{Form, Json};
 use serde::Deserialize;
 
+use crate::auth::RequestInfo;
 use crate::oauth::{store, token_hash, verify_pkce_s256, OAuthError};
 use crate::users;
 use crate::AppState;
@@ -35,11 +36,13 @@ pub struct TokenForm {
 /// `POST /token`
 pub async fn token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(form): Form<TokenForm>,
 ) -> Result<impl IntoResponse, OAuthError> {
+    let info = RequestInfo::from_headers(&headers);
     let body = match form.grant_type.as_str() {
-        "authorization_code" => authorization_code(&state, &form).await?,
-        "refresh_token" => refresh_token(&state, &form).await?,
+        "authorization_code" => authorization_code(&state, &form, &info).await?,
+        "refresh_token" => refresh_token(&state, &form, &info).await?,
         other => {
             return Err(OAuthError::new(
                 axum::http::StatusCode::BAD_REQUEST,
@@ -86,6 +89,7 @@ async fn authenticate_client(
 async fn authorization_code(
     state: &AppState,
     form: &TokenForm,
+    info: &RequestInfo,
 ) -> Result<serde_json::Value, OAuthError> {
     let code = form
         .code
@@ -133,12 +137,13 @@ async fn authorization_code(
 
     // A new authorization starts a fresh refresh-token family.
     let family_id = crate::util::new_id();
-    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &family_id).await
+    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &family_id, info).await
 }
 
 async fn refresh_token(
     state: &AppState,
     form: &TokenForm,
+    info: &RequestInfo,
 ) -> Result<serde_json::Value, OAuthError> {
     let token = form
         .refresh_token
@@ -180,7 +185,7 @@ async fn refresh_token(
         .clone()
         .unwrap_or_else(|| state.config.mcp_url());
     // Stay in the same family so the rotation chain is tracked.
-    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &row.family_id).await
+    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &row.family_id, info).await
 }
 
 /// Mint an access token + a fresh (rotated) refresh token within `family_id`.
@@ -193,6 +198,7 @@ async fn issue_tokens(
     scope: &str,
     resource: Option<&str>,
     family_id: &str,
+    info: &RequestInfo,
 ) -> Result<serde_json::Value, OAuthError> {
     let (access, ttl) = state
         .signer
@@ -208,6 +214,7 @@ async fn issue_tokens(
         resource,
         family_id,
         REFRESH_TTL_SECS,
+        info,
     )
     .await?;
 

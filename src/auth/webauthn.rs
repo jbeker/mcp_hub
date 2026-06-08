@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
@@ -365,8 +365,10 @@ pub async fn recover_start(
 pub async fn register_finish(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Json(cred): Json<RegisterPublicKeyCredential>,
 ) -> Result<(SignedCookieJar, Json<FinishResponse>), ApiError> {
+    let info = super::RequestInfo::from_headers(&headers);
     let cid = ceremony_id(&jar).ok_or_else(|| bad("no registration in progress"))?;
     let ceremony = state
         .reg_states
@@ -450,7 +452,7 @@ pub async fn register_finish(
         .await
         .map_err(ApiError::from)?;
 
-    let sid = session::create(&state.db, &user_id)
+    let sid = session::create(&state.db, &user_id, &info)
         .await
         .map_err(ApiError::from)?;
     let secure = state.config.cookie_secure();
@@ -519,8 +521,10 @@ pub async fn login_start(
 pub async fn login_finish(
     State(state): State<AppState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Json(cred): Json<PublicKeyCredential>,
 ) -> Result<(SignedCookieJar, Json<FinishResponse>), ApiError> {
+    let info = super::RequestInfo::from_headers(&headers);
     let cid = ceremony_id(&jar).ok_or_else(|| bad("no login in progress"))?;
     let ceremony = state
         .auth_states
@@ -547,7 +551,15 @@ pub async fn login_finish(
         }
     }
 
-    let sid = session::create(&state.db, &ceremony.user_id)
+    // Record where this passkey was last used (best-effort; failure is non-fatal).
+    let _ = users::touch_credential(
+        &state.db,
+        result.cred_id().as_ref(),
+        &info,
+    )
+    .await;
+
+    let sid = session::create(&state.db, &ceremony.user_id, &info)
         .await
         .map_err(ApiError::from)?;
     let secure = state.config.cookie_secure();

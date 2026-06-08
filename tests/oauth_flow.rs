@@ -298,7 +298,7 @@ async fn full_consent_flow_issues_and_exchanges_code() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let sid = session::create(&state.db, &user.id).await.unwrap();
+    let sid = session::create(&state.db, &user.id, &Default::default()).await.unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,
@@ -456,7 +456,7 @@ async fn consent_without_csrf_is_rejected() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let sid = session::create(&state.db, &user.id).await.unwrap();
+    let sid = session::create(&state.db, &user.id, &Default::default()).await.unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,

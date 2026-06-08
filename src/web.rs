@@ -911,6 +911,7 @@ pub async fn account_page(
     jar: SignedCookieJar,
 ) -> Response {
     let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let now = crate::util::now_unix();
     let creds = users::list_credentials(&state.db, &user.id)
         .await
         .unwrap_or_default();
@@ -930,9 +931,16 @@ pub async fn account_page(
                 id = esc(&c.id),
             )
         };
+        let used = match c.last_used_at {
+            Some(u) => format!("last used {}", ago(now - u)),
+            None => "never used".to_string(),
+        };
         rows.push_str(&format!(
-            r#"<li><span><code>{name}</code></span> {remove}</li>"#,
+            r#"<li><div><code>{name}</code><div class="meta muted">added {added} · {used}{origin}</div></div> {remove}</li>"#,
             name = esc(name),
+            added = ago(now - c.created_at),
+            used = used,
+            origin = origin_detail(&c.last_ip, &c.last_user_agent),
             remove = remove,
         ));
     }
@@ -942,7 +950,6 @@ pub async fn account_page(
     let connections = crate::oauth::store::list_user_connections(&state.db, &user.id)
         .await
         .unwrap_or_default();
-    let now = crate::util::now_unix();
     let mut conn_rows = String::new();
     if connections.is_empty() {
         conn_rows.push_str(r#"<p class="muted">No MCP clients are connected.</p>"#);
@@ -983,13 +990,13 @@ pub async fn account_page(
     <span class="conn-title"><code>{title}</code></span>
     <form method="post" action="/account/connections/revoke" data-confirm="Disconnect this client?">{csrf}<input type="hidden" name="client_id" value="{cid}"><button class="ghost danger">Disconnect</button></form>
   </div>
-  <div class="conn-meta muted">{orig}<code>{cid}</code> · last accessed {last} · connected {first}</div>
+  <div class="conn-meta muted">{orig}<code>{cid}</code> · last accessed {last} · connected {first}{origin}</div>
   {redirects}
   <form class="conn-edit" method="post" action="/account/connections/label">
     {csrf}
     <input type="hidden" name="client_id" value="{cid}">
     <label>Name<br><input type="text" name="name" value="{cname}" placeholder="{cname_ph}" maxlength="60"></label>
-    <label>Note<br><input type="text" name="note" value="{note}" placeholder="e.g. work laptop" maxlength="200"></label>
+    <label>Note<br><input type="text" name="note" value="{note}" maxlength="200"></label>
     <button class="ghost" type="submit">Save</button>
   </form>
 </li>"#,
@@ -998,6 +1005,7 @@ pub async fn account_page(
                 cid = esc(&c.client_id),
                 last = ago(now - c.last_seen),
                 first = ago(now - c.first_seen),
+                origin = origin_detail(&c.last_ip, &c.last_user_agent),
                 redirects = redirects,
                 csrf = csrf,
                 cname = esc(&c.custom_name),
@@ -1012,6 +1020,24 @@ pub async fn account_page(
         .await
         .unwrap_or_default();
     let other_sessions = sessions.len().saturating_sub(1);
+    let current_sid = session::current_session_id(&jar).unwrap_or_default();
+    let mut session_rows = String::new();
+    session_rows.push_str("<ul class=\"servers\">");
+    for s in &sessions {
+        let this = if s.id == current_sid {
+            r#" <span class="badge">this device</span>"#
+        } else {
+            ""
+        };
+        session_rows.push_str(&format!(
+            r#"<li><div><code>session</code>{this}<div class="meta muted">started {started} · expires in {expiry}{origin}</div></div></li>"#,
+            this = this,
+            started = ago(now - s.created_at),
+            expiry = duration(s.expires_at - now),
+            origin = origin_detail(&s.last_ip, &s.last_user_agent),
+        ));
+    }
+    session_rows.push_str("</ul>");
 
     // Personal access tokens (for clients that can't do the OAuth flow).
     let pats = crate::tokens::list_for_user(&state.db, &user.id)
@@ -1051,9 +1077,9 @@ pub async fn account_page(
 <p>Signed in as <strong>{handle}</strong></p>
 <section>
   <h2>Passkeys</h2>
-  <p class="muted">Add a second passkey (another device or a hardware key) so you are not locked out if you lose one.</p>
+  <p class="muted">Passkeys are how you sign in — a private key held by your device or hardware key (Touch ID, Face ID, Windows Hello, a YubiKey, …) that proves who you are without a password. The hub only stores the matching public key, so there is nothing to phish or leak. Add a second passkey (another device or a hardware key) so you are not locked out if you lose one.</p>
   {rows}
-  <button id="add-passkey-btn" type="button">Add a passkey</button>
+  <button id="add-passkey-btn" class="inline" type="button">Add a passkey</button>
   <p class="error" id="add-passkey-error"></p>
 </section>
 <section style="margin-top:18px">
@@ -1065,28 +1091,30 @@ pub async fn account_page(
   <h2>Personal access tokens</h2>
   <p class="muted">For MCP clients that can't sign in with OAuth. A token is a bearer credential with full access to your MCP endpoint — treat it like a password. Shown once at creation.</p>
   {pat_rows}
-  <form method="post" action="/account/tokens/create" class="row" style="margin-top:10px;gap:8px;align-items:flex-end">
+  <form method="post" action="/account/tokens/create" class="token-create">
     {csrf}
-    <label>Name<br><input type="text" name="name" placeholder="e.g. my-laptop" maxlength="60" required></label>
-    <label>Expires<br><select name="expires_days">
+    <label class="name">Name<br><input type="text" name="name" placeholder="e.g. my-laptop" maxlength="60" required></label>
+    <label class="expires">Expires<br><select name="expires_days">
       <option value="7">7 days</option>
       <option value="30" selected>30 days</option>
       <option value="90">90 days</option>
       <option value="180">180 days</option>
       <option value="365">365 days</option>
     </select></label>
-    <button type="submit">Create token</button>
+    <button class="inline" type="submit">Create token</button>
   </form>
 </section>
 <section style="margin-top:18px">
   <h2>Browser sessions</h2>
   <p class="muted">You have {n_sessions} active session(s){other}.</p>
+  {session_rows}
   {sign_out_others}
 </section>"#,
         handle = esc(&user.handle),
         rows = rows,
         conn_rows = conn_rows,
         pat_rows = pat_rows,
+        session_rows = session_rows,
         n_sessions = sessions.len(),
         other = if other_sessions > 0 {
             format!(", including {other_sessions} other than this one")
@@ -1268,6 +1296,24 @@ fn ago(secs: i64) -> String {
         format!("{}h ago", s / 3600)
     } else {
         format!("{}d ago", s / 86_400)
+    }
+}
+
+/// Render an optional last-seen IP and User-Agent as a trailing muted detail
+/// (" · IP 1.2.3.4 · Mozilla/5.0 …"), omitting whichever is absent. Returns an
+/// empty string when neither is known.
+fn origin_detail(ip: &Option<String>, ua: &Option<String>) -> String {
+    let mut parts = Vec::new();
+    if let Some(ip) = ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("IP {}", esc(ip)));
+    }
+    if let Some(ua) = ua.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(esc(ua));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
     }
 }
 
