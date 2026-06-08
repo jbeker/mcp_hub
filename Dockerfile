@@ -15,6 +15,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
     cargo build --release && rm -rf src
 
 COPY migrations ./migrations
+COPY assets ./assets
 COPY src ./src
 # Touch main so cargo rebuilds with the real sources.
 RUN touch src/main.rs && cargo build --release

@@ -3,12 +3,24 @@
 //! enabled backends, namespacing everything as `<server>__<tool>`.
 
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult, Implementation,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam, ReadResourceResult,
-    ServerCapabilities, ServerInfo,
+    CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult, Icon,
+    Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam,
+    ReadResourceResult, ServerCapabilities, ServerInfo,
 };
 use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+
+/// The hub's icon advertised in `serverInfo.icons`: a robot face from the
+/// OpenMoji set (CC BY-SA 4.0), embedded as a base64 `data:` URI so it needs
+/// no external hosting. See ATTRIBUTION.md.
+static HUB_ICON_DATA_URI: LazyLock<String> = LazyLock::new(|| {
+    let png = include_bytes!("../../assets/hub-icon.png");
+    format!("data:image/png;base64,{}", BASE64.encode(png))
+});
 
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -255,7 +267,11 @@ impl ServerHandler for HubProxy {
                 name: "mcp-hub".into(),
                 title: Some("MCP Hub".into()),
                 version: env!("CARGO_PKG_VERSION").into(),
-                icons: None,
+                icons: Some(vec![Icon {
+                    src: HUB_ICON_DATA_URI.clone(),
+                    mime_type: Some("image/png".into()),
+                    sizes: Some(vec!["96x96".into()]),
+                }]),
                 website_url: None,
             },
             instructions: Some(
