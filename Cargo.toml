@@ -43,7 +43,10 @@ axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
 url = "2"
 
 # OAuth 2.1 Authorization Server: ES256 JWTs + key material
-jsonwebtoken = "9"
+# rust_crypto backend: jsonwebtoken 10 no longer bundles a crypto provider, and
+# we want the pure-Rust one (ES256 via p256/sha2, already in the tree) rather
+# than the aws-lc-rs C build, to keep the amd64 Docker cross-build simple.
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "jwk"] }
 
 # Model Context Protocol SDK (proxy server + backend clients)

@@ -1777,6 +1777,7 @@ pub async fn deactivate_user(state: &AppState, user_id: &str) -> anyhow::Result<
     users::set_disabled(&state.db, user_id, true).await?;
     session::delete_all_for_user(&state.db, user_id).await?;
     crate::oauth::store::revoke_all_user_tokens(&state.db, user_id).await?;
+    crate::tokens::revoke_all_for_user(&state.db, user_id).await?;
     Ok(())
 }
 

@@ -126,6 +126,18 @@ pub async fn revoke(pool: &SqlitePool, user_id: &str, token_id: &str) -> Result<
     Ok(res.rows_affected() > 0)
 }
 
+/// Revoke every personal access token for a user. Used when disabling an
+/// account so a stolen PAT is dead for good and re-enabling the account cannot
+/// resurrect it (mirrors how OAuth refresh tokens are dropped on disable).
+/// Returns the number of tokens removed.
+pub async fn revoke_all_for_user(pool: &SqlitePool, user_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM personal_access_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +198,33 @@ mod tests {
         // Revoking someone else's (or a gone) token reports false.
         assert!(!revoke(&pool, "u1", &pat2.id).await.unwrap());
         assert!(!revoke(&pool, "other", &pat.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn revoke_all_for_user_kills_every_token() {
+        let pool = pool().await;
+        // A second user whose tokens must be left untouched.
+        sqlx::query("INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES ('u2','bob','Bob',0,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (_, pt_a) = create(&pool, "u1", "a", 3600).await.unwrap();
+        let (_, pt_b) = create(&pool, "u1", "b", 3600).await.unwrap();
+        let (_, pt_other) = create(&pool, "u2", "c", 3600).await.unwrap();
+        let (ha, hb, ho) = (token_hash(&pt_a), token_hash(&pt_b), token_hash(&pt_other));
+
+        // Disabling u1: all of u1's tokens are gone, u2's survives.
+        let removed = revoke_all_for_user(&pool, "u1").await.unwrap();
+        assert_eq!(removed, 2);
+        assert!(resolve_valid(&pool, &ha).await.unwrap().is_none());
+        assert!(resolve_valid(&pool, &hb).await.unwrap().is_none());
+        assert!(resolve_valid(&pool, &ho).await.unwrap().is_some());
+
+        // Re-enabling the account cannot resurrect the revoked tokens: the rows
+        // are gone, so a previously valid PAT stays dead.
+        assert!(resolve_valid(&pool, &ha).await.unwrap().is_none());
+        assert_eq!(revoke_all_for_user(&pool, "u1").await.unwrap(), 0);
     }
 
     #[tokio::test]

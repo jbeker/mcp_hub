@@ -45,8 +45,11 @@ pub fn uid_for(base: Option<u32>, slot: Option<i64>) -> Option<u32> {
     Some(base + u32::try_from(slot?).ok()?)
 }
 
-/// Prepare a [`Sandbox`] for `uid`: create and chown its cache directory under
-/// `<env_dir>/../sandbox/<uid>`.
+/// Prepare a [`Sandbox`] for `uid`: create, chown, and lock its cache directory
+/// under `<env_dir>/../sandbox/<uid>`. The directory is the child's HOME and the
+/// root of its uv/npm/XDG caches, so it is set `0700` — owned by and readable
+/// only by `uid` — to keep one sandbox UID from reading another's cached files.
+/// Re-runs on every spawn, so existing directories are tightened too.
 pub fn prepare(uid: u32, env_dir: &str) -> std::io::Result<Sandbox> {
     let root = Path::new(env_dir)
         .parent()
@@ -55,6 +58,7 @@ pub fn prepare(uid: u32, env_dir: &str) -> std::io::Result<Sandbox> {
     let cache = root.join(uid.to_string());
     std::fs::create_dir_all(&cache)?;
     chown(&cache, uid, uid)?;
+    set_private(&cache)?;
     Ok(Sandbox {
         uid,
         gid: uid,
@@ -80,6 +84,21 @@ pub fn chown(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         let _ = (path, uid, gid);
         Ok(())
     }
+}
+
+/// Restrict a directory to `0700` (owner-only read/write/traverse). No-op off
+/// unix. Used to keep one sandbox UID from reading another's cache.
+pub fn set_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Lock the SQLite database (and its WAL/SHM sidecars) to `0600` so a sandbox
@@ -139,6 +158,20 @@ pub fn make_world_traversable(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::uid_for;
+
+    #[cfg(unix)]
+    #[test]
+    fn set_private_restricts_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mcphub-sbtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Loosen first so the assertion proves set_private tightened it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::set_private(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn uid_for_requires_a_base() {
