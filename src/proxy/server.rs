@@ -271,8 +271,19 @@ impl ServerHandler for HubProxy {
                 let bound = guard.as_ref().expect("bound after ensure_bound");
                 (bound.user_id.clone(), bound.admin)
             };
+            // The calling client comes from the live request token (a client may
+            // only manage its own connection label), not the per-user bound state.
+            let client_id = Self::authed(&context)?.client_id;
             let op = request.name.strip_prefix("hub__").unwrap_or_default();
-            return management::dispatch(&self.state, &user_id, admin, op, request.arguments).await;
+            return management::dispatch(
+                &self.state,
+                &user_id,
+                admin,
+                client_id.as_deref(),
+                op,
+                request.arguments,
+            )
+            .await;
         }
 
         let (ns, original) = request.name.split_once("__").ok_or_else(|| {

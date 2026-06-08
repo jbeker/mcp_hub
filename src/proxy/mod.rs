@@ -24,6 +24,10 @@ use crate::AppState;
 pub struct AuthedUser {
     pub user_id: String,
     pub admin: bool,
+    /// The OAuth client this request authenticated as, or `None` for a personal
+    /// access token (which is not tied to a registered client). Lets a client
+    /// manage its own connection label and nothing else.
+    pub client_id: Option<String>,
 }
 
 /// Build the router serving the `/mcp` Streamable HTTP endpoint, gated by an
@@ -67,7 +71,7 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
             Ok(Some((user_id, token_id))) => {
                 // Best-effort usage bookkeeping; never fail auth on this write.
                 let _ = crate::tokens::touch(&state.db, &token_id).await;
-                authorize(&state, req, next, &user_id, None).await
+                authorize(&state, req, next, &user_id, None, None).await
             }
             _ => unauthorized(&state),
         };
@@ -81,7 +85,7 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         Ok(c) => c,
         Err(_) => return unauthorized(&state),
     };
-    authorize(&state, req, next, &claims.sub, Some(claims.admin)).await
+    authorize(&state, req, next, &claims.sub, Some(claims.admin), Some(claims.client_id)).await
 }
 
 /// Confirm the account still exists and is enabled, then forward the request
@@ -95,12 +99,14 @@ async fn authorize(
     next: Next,
     user_id: &str,
     admin_claim: Option<bool>,
+    client_id: Option<String>,
 ) -> Response {
     match crate::users::find_by_id(&state.db, user_id).await {
         Ok(Some(user)) if !user.disabled => {
             req.extensions_mut().insert(AuthedUser {
                 user_id: user.id,
                 admin: admin_claim.unwrap_or(user.is_admin),
+                client_id,
             });
             next.run(req).await
         }

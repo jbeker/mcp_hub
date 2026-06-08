@@ -4,6 +4,7 @@
 
 use mcp_hub::instances::ServerDef;
 use mcp_hub::config::{Config, Limits};
+use mcp_hub::oauth::store;
 use mcp_hub::{build_router, db, instances, users, AppState};
 use rmcp::model::{CallToolRequestParam, GetPromptRequestParam, ReadResourceRequestParam};
 use rmcp::service::{serve_client, RunningService};
@@ -535,6 +536,119 @@ async fn personal_access_token_tools_round_trip() {
         .await
         .unwrap()
         .is_none());
+
+    let _ = client.cancel().await;
+}
+
+/// Register two OAuth clients for one user with a live connection each.
+async fn seed_client(state: &AppState, user_id: &str, client_id: &str, name: &str) {
+    store::create_client(
+        &state.db,
+        client_id,
+        None,
+        &[],
+        &serde_json::json!({ "client_name": name }),
+    )
+    .await
+    .unwrap();
+    store::insert_refresh(
+        &state.db,
+        &format!("hash-{client_id}"),
+        client_id,
+        user_id,
+        "mcp",
+        None,
+        "fam",
+        3600,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn client_can_label_only_itself() {
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+
+    // Two clients on the SAME account. client-b already has a label.
+    seed_client(&state, &user.id, "client-a", "Claude A").await;
+    seed_client(&state, &user.id, "client-b", "Claude B").await;
+    store::set_client_label(&state.db, &user.id, "client-b", "B custom", "b note")
+        .await
+        .unwrap();
+
+    // Connect as client-a.
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user.id, "client-a", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // get_my_client returns client-a's own (empty) label + its registered name,
+    // and never leaks client-b's label.
+    let got = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__get_my_client".into(),
+            arguments: None,
+        })
+        .await
+        .unwrap();
+    let g = got.structured_content.unwrap();
+    assert_eq!(g["client_id"], "client-a");
+    assert_eq!(g["registered_name"], "Claude A");
+    assert_eq!(g["name"], "");
+    assert!(!serde_json::to_string(&g).unwrap().contains("B custom"));
+
+    // set_my_client updates only client-a.
+    let set = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__set_my_client".into(),
+            arguments: args(serde_json::json!({"name": "My Laptop", "note": "personal"})),
+        })
+        .await
+        .unwrap();
+    assert_eq!(set.structured_content.unwrap()["name"], "My Laptop");
+
+    // client-a's label changed; client-b's is untouched. The tool exposes no
+    // argument to target another client, so client-b is unreachable from here.
+    assert_eq!(
+        store::get_client_label(&state.db, &user.id, "client-a").await.unwrap(),
+        ("My Laptop".to_string(), "personal".to_string())
+    );
+    assert_eq!(
+        store::get_client_label(&state.db, &user.id, "client-b").await.unwrap(),
+        ("B custom".to_string(), "b note".to_string())
+    );
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn self_service_client_tools_reject_personal_access_tokens() {
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    // A PAT is not tied to an OAuth client, so it cannot use the *_my_client tools.
+    let (_pat, secret) = mcp_hub::tokens::create(&state.db, &user.id, "laptop", 3600)
+        .await
+        .unwrap();
+    let client = connect(&base, secret).await;
+
+    let res = client
+        .call_tool(CallToolRequestParam {
+            name: "hub__set_my_client".into(),
+            arguments: args(serde_json::json!({"name": "x"})),
+        })
+        .await;
+    let rejected = match res {
+        Err(_) => true,
+        Ok(r) => r.is_error == Some(true),
+    };
+    assert!(rejected, "a personal access token must not set a client label");
 
     let _ = client.cancel().await;
 }

@@ -103,6 +103,27 @@ pub fn tools(admin: bool) -> Vec<Tool> {
              hub__list_tokens).",
             schema(json!({"token_id": {"type": "string"}}), &["token_id"]),
         ),
+        tool(
+            "hub__get_my_client",
+            "Show how THIS MCP client (the one making the call) appears in your \
+             connected-clients list: its client id, the name it registered with, \
+             and any custom name and note you have set for it.",
+            schema(json!({}), &[]),
+        ),
+        tool(
+            "hub__set_my_client",
+            "Set the custom name and/or note for THIS MCP client only (the one \
+             making the call). You cannot change any other client, even your own \
+             others. Omitted fields are left unchanged; pass an empty string to \
+             clear one. Only available to OAuth clients, not personal access tokens.",
+            schema(
+                json!({
+                    "name": {"type": "string", "description": "Custom display name for this client ('' clears it)"},
+                    "note": {"type": "string", "description": "Freeform note for this client ('' clears it)"}
+                }),
+                &[],
+            ),
+        ),
     ];
     if admin {
         t.push(tool(
@@ -165,16 +186,22 @@ pub fn is_management_tool(full_name: &str) -> bool {
 }
 
 /// Dispatch a management tool call. `op` is the name without the `hub__` prefix.
+/// `client_id` is the OAuth client the request authenticated as (`None` for a
+/// personal access token); the self-service `*_my_client` tools use it to scope
+/// changes to the caller's own connection.
 pub async fn dispatch(
     state: &AppState,
     user_id: &str,
     admin: bool,
+    client_id: Option<&str>,
     op: &str,
     args: Option<JsonObject>,
 ) -> Result<CallToolResult, McpError> {
     let args = args.unwrap_or_default();
     match op {
         "whoami" => whoami(state, user_id).await,
+        "get_my_client" => get_my_client(state, user_id, client_id).await,
+        "set_my_client" => set_my_client(state, user_id, client_id, &args).await,
         "list_my_servers" => list_my_servers(state, user_id).await,
         "add_server" => add_server(state, user_id, &args).await,
         "edit_server" => edit_server(state, user_id, &args).await,
@@ -245,6 +272,92 @@ async fn whoami(state: &AppState, user_id: &str) -> Result<CallToolResult, McpEr
         "admin": user.is_admin,
         "servers": servers,
     }))
+}
+
+/// Resolve the calling client's id, rejecting personal-access-token callers
+/// (which are not tied to a registered OAuth client).
+fn require_client(client_id: Option<&str>) -> Result<&str, McpError> {
+    client_id.filter(|c| !c.is_empty()).ok_or_else(|| {
+        McpError::invalid_request(
+            "this tool is only available to OAuth-authenticated MCP clients, \
+             not personal access tokens",
+            None,
+        )
+    })
+}
+
+/// `hub__get_my_client` — show the calling client's own connection label.
+async fn get_my_client(
+    state: &AppState,
+    user_id: &str,
+    client_id: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    let client_id = require_client(client_id)?;
+    let (name, note) = crate::oauth::store::get_client_label(&state.db, user_id, client_id)
+        .await
+        .map_err(internal)?;
+    // The name the client declared at registration (DCR metadata), if any.
+    let registered_name = crate::oauth::store::get_client(&state.db, client_id)
+        .await
+        .map_err(internal)?
+        .and_then(|c| {
+            c.metadata
+                .get("client_name")
+                .and_then(|v| v.as_str().map(String::from))
+        });
+    ok(json!({
+        "client_id": client_id,
+        "registered_name": registered_name,
+        "name": name,
+        "note": note,
+    }))
+}
+
+/// `hub__set_my_client` — set the calling client's own name and/or note. Scoped
+/// strictly to the authenticated client_id, so a client can never touch another
+/// client's label, even one on the same account.
+async fn set_my_client(
+    state: &AppState,
+    user_id: &str,
+    client_id: Option<&str>,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let client_id = require_client(client_id)?;
+    // Only label a client the user actually has a live connection to (matches
+    // the web Account page and avoids labelling stale ids).
+    if !crate::oauth::store::user_has_connection(&state.db, user_id, client_id)
+        .await
+        .map_err(internal)?
+    {
+        return Err(McpError::invalid_request(
+            "this client is not currently connected to your account",
+            None,
+        ));
+    }
+    // Partial update: start from the existing label and overwrite only the
+    // fields that were supplied. A present-but-empty string clears that field.
+    let (mut name, mut note) = crate::oauth::store::get_client_label(&state.db, user_id, client_id)
+        .await
+        .map_err(internal)?;
+    let mut changed = false;
+    if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
+        name = n.trim().chars().take(60).collect();
+        changed = true;
+    }
+    if let Some(n) = args.get("note").and_then(|v| v.as_str()) {
+        note = n.trim().chars().take(200).collect();
+        changed = true;
+    }
+    if !changed {
+        return Err(McpError::invalid_params(
+            "provide 'name' and/or 'note' to set",
+            None,
+        ));
+    }
+    crate::oauth::store::set_client_label(&state.db, user_id, client_id, &name, &note)
+        .await
+        .map_err(internal)?;
+    ok(json!({ "client_id": client_id, "name": name, "note": note }))
 }
 
 async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResult, McpError> {
