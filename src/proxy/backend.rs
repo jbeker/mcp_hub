@@ -278,10 +278,12 @@ fn stdio_command(
         None => None,
     };
 
-    // Substitute `${VAR}` references in the command line against the configured
-    // env (secrets + non-secret config + MCP_CONFIG_FILE) so a user can write
-    // e.g. `${TOOL_HOME}/bin/server` or `--config=${MCP_CONFIG_FILE}`. Unknown
-    // references are left literal (see `expand_vars`).
+    // Substitute `${VAR}` references in the command line and in env-var *values*
+    // against the configured env (secrets + non-secret config + MCP_CONFIG_FILE),
+    // so a user can write e.g. `${TOOL_HOME}/bin/server` as the command or
+    // `GOOGLE_APPLICATION_CREDENTIALS=${MCP_CONFIG_FILE}` as an env var. Each
+    // value expands against the whole map in a single pass; unknown references
+    // are left literal (see `expand_vars`).
     let program = crate::util::expand_vars(&program, &env);
     let args: Vec<String> = def
         .args
@@ -294,7 +296,7 @@ fn stdio_command(
         // Don't leak the hub's own environment into the child.
         c.env_clear();
         for (k, v) in &env {
-            c.env(k, v);
+            c.env(k, crate::util::expand_vars(v, &env));
         }
         // Preserve PATH so `uvx`/`npx` can find interpreters.
         if let Ok(path) = std::env::var("PATH") {
@@ -483,6 +485,47 @@ mod tests {
         // The file landed in the per-instance working directory.
         let file = env_dir.join("workdir").join("cfg-inst").join("config");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "FILECONTENT");
+        std::fs::remove_dir_all(&env_dir).ok();
+    }
+
+    /// `${VAR}` references in env-var *values* are expanded against the launch
+    /// env, including `${MCP_CONFIG_FILE}` — so a tool that reads its config path
+    /// from an env var (Google ADC's GOOGLE_APPLICATION_CREDENTIALS) works
+    /// without a shell wrapper. The probe command confirms the expanded value
+    /// equals the real config path and that a plain cross-reference resolves.
+    #[tokio::test]
+    async fn env_values_expand_vars_including_config_file_path() {
+        let env_dir = std::env::temp_dir().join(format!("mcphub-envexp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&env_dir);
+        std::fs::create_dir_all(&env_dir).unwrap();
+
+        let mut env = BTreeMap::new();
+        // References the injected config-file path...
+        env.insert("GAC".to_string(), "${MCP_CONFIG_FILE}".to_string());
+        // ...and a plain cross-reference between two configured vars.
+        env.insert("BASE".to_string(), "hello".to_string());
+        env.insert("DERIVED".to_string(), "${BASE}-world".to_string());
+
+        let def = stdio_def(
+            "sh",
+            &[
+                "-c",
+                "[ \"$GAC\" = \"$MCP_CONFIG_FILE\" ] && [ \"$DERIVED\" = \"hello-world\" ] \
+                  && echo ENVEXPAND_OK >&2; exit 1",
+            ],
+        );
+        let err = Backend::probe(
+            &def,
+            &env,
+            None,
+            env_dir.to_str().unwrap(),
+            "envexp-inst",
+            Some("CREDS"),
+        )
+        .await
+        .expect_err("the probe command always exits 1");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ENVEXPAND_OK"), "env values not expanded: {msg}");
         std::fs::remove_dir_all(&env_dir).ok();
     }
 

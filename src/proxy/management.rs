@@ -48,7 +48,7 @@ pub fn tools(admin: bool) -> Vec<Tool> {
                     "repo": {"type": "string", "description": "stdio (optional): git repo to build a cached venv from"},
                     "git_ref": {"type": "string", "description": "branch/tag for 'repo' (default main)"},
                     "display_name": {"type": "string"},
-                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Values may reference ${VAR}, e.g. GOOGLE_APPLICATION_CREDENTIALS=${MCP_CONFIG_FILE}"},
                     "config_file": {"type": "string", "description": "stdio (optional): config file written to the server's working dir, path in MCP_CONFIG_FILE"}
                 }),
                 &["namespace", "transport"],
@@ -72,7 +72,9 @@ pub fn tools(admin: bool) -> Vec<Tool> {
         tool(
             "hub__set_env",
             "Replace the full set of environment variables on one of your servers \
-             (encrypted at rest). Pass the complete map; omitted keys are removed.",
+             (encrypted at rest). Pass the complete map; omitted keys are removed. \
+             Values may reference ${VAR} (expanded at launch), including \
+             ${MCP_CONFIG_FILE} for the config file's path.",
             schema(
                 json!({
                     "namespace": {"type": "string"},

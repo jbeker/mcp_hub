@@ -190,7 +190,7 @@ fn server_fields(
   <div class="http-only {http_hidden}">
     <label>Remote URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
   </div>
-  <label>Environment variables (one <code>KEY=VALUE</code> per line)<textarea name="env" rows="6" placeholder="API_TOKEN=...">{env}</textarea></label>"#,
+  <label>Environment variables (one <code>KEY=VALUE</code> per line; values may reference <code>${{VAR}}</code>, e.g. <code>GOOGLE_APPLICATION_CREDENTIALS=${{MCP_CONFIG_FILE}}</code>)<textarea name="env" rows="6" placeholder="API_TOKEN=...">{env}</textarea></label>"#,
         transport_field = transport_field,
         stdio_hidden = stdio_hidden,
         http_hidden = http_hidden,
