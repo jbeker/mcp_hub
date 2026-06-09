@@ -151,6 +151,7 @@ pub async fn dashboard(
 
 /// Editable fields shared by the add and edit forms. `transport` is a `<select>`
 /// only when creating (it is fixed once a server exists).
+#[allow(clippy::too_many_arguments)]
 fn server_fields(
     transport: &str,
     transport_select: bool,
@@ -159,6 +160,7 @@ fn server_fields(
     git_ref: &str,
     url: &str,
     env: &str,
+    config_file: &str,
 ) -> String {
     let stdio_hidden = if transport == "http" { "hidden" } else { "" };
     let http_hidden = if transport == "http" { "" } else { "hidden" };
@@ -183,6 +185,7 @@ fn server_fields(
     <label>Command line<input name="command" value="{cmd}" placeholder="uvx your-mcp-server"></label>
     <label>Repository (optional — builds a cached venv from a git repo)<input name="repo" value="{repo}" placeholder="https://github.com/you/your-mcp"></label>
     <label>Git ref (branch or tag)<input name="git_ref" value="{git_ref}" placeholder="main"></label>
+    <label>Config file (optional — written to the server's working directory; its path is exposed as <code>$MCP_CONFIG_FILE</code>)<textarea name="config_file" rows="6" placeholder="(paste a config file the server needs on disk)">{config_file}</textarea></label>
   </div>
   <div class="http-only {http_hidden}">
     <label>Remote URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
@@ -196,6 +199,7 @@ fn server_fields(
         git_ref = esc(git_ref),
         url = esc(url),
         env = esc(env),
+        config_file = esc(config_file),
     )
 }
 
@@ -216,7 +220,7 @@ pub async fn new_server(
   <button type="submit">Add server</button>
 </form>"#,
         csrf = csrf,
-        fields = server_fields("stdio", true, "", "", "", "", ""),
+        fields = server_fields("stdio", true, "", "", "", "", "", ""),
     );
     page("Add a server", &body).into_response()
 }
@@ -242,6 +246,8 @@ pub struct CreateServerForm {
     pub url: String,
     #[serde(default)]
     pub env: String,
+    #[serde(default)]
+    pub config_file: String,
 }
 
 /// `POST /servers/create`
@@ -281,8 +287,27 @@ pub async fn create_server(
     if let Err(e) = instances::replace_env(&state.db, &state.secrets, &inst.id, &env).await {
         return error_page(&e.to_string());
     }
+    if let Err(e) = apply_config_file(&state, &inst.id, &form.config_file).await {
+        return error_page(&e.to_string());
+    }
     audit_ok("server.add", &user, &headers, form.namespace.trim());
     Redirect::to(&format!("/servers/{}", inst.id)).into_response()
+}
+
+/// Store or clear an instance's config file from a submitted form value. A blank
+/// value clears it (and removes any on-disk copy left in the working directory).
+async fn apply_config_file(
+    state: &AppState,
+    instance_id: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    if content.trim().is_empty() {
+        instances::clear_config_file(&state.db, instance_id).await?;
+        crate::proxy::backend::remove_workdir(&state.config.env_dir, instance_id);
+    } else {
+        instances::set_config_file(&state.db, &state.secrets, instance_id, content).await?;
+    }
+    Ok(())
 }
 
 /// Build a `ServerDef` + env map from submitted command/url/repo/env fields.
@@ -380,6 +405,11 @@ pub async fn server_detail(
     let env = instances::env_for_edit(&state.db, &state.secrets, &inst.id)
         .await
         .unwrap_or_default();
+    let config_file = instances::config_file_for_edit(&state.db, &state.secrets, &inst.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     let fields = server_fields(
         &def.transport,
@@ -389,6 +419,7 @@ pub async fn server_detail(
         def.git_ref.as_deref().unwrap_or(""),
         def.url.as_deref().unwrap_or(""),
         &instances::render_env(&env),
+        &config_file,
     );
 
     let toggle = if inst.enabled {
@@ -559,6 +590,9 @@ pub async fn save_config(
     if let Err(e) = instances::replace_env(&state.db, &state.secrets, &inst.id, &env).await {
         return error_page(&e.to_string());
     }
+    if let Err(e) = apply_config_file(&state, &inst.id, &form.config_file).await {
+        return error_page(&e.to_string());
+    }
     audit_ok("server.edit", &user, &headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
@@ -626,6 +660,7 @@ pub async fn delete_server(
     };
     let _ = instances::delete(&state.db, &id).await;
     crate::gitsrc::remove_env(&state.config.env_dir, &id);
+    crate::proxy::backend::remove_workdir(&state.config.env_dir, &id);
     audit_ok("server.remove", &user, &headers, &inst.namespace);
     Redirect::to("/").into_response()
 }
@@ -760,7 +795,21 @@ async fn probe_instance(
         Ok(e) => e,
         Err(e) => return ("error", Some(format!("config error: {e:#}"))),
     };
-    match crate::proxy::backend::Backend::probe(&def, &env, sandbox.as_ref()).await {
+    let config_file = match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await
+    {
+        Ok(c) => c,
+        Err(e) => return ("error", Some(format!("config error: {e:#}"))),
+    };
+    match crate::proxy::backend::Backend::probe(
+        &def,
+        &env,
+        sandbox.as_ref(),
+        &state.config.env_dir,
+        &inst.id,
+        config_file.as_deref(),
+    )
+    .await
+    {
         Ok(()) => ("ok", None),
         Err(e) => ("error", Some(format!("failed to start: {e:#}"))),
     }

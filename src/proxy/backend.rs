@@ -32,6 +32,7 @@ impl Backend {
     /// Establish a connection for `def`, injecting `env` (decrypted secrets +
     /// non-secret config). The `permit` (a global backend slot) is held for the
     /// life of the connection. The backend is initialized and ready on success.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         def: &ServerDef,
         env: &BTreeMap<String, String>,
@@ -40,10 +41,12 @@ impl Backend {
         display_name: String,
         permit: OwnedSemaphorePermit,
         sandbox: Option<&crate::sandbox::Sandbox>,
+        env_dir: &str,
+        config_file: Option<&str>,
     ) -> Result<Backend> {
         let peer = match def.transport.as_str() {
             "stdio" => {
-                let cmd = stdio_command(def, env, sandbox)
+                let cmd = stdio_command(def, env, sandbox, env_dir, &instance_id, config_file)
                     .with_context(|| format!("backend '{namespace}'"))?;
                 let transport = TokioChildProcess::new(cmd)
                     .with_context(|| format!("spawning backend '{namespace}'"))?;
@@ -81,10 +84,13 @@ impl Backend {
         def: &ServerDef,
         env: &BTreeMap<String, String>,
         sandbox: Option<&crate::sandbox::Sandbox>,
+        env_dir: &str,
+        instance_id: &str,
+        config_file: Option<&str>,
     ) -> Result<()> {
         match def.transport.as_str() {
             "stdio" => {
-                let cmd = stdio_command(def, env, sandbox)?;
+                let cmd = stdio_command(def, env, sandbox, env_dir, instance_id, config_file)?;
                 // Pipe stderr so we can surface the child's own error output if
                 // it dies before answering `initialize`.
                 let (transport, stderr) = TokioChildProcess::builder(cmd)
@@ -237,26 +243,51 @@ impl Backend {
 /// cleared environment with only the injected vars (+ `PATH`), and — when a
 /// sandbox is active — a drop to the per-user UID with caches/HOME pointed at a
 /// writable per-UID directory.
+///
+/// When `config_file` is set, its contents are written into a fresh per-instance
+/// working directory (which becomes the child's `cwd`), and its absolute path is
+/// injected as `MCP_CONFIG_FILE` — available both for `${MCP_CONFIG_FILE}`
+/// expansion in the command line and to the child's environment.
 fn stdio_command(
     def: &ServerDef,
     env: &BTreeMap<String, String>,
     sandbox: Option<&crate::sandbox::Sandbox>,
+    env_dir: &str,
+    instance_id: &str,
+    config_file: Option<&str>,
 ) -> Result<tokio::process::Command> {
     let program = def
         .command
         .clone()
         .ok_or_else(|| anyhow!("stdio backend has no command"))?;
+
+    let mut env = env.clone();
+
+    // If a config file is attached, write it into a fresh working directory and
+    // expose its path before expanding `${MCP_CONFIG_FILE}` in the command line.
+    let workdir = match config_file {
+        Some(content) => {
+            let path = write_config_file(env_dir, instance_id, content, sandbox)
+                .context("writing config file")?;
+            env.insert(
+                crate::instances::CONFIG_FILE_ENV.to_string(),
+                path.0.to_string_lossy().into_owned(),
+            );
+            Some(path.1)
+        }
+        None => None,
+    };
+
     // Substitute `${VAR}` references in the command line against the configured
-    // env (secrets + non-secret config) so a user can write e.g.
-    // `${TOOL_HOME}/bin/server` or `--token=${API_TOKEN}`. Unknown references
-    // are left literal (see `expand_vars`).
-    let program = crate::util::expand_vars(&program, env);
+    // env (secrets + non-secret config + MCP_CONFIG_FILE) so a user can write
+    // e.g. `${TOOL_HOME}/bin/server` or `--config=${MCP_CONFIG_FILE}`. Unknown
+    // references are left literal (see `expand_vars`).
+    let program = crate::util::expand_vars(&program, &env);
     let args: Vec<String> = def
         .args
         .iter()
-        .map(|a| crate::util::expand_vars(a, env))
+        .map(|a| crate::util::expand_vars(a, &env))
         .collect();
-    let env = env.clone();
     let sandbox = sandbox.cloned();
     Ok(tokio::process::Command::new(&program).configure(|c| {
         c.args(&args);
@@ -268,6 +299,11 @@ fn stdio_command(
         // Preserve PATH so `uvx`/`npx` can find interpreters.
         if let Ok(path) = std::env::var("PATH") {
             c.env("PATH", path);
+        }
+        // Run from the per-instance working directory so a config file written
+        // there is discoverable by tools that look in their cwd.
+        if let Some(dir) = &workdir {
+            c.current_dir(dir);
         }
         // Drop the child to its per-user sandbox UID and point its caches/HOME
         // at a writable per-UID directory.
@@ -281,6 +317,41 @@ fn stdio_command(
             c.env("npm_config_cache", format!("{}/npm", sb.cache_dir));
         }
     }))
+}
+
+/// The per-instance working directory used to host a config file.
+fn workdir_path(env_dir: &str, instance_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(env_dir).join("workdir").join(instance_id)
+}
+
+/// (Re)create the instance's working directory and write `content` into it under
+/// the fixed config-file name. Returns `(file_path, workdir)`. The directory is
+/// recreated from scratch on every spawn so a stale file is never left behind.
+/// When a sandbox is active the directory and file are chowned to the sandbox
+/// UID and the directory locked to `0700`, so only that UID can read it.
+fn write_config_file(
+    env_dir: &str,
+    instance_id: &str,
+    content: &str,
+    sandbox: Option<&crate::sandbox::Sandbox>,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let workdir = workdir_path(env_dir, instance_id);
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir)?;
+    let file = workdir.join(crate::instances::CONFIG_FILE_NAME);
+    std::fs::write(&file, content)?;
+    if let Some(sb) = sandbox {
+        crate::sandbox::chown(&workdir, sb.uid, sb.gid)?;
+        crate::sandbox::chown(&file, sb.uid, sb.gid)?;
+        crate::sandbox::set_private(&workdir)?;
+    }
+    Ok((file, workdir))
+}
+
+/// Best-effort removal of an instance's working directory (e.g. on delete), so a
+/// decrypted config file does not linger on disk after the instance is gone.
+pub fn remove_workdir(env_dir: &str, instance_id: &str) {
+    let _ = std::fs::remove_dir_all(workdir_path(env_dir, instance_id));
 }
 
 /// Build the Streamable-HTTP transport config for an http backend, applying the
@@ -371,11 +442,48 @@ mod tests {
     #[tokio::test]
     async fn probe_captures_stderr_from_a_crashing_backend() {
         let def = stdio_def("sh", &["-c", "echo BOOM_MARKER >&2; exit 1"]);
-        let err = Backend::probe(&def, &BTreeMap::new(), None)
+        let err = Backend::probe(&def, &BTreeMap::new(), None, "/tmp", "probe-test", None)
             .await
             .expect_err("a backend that exits should fail to probe");
         let msg = format!("{err:#}");
         assert!(msg.contains("BOOM_MARKER"), "stderr not captured: {msg}");
+    }
+
+    /// A config file is written into the child's working directory and its path
+    /// exposed as `$MCP_CONFIG_FILE`. The probe command reads the file via that
+    /// var and, on a match, echoes a marker to stderr — which the probe captures.
+    #[tokio::test]
+    async fn config_file_is_written_and_exposed_via_env() {
+        let env_dir = std::env::temp_dir().join(format!("mcphub-cfgtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&env_dir);
+        std::fs::create_dir_all(&env_dir).unwrap();
+
+        let def = stdio_def(
+            "sh",
+            &[
+                "-c",
+                // Reads the file via $MCP_CONFIG_FILE and via the cwd-relative name.
+                "if [ \"$(cat \"$MCP_CONFIG_FILE\")\" = \"FILECONTENT\" ] && \
+                  [ \"$(cat config)\" = \"FILECONTENT\" ]; then echo CONFIG_OK >&2; fi; exit 1",
+            ],
+        );
+        let err = Backend::probe(
+            &def,
+            &BTreeMap::new(),
+            None,
+            env_dir.to_str().unwrap(),
+            "cfg-inst",
+            Some("FILECONTENT"),
+        )
+        .await
+        .expect_err("the probe command always exits 1");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CONFIG_OK"), "config file/env not wired: {msg}");
+
+        // The file landed in the per-instance working directory.
+        let file = env_dir.join("workdir").join("cfg-inst").join("config");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "FILECONTENT");
+        std::fs::remove_dir_all(&env_dir).ok();
     }
 
     #[test]

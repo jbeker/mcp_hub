@@ -96,6 +96,52 @@ async fn env_is_encrypted_and_round_trips() {
 }
 
 #[tokio::test]
+async fn config_file_is_encrypted_and_round_trips() {
+    let pool = pool().await;
+    let secrets = SecretBox::new(&[9u8; 32]);
+    let user = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
+    let inst = instances::create(&pool, &user.id, None, Some(&stdio_def("uvx", &["m"])), "s", "S")
+        .await
+        .unwrap();
+
+    // No file to start with.
+    assert!(instances::config_file_for_edit(&pool, &secrets, &inst.id).await.unwrap().is_none());
+
+    let content = "{\"token\": \"s3cr3t-config\"}";
+    instances::set_config_file(&pool, &secrets, &inst.id, content).await.unwrap();
+
+    // Comes back for editing and resolves for launch.
+    assert_eq!(
+        instances::config_file_for_edit(&pool, &secrets, &inst.id).await.unwrap().as_deref(),
+        Some(content)
+    );
+    assert_eq!(
+        instances::resolved_config_file(&pool, &secrets, &inst.id).await.unwrap().as_deref(),
+        Some(content)
+    );
+
+    // The stored ciphertext must not contain the plaintext.
+    let (ct,): (Vec<u8>,) =
+        sqlx::query_as("SELECT ciphertext FROM instance_config_files WHERE instance_id = ?")
+            .bind(&inst.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!ct.windows(13).any(|w| w == b"s3cr3t-config"));
+
+    // Upsert replaces the contents.
+    instances::set_config_file(&pool, &secrets, &inst.id, "replaced").await.unwrap();
+    assert_eq!(
+        instances::config_file_for_edit(&pool, &secrets, &inst.id).await.unwrap().as_deref(),
+        Some("replaced")
+    );
+
+    // Clearing removes it.
+    instances::clear_config_file(&pool, &inst.id).await.unwrap();
+    assert!(instances::resolved_config_file(&pool, &secrets, &inst.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn command_line_round_trips() {
     let (cmd, args) = instances::parse_command("uvx zabbix-mcp-server --url \"a b\"").unwrap();
     assert_eq!(cmd.as_deref(), Some("uvx"));

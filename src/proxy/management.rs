@@ -48,7 +48,8 @@ pub fn tools(admin: bool) -> Vec<Tool> {
                     "repo": {"type": "string", "description": "stdio (optional): git repo to build a cached venv from"},
                     "git_ref": {"type": "string", "description": "branch/tag for 'repo' (default main)"},
                     "display_name": {"type": "string"},
-                    "env": {"type": "object", "additionalProperties": {"type": "string"}}
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "config_file": {"type": "string", "description": "stdio (optional): config file written to the server's working dir, path in MCP_CONFIG_FILE"}
                 }),
                 &["namespace", "transport"],
             ),
@@ -78,6 +79,21 @@ pub fn tools(admin: bool) -> Vec<Tool> {
                     "env": {"type": "object", "additionalProperties": {"type": "string"}}
                 }),
                 &["namespace", "env"],
+            ),
+        ),
+        tool(
+            "hub__set_config_file",
+            "Set or clear the configuration file for one of your stdio servers \
+             (encrypted at rest). At launch the file is written into the server's \
+             working directory and its path exposed as the MCP_CONFIG_FILE \
+             environment variable. Pass an empty 'content' (or omit it) to remove \
+             the file.",
+            schema(
+                json!({
+                    "namespace": {"type": "string"},
+                    "content": {"type": "string", "description": "File contents; empty/omitted clears it"}
+                }),
+                &["namespace"],
             ),
         ),
         tool(
@@ -247,6 +263,7 @@ async fn run(
         "add_server" => add_server(state, user_id, args).await,
         "edit_server" => edit_server(state, user_id, args).await,
         "set_env" => set_env(state, user_id, args).await,
+        "set_config_file" => set_config_file(state, user_id, args).await,
         "update_server" => update_server(state, user_id, args).await,
         "enable" => set_enabled(state, user_id, args, true).await,
         "disable" => set_enabled(state, user_id, args, false).await,
@@ -299,6 +316,7 @@ fn action_for(op: &str) -> Option<&'static str> {
         "add_server" => "server.add",
         "edit_server" => "server.edit",
         "set_env" => "server.set_env",
+        "set_config_file" => "server.set_config_file",
         "update_server" => "server.update",
         "enable" => "server.enable",
         "disable" => "server.disable",
@@ -559,6 +577,11 @@ async fn add_server(
     instances::replace_env(&state.db, &state.secrets, &inst.id, &env)
         .await
         .map_err(internal)?;
+    if let Some(content) = opt_str(args, "config_file").filter(|c| !c.is_empty()) {
+        instances::set_config_file(&state.db, &state.secrets, &inst.id, &content)
+            .await
+            .map_err(internal)?;
+    }
     ok(json!({ "added": true, "namespace": inst.namespace }))
 }
 
@@ -609,6 +632,28 @@ async fn set_env(
         .await
         .map_err(internal)?;
     ok(json!({ "set": true, "namespace": namespace, "keys": env.keys().collect::<Vec<_>>() }))
+}
+
+async fn set_config_file(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let namespace = req_str(args, "namespace")?;
+    let inst = find_instance(state, user_id, &namespace).await?;
+    let content = opt_str(args, "content").unwrap_or_default();
+    if content.is_empty() {
+        instances::clear_config_file(&state.db, &inst.id)
+            .await
+            .map_err(internal)?;
+        crate::proxy::backend::remove_workdir(&state.config.env_dir, &inst.id);
+        ok(json!({ "namespace": namespace, "cleared": true }))
+    } else {
+        instances::set_config_file(&state.db, &state.secrets, &inst.id, &content)
+            .await
+            .map_err(internal)?;
+        ok(json!({ "namespace": namespace, "set": true }))
+    }
 }
 
 async fn update_server(
@@ -673,6 +718,7 @@ async fn remove(
     instances::delete(&state.db, &inst.id)
         .await
         .map_err(internal)?;
+    crate::proxy::backend::remove_workdir(&state.config.env_dir, &inst.id);
     ok(json!({ "removed": true, "namespace": namespace }))
 }
 

@@ -78,6 +78,14 @@ pub const RESERVED_NAMESPACE: &str = "hub";
 /// endpoint instead of the catalog's default.
 pub const URL_KEY: &str = "MCP_URL";
 
+/// Env var exposing the absolute path of an instance's config file (when one is
+/// attached). Referenceable as `${MCP_CONFIG_FILE}` in the command line.
+pub const CONFIG_FILE_ENV: &str = "MCP_CONFIG_FILE";
+
+/// Fixed on-disk name the config file is written under, inside the instance's
+/// working directory. Tools reach it via [`CONFIG_FILE_ENV`].
+pub const CONFIG_FILE_NAME: &str = "config";
+
 /// Validate a user-supplied remote backend URL (http/https only).
 pub fn validate_remote_url(url: &str) -> Result<()> {
     let parsed =
@@ -577,6 +585,82 @@ pub async fn resolved_env(
         env.insert(key, value);
     }
     Ok(env)
+}
+
+// ---------------------------------------------------------------------------
+// Configuration file: a single small file, encrypted at rest, written into the
+// instance's working directory at launch (see proxy::backend::stdio_command).
+// ---------------------------------------------------------------------------
+
+/// Store (or replace) an instance's encrypted config file contents.
+pub async fn set_config_file(
+    pool: &SqlitePool,
+    secrets: &SecretBox,
+    instance_id: &str,
+    content: &str,
+) -> Result<()> {
+    let sealed = secrets.seal(content.as_bytes())?;
+    sqlx::query(
+        "INSERT INTO instance_config_files (instance_id, nonce, ciphertext, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(instance_id) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext",
+    )
+    .bind(instance_id)
+    .bind(&sealed.nonce)
+    .bind(&sealed.ciphertext)
+    .bind(now_unix())
+    .execute(pool)
+    .await
+    .context("storing config file")?;
+    Ok(())
+}
+
+/// Remove an instance's config file (no-op if none is stored).
+pub async fn clear_config_file(pool: &SqlitePool, instance_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM instance_config_files WHERE instance_id = ?")
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .context("clearing config file")?;
+    Ok(())
+}
+
+/// Decrypt an instance's config file for the edit form, or `None` if unset.
+pub async fn config_file_for_edit(
+    pool: &SqlitePool,
+    secrets: &SecretBox,
+    instance_id: &str,
+) -> Result<Option<String>> {
+    decrypt_config_file(pool, secrets, instance_id).await
+}
+
+/// Decrypt an instance's config file for launch, or `None` if unset. Plaintext
+/// exists only in memory here until the launcher writes it to disk.
+pub async fn resolved_config_file(
+    pool: &SqlitePool,
+    secrets: &SecretBox,
+    instance_id: &str,
+) -> Result<Option<String>> {
+    decrypt_config_file(pool, secrets, instance_id).await
+}
+
+async fn decrypt_config_file(
+    pool: &SqlitePool,
+    secrets: &SecretBox,
+    instance_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT nonce, ciphertext FROM instance_config_files WHERE instance_id = ?")
+            .bind(instance_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((nonce, ciphertext)) = row else {
+        return Ok(None);
+    };
+    let plain = secrets.open(&Sealed { nonce, ciphertext })?;
+    Ok(Some(
+        String::from_utf8(plain).context("config file was not valid UTF-8")?,
+    ))
 }
 
 #[cfg(test)]

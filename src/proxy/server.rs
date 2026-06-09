@@ -206,6 +206,19 @@ impl HubProxy {
                     continue;
                 }
             };
+            let config_file = match instances::resolved_config_file(
+                &self.state.db,
+                &self.state.secrets,
+                &inst.id,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    self.mark_status(inst, "error", Some(&format!("config error: {e:#}"))).await;
+                    continue;
+                }
+            };
             match Backend::spawn(
                 &def,
                 &env,
@@ -214,6 +227,8 @@ impl HubProxy {
                 inst.display_name.clone(),
                 permit,
                 sandbox.as_ref(),
+                &self.state.config.env_dir,
+                config_file.as_deref(),
             )
             .await
             {
