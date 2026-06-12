@@ -175,10 +175,17 @@ ul.conns li {
 .hidden { display: none; }
 
 /* Server detail tabs: the active tab is just a highlighted link. */
-nav.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 16px 0 12px; }
-nav.tabs a { padding: 7px 14px; font-size: 14px; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
-nav.tabs a.active { color: var(--fg); border-bottom-color: var(--accent); }
-nav.tabs a:hover { color: var(--fg); }
+/* Segmented control: an unmistakable two-tab switch. The active tab is filled
+   with a tint of the accent and brightened; inactive tabs sit in bordered
+   cells that visibly invite a click. */
+nav.tabs { display: inline-flex; gap: 4px; padding: 4px; margin: 16px 0 18px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px; }
+nav.tabs a { padding: 7px 16px; font-size: 14px; font-weight: 600; line-height: 1;
+  color: var(--muted); border-radius: 7px; border: 1px solid transparent; }
+nav.tabs a:hover { color: var(--fg); background: var(--card); }
+nav.tabs a.active { color: var(--fg); background: rgba(91, 140, 255, 0.16);
+  border-color: var(--accent); }
+nav.tabs a.active:hover { background: rgba(91, 140, 255, 0.16); }
 
 /* Capabilities page: expandable tool/prompt entries. */
 details.tool { border-bottom: 1px solid var(--border); padding: 8px 0; }
