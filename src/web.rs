@@ -759,8 +759,14 @@ async fn probe_instance(
         Ok(d) => d,
         Err(e) => return ("error", Some(format!("resolve failed: {e:#}")), None),
     };
-    if def.transport == "http" && def.url.as_deref().unwrap_or("").trim().is_empty() {
-        return ("error", Some("no remote URL set".into()), None);
+    if def.transport == "http" {
+        let url = def.url.as_deref().unwrap_or("").trim();
+        if url.is_empty() {
+            return ("error", Some("no remote URL set".into()), None);
+        }
+        if let Err(e) = instances::check_backend_host(url, state.config.block_private_backend_ips) {
+            return ("error", Some(format!("{e}")), None);
+        }
     }
     // Fail closed: resolve the sandbox identity up front (used for both the
     // self-heal rebuild and the probe spawn) rather than ever running as root.
@@ -821,6 +827,7 @@ async fn probe_instance(
         &state.config.env_dir,
         &inst.id,
         config_file.as_deref(),
+        state.config.child_limits,
     )
     .await
     {

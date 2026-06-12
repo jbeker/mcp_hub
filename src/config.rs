@@ -35,6 +35,45 @@ pub struct Config {
     pub sandbox_uid_base: Option<u32>,
     /// Backend lifecycle limits.
     pub limits: Limits,
+    /// Per-child OS resource limits applied to stdio backend subprocesses.
+    pub child_limits: ChildLimits,
+    /// When true (`HUB_BLOCK_PRIVATE_BACKEND_IPS`), an http backend whose host
+    /// resolves to a loopback/private/link-local address is rejected — an
+    /// anti-SSRF guard so a user-configured remote URL can't reach the
+    /// container's own network. Off by default (home/LAN deployments often
+    /// point at private IPs on purpose).
+    pub block_private_backend_ips: bool,
+}
+
+/// `setrlimit` caps applied to every stdio backend subprocess, as a last line
+/// of defence against a runaway server taking down the container. Each is
+/// `None` (the field is 0 / the env var unset) to leave that limit untouched.
+#[derive(Clone, Copy, Default)]
+pub struct ChildLimits {
+    /// `RLIMIT_NPROC` — max processes/threads for the child's UID (`HUB_CHILD_MAX_PROCS`).
+    pub max_procs: Option<u64>,
+    /// `RLIMIT_DATA` in megabytes (`HUB_CHILD_MAX_MEM_MB`). Deliberately
+    /// `RLIMIT_DATA`, not `RLIMIT_AS`: a Node child's V8/Wasm engine *reserves*
+    /// ~10 GiB of virtual address space without committing it, which an
+    /// `RLIMIT_AS` cap rejects at startup (`WebAssembly.instantiate: Out of
+    /// memory`). `RLIMIT_DATA` bounds the heap that is actually written, so
+    /// real runaway growth is still caught.
+    pub max_mem_mb: Option<u64>,
+    /// `RLIMIT_CPU` in seconds of CPU time (`HUB_CHILD_MAX_CPU_SECS`).
+    pub max_cpu_secs: Option<u64>,
+    /// `RLIMIT_FSIZE` in megabytes (`HUB_CHILD_MAX_FILE_MB`).
+    pub max_file_mb: Option<u64>,
+}
+
+impl ChildLimits {
+    /// True when at least one limit is configured (so the spawn can skip the
+    /// `pre_exec` hook entirely when nothing is set).
+    pub fn any(&self) -> bool {
+        self.max_procs.is_some()
+            || self.max_mem_mb.is_some()
+            || self.max_cpu_secs.is_some()
+            || self.max_file_mb.is_some()
+    }
 }
 
 /// Limits governing backend MCP server processes/connections.
@@ -43,6 +82,13 @@ pub struct Limits {
     pub max_backends_per_user: usize,
     pub max_backends_global: usize,
     pub backend_idle_secs: u64,
+    /// Per-call wall-clock cap for a proxied backend RPC (`HUB_BACKEND_CALL_TIMEOUT_SECS`);
+    /// 0 = no timeout. Stops one wedged backend from hanging a client forever.
+    pub backend_call_timeout_secs: u64,
+    /// Cap on a single backend response's serialized size in megabytes
+    /// (`HUB_MAX_RESPONSE_MB`); 0 = uncapped. Bounds memory blow-up from a
+    /// backend returning a huge payload.
+    pub max_response_mb: u64,
 }
 
 impl Default for Limits {
@@ -51,6 +97,8 @@ impl Default for Limits {
             max_backends_per_user: 16,
             max_backends_global: 128,
             backend_idle_secs: 300,
+            backend_call_timeout_secs: 0,
+            max_response_mb: 0,
         }
     }
 }
@@ -95,6 +143,25 @@ impl Config {
         if let Some(v) = opt_parse("HUB_BACKEND_IDLE_SECS")? {
             limits.backend_idle_secs = v;
         }
+        if let Some(v) = opt_parse("HUB_BACKEND_CALL_TIMEOUT_SECS")? {
+            limits.backend_call_timeout_secs = v;
+        }
+        if let Some(v) = opt_parse("HUB_MAX_RESPONSE_MB")? {
+            limits.max_response_mb = v;
+        }
+
+        // A value of 0 means "leave this limit untouched", same as unset.
+        let nonzero = |key| -> Result<Option<u64>> { Ok(opt_parse::<u64>(key)?.filter(|&v| v > 0)) };
+        let child_limits = ChildLimits {
+            max_procs: nonzero("HUB_CHILD_MAX_PROCS")?,
+            max_mem_mb: nonzero("HUB_CHILD_MAX_MEM_MB")?,
+            max_cpu_secs: nonzero("HUB_CHILD_MAX_CPU_SECS")?,
+            max_file_mb: nonzero("HUB_CHILD_MAX_FILE_MB")?,
+        };
+
+        let block_private_backend_ips = opt("HUB_BLOCK_PRIVATE_BACKEND_IPS")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
 
         Ok(Self {
             base_url,
@@ -107,6 +174,8 @@ impl Config {
             allow_open_registration,
             sandbox_uid_base,
             limits,
+            child_limits,
+            block_private_backend_ips,
         })
     }
 

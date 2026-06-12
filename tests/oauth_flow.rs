@@ -22,6 +22,9 @@ fn test_config() -> Config {
         allow_open_registration: false,
         sandbox_uid_base: None,
         limits: Limits::default(),
+        child_limits: Default::default(),
+
+        block_private_backend_ips: false,
     }
 }
 

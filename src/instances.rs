@@ -116,7 +116,80 @@ pub fn validate_remote_url(url: &str) -> Result<()> {
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("remote URL must be an http(s) URL");
     }
+    // A `#fragment` is never sent on the wire and almost always signals a
+    // copy-paste mistake; reject it so the stored URL is exactly what connects.
+    if parsed.fragment().is_some() {
+        bail!("remote URL must not contain a '#' fragment");
+    }
+    // Plaintext http is only safe to a loopback host (a sidecar on the same
+    // machine); anywhere else it would send the bearer credential in the clear.
+    if parsed.scheme() == "http" && !host_is_loopback(&parsed) {
+        bail!("http is only allowed for loopback addresses; use https");
+    }
     Ok(())
+}
+
+/// True when the URL's host is a loopback literal (`localhost`, `127.0.0.0/8`,
+/// or `::1`). A bare hostname that merely *resolves* to loopback is not treated
+/// as loopback here — that DNS-time decision belongs to [`check_backend_host`].
+fn host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// Validate a backend URL and, when `block_private` is set, refuse one whose
+/// host resolves to a loopback/private/link-local/unspecified address — an
+/// anti-SSRF guard. Resolution is best-effort: a host that cannot be resolved
+/// at validation time is allowed through (it will simply fail to connect),
+/// since this also runs at config-save time when the target may be offline.
+pub fn check_backend_host(url: &str, block_private: bool) -> Result<()> {
+    validate_remote_url(url)?;
+    if !block_private {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url.trim()).map_err(|_| anyhow!("'{url}' is not a valid URL"))?;
+    // A loopback literal is the one private target we *do* allow (sidecar use).
+    if host_is_loopback(&parsed) {
+        return Ok(());
+    }
+    let host = parsed.host_str().ok_or_else(|| anyhow!("remote URL has no host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    use std::net::ToSocketAddrs;
+    if let Ok(addrs) = (host, port).to_socket_addrs() {
+        for addr in addrs {
+            if ip_is_private(addr.ip()) {
+                bail!("remote URL host resolves to a non-public address ({})", addr.ip());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for addresses that must never be reachable from a user-configured
+/// backend when the SSRF guard is on: loopback, RFC1918/ULA private,
+/// link-local, and the unspecified address.
+fn ip_is_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local (fc00::/7) and link-local (fe80::/10); checked by
+                // segment since the std helpers are unstable.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// A user-configured server instance.
@@ -719,15 +792,42 @@ async fn decrypt_config_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_remote_url, CapabilitiesSnapshot};
+    use super::{check_backend_host, ip_is_private, validate_remote_url, CapabilitiesSnapshot};
 
     #[test]
     fn remote_url_validation() {
         assert!(validate_remote_url("https://memory.example.com/mcp").is_ok());
-        assert!(validate_remote_url("http://10.0.0.5:8080/mcp").is_ok());
+        // http is allowed only to a loopback host…
+        assert!(validate_remote_url("http://localhost:8080/mcp").is_ok());
+        assert!(validate_remote_url("http://127.0.0.1:8080/mcp").is_ok());
+        // …not to any other host (would leak the bearer token in the clear).
+        assert!(validate_remote_url("http://10.0.0.5:8080/mcp").is_err());
+        assert!(validate_remote_url("http://example.com/mcp").is_err());
+        // Other rejects: non-http scheme, garbage, empty, stray fragment.
         assert!(validate_remote_url("ftp://example.com").is_err());
         assert!(validate_remote_url("not a url").is_err());
         assert!(validate_remote_url("").is_err());
+        assert!(validate_remote_url("https://example.com/mcp#frag").is_err());
+    }
+
+    #[test]
+    fn private_ip_classification() {
+        use std::net::IpAddr;
+        for s in ["127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.1.1", "::1", "fd00::1", "fe80::1"] {
+            assert!(ip_is_private(s.parse::<IpAddr>().unwrap()), "{s} should be private");
+        }
+        for s in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(!ip_is_private(s.parse::<IpAddr>().unwrap()), "{s} should be public");
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_private_when_enabled() {
+        // Loopback literal is always allowed (sidecar use).
+        assert!(check_backend_host("http://127.0.0.1:9000/mcp", true).is_ok());
+        // A literal private IP is blocked only when the guard is on.
+        assert!(check_backend_host("https://10.0.0.5/mcp", false).is_ok());
+        assert!(check_backend_host("https://10.0.0.5/mcp", true).is_err());
     }
 
     /// The snapshot must survive a JSON round-trip (it is cached in SQLite),

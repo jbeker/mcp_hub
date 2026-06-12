@@ -39,6 +39,9 @@ async fn spawn_hub() -> (String, AppState) {
         allow_open_registration: false,
         sandbox_uid_base: None,
         limits: Limits::default(),
+        child_limits: Default::default(),
+
+        block_private_backend_ips: false,
     };
     let state = AppState::new(config, pool).await.unwrap();
 

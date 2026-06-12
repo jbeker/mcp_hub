@@ -43,11 +43,20 @@ impl Backend {
         sandbox: Option<&crate::sandbox::Sandbox>,
         env_dir: &str,
         config_file: Option<&str>,
+        child_limits: crate::config::ChildLimits,
     ) -> Result<Backend> {
         let peer = match def.transport.as_str() {
             "stdio" => {
-                let cmd = stdio_command(def, env, sandbox, env_dir, &instance_id, config_file)
-                    .with_context(|| format!("backend '{namespace}'"))?;
+                let cmd = stdio_command(
+                    def,
+                    env,
+                    sandbox,
+                    env_dir,
+                    &instance_id,
+                    config_file,
+                    child_limits,
+                )
+                .with_context(|| format!("backend '{namespace}'"))?;
                 let transport = TokioChildProcess::new(cmd)
                     .with_context(|| format!("spawning backend '{namespace}'"))?;
                 serve_client((), transport)
@@ -91,10 +100,12 @@ impl Backend {
         env_dir: &str,
         instance_id: &str,
         config_file: Option<&str>,
+        child_limits: crate::config::ChildLimits,
     ) -> Result<crate::instances::CapabilitiesSnapshot> {
         match def.transport.as_str() {
             "stdio" => {
-                let cmd = stdio_command(def, env, sandbox, env_dir, instance_id, config_file)?;
+                let cmd =
+                    stdio_command(def, env, sandbox, env_dir, instance_id, config_file, child_limits)?;
                 // Pipe stderr so we can surface the child's own error output if
                 // it dies before answering `initialize`.
                 let (transport, stderr) = TokioChildProcess::builder(cmd)
@@ -311,6 +322,7 @@ fn stdio_command(
     env_dir: &str,
     instance_id: &str,
     config_file: Option<&str>,
+    child_limits: crate::config::ChildLimits,
 ) -> Result<tokio::process::Command> {
     let program = def
         .command
@@ -363,6 +375,17 @@ fn stdio_command(
         if let Some(dir) = &workdir {
             c.current_dir(dir);
         }
+        // Apply per-child resource caps in the forked child, before the uid
+        // drop below (std runs user `pre_exec` hooks before its own uid/gid
+        // change). Setting limits while still privileged is what lets them
+        // hold against the unprivileged sandbox UID. No-op when nothing is set.
+        if child_limits.any() {
+            // SAFETY: the closure only calls `setrlimit`, which is a single
+            // async-signal-safe syscall — valid in the post-fork/pre-exec child.
+            unsafe {
+                c.pre_exec(move || apply_child_limits(child_limits));
+            }
+        }
         // Drop the child to its per-user sandbox UID and point its caches/HOME
         // at a writable per-UID directory.
         if let Some(sb) = &sandbox {
@@ -375,6 +398,42 @@ fn stdio_command(
             c.env("npm_config_cache", format!("{}/npm", sb.cache_dir));
         }
     }))
+}
+
+/// Apply the configured `setrlimit` caps. Runs in the forked child between
+/// `fork` and `exec`, so it must stay async-signal-safe: it does nothing but
+/// issue `setrlimit` syscalls. A failure aborts the spawn (the child reports
+/// the errno back through the standard `pre_exec` channel).
+#[cfg(unix)]
+fn apply_child_limits(limits: crate::config::ChildLimits) -> std::io::Result<()> {
+    // The resource-id type differs across platforms (glibc `__rlimit_resource_t`
+    // vs `c_int`); leave it for the closure to infer from the `RLIMIT_*`
+    // constants so this compiles on the dev host and the Linux target alike.
+    let set = |resource, value: u64| -> std::io::Result<()> {
+        let rl = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+        // SAFETY: `rl` is a valid, fully-initialized rlimit for the duration
+        // of the call.
+        if unsafe { libc::setrlimit(resource, &rl) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    if let Some(n) = limits.max_procs {
+        set(libc::RLIMIT_NPROC, n)?;
+    }
+    if let Some(mb) = limits.max_mem_mb {
+        set(libc::RLIMIT_DATA, mb.saturating_mul(1024 * 1024))?;
+    }
+    if let Some(s) = limits.max_cpu_secs {
+        set(libc::RLIMIT_CPU, s)?;
+    }
+    if let Some(mb) = limits.max_file_mb {
+        set(libc::RLIMIT_FSIZE, mb.saturating_mul(1024 * 1024))?;
+    }
+    Ok(())
 }
 
 /// The per-instance working directory used to host a config file.
@@ -500,9 +559,17 @@ mod tests {
     #[tokio::test]
     async fn probe_captures_stderr_from_a_crashing_backend() {
         let def = stdio_def("sh", &["-c", "echo BOOM_MARKER >&2; exit 1"]);
-        let err = Backend::probe(&def, &BTreeMap::new(), None, "/tmp", "probe-test", None)
-            .await
-            .expect_err("a backend that exits should fail to probe");
+        let err = Backend::probe(
+            &def,
+            &BTreeMap::new(),
+            None,
+            "/tmp",
+            "probe-test",
+            None,
+            Default::default(),
+        )
+        .await
+        .expect_err("a backend that exits should fail to probe");
         let msg = format!("{err:#}");
         assert!(msg.contains("BOOM_MARKER"), "stderr not captured: {msg}");
     }
@@ -532,6 +599,7 @@ mod tests {
             env_dir.to_str().unwrap(),
             "cfg-inst",
             Some("FILECONTENT"),
+            Default::default(),
         )
         .await
         .expect_err("the probe command always exits 1");
@@ -577,12 +645,50 @@ mod tests {
             env_dir.to_str().unwrap(),
             "envexp-inst",
             Some("CREDS"),
+            Default::default(),
         )
         .await
         .expect_err("the probe command always exits 1");
         let msg = format!("{err:#}");
         assert!(msg.contains("ENVEXPAND_OK"), "env values not expanded: {msg}");
         std::fs::remove_dir_all(&env_dir).ok();
+    }
+
+    /// The `pre_exec` `setrlimit` hook actually reaches the subprocess: a child
+    /// asked to report its own `RLIMIT_FSIZE` sees the configured cap rather
+    /// than "unlimited". Reporting the observed limit is more robust than
+    /// relying on SIGXFSZ timing through a shell. Linux-only — the limits are a
+    /// no-op on the dev host's non-Linux targets.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_resource_limit_reaches_the_subprocess() {
+        // `ulimit -f` prints the file-size limit (in blocks) the child runs
+        // under; with no cap it would print "unlimited".
+        let def = stdio_def(
+            "sh",
+            &["-c", "printf 'RLIMIT_F=%s\\n' \"$(ulimit -f)\" >&2; exit 1"],
+        );
+        let limits = crate::config::ChildLimits {
+            max_file_mb: Some(1),
+            ..Default::default()
+        };
+        let err = Backend::probe(
+            &def,
+            &BTreeMap::new(),
+            None,
+            "/tmp",
+            "rlimit-inst",
+            None,
+            limits,
+        )
+        .await
+        .expect_err("the probe command always exits 1");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RLIMIT_F="), "child did not report its limit: {msg}");
+        assert!(
+            !msg.contains("RLIMIT_F=unlimited"),
+            "file-size limit was not applied: {msg}"
+        );
     }
 
     #[test]

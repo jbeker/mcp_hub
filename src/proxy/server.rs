@@ -159,9 +159,21 @@ impl HubProxy {
                     continue;
                 }
             };
-            if def.transport == "http" && def.url.as_deref().unwrap_or("").trim().is_empty() {
-                self.mark_status(inst, "error", Some("no remote URL set")).await;
-                continue;
+            if def.transport == "http" {
+                let url = def.url.as_deref().unwrap_or("").trim();
+                if url.is_empty() {
+                    self.mark_status(inst, "error", Some("no remote URL set")).await;
+                    continue;
+                }
+                // Re-resolve the host at connect time (not just at save) so the
+                // SSRF guard also defeats DNS rebinding.
+                if let Err(e) = instances::check_backend_host(
+                    url,
+                    self.state.config.block_private_backend_ips,
+                ) {
+                    self.mark_status(inst, "error", Some(&format!("{e}"))).await;
+                    continue;
+                }
             }
             // Git-sourced backends run from their prebuilt virtualenv. Rewrite
             // the def to a direct stdio exec; skip if it has not been built yet.
@@ -229,6 +241,7 @@ impl HubProxy {
                 sandbox.as_ref(),
                 &self.state.config.env_dir,
                 config_file.as_deref(),
+                self.state.config.child_limits,
             )
             .await
             {
@@ -242,6 +255,46 @@ impl HubProxy {
             }
         }
         out
+    }
+
+    /// Run a proxied backend call under the configured wall-clock timeout
+    /// (`HUB_BACKEND_CALL_TIMEOUT_SECS`; 0 = no timeout). A timeout maps to an
+    /// MCP internal error rather than hanging the client.
+    async fn with_call_timeout<F, T>(&self, fut: F) -> Result<T, McpError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let secs = self.state.config.limits.backend_call_timeout_secs;
+        if secs == 0 {
+            return Ok(fut.await);
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(McpError::internal_error(
+                format!("backend call timed out after {secs}s"),
+                None,
+            )),
+        }
+    }
+
+    /// Reject a backend response whose serialized size exceeds
+    /// `HUB_MAX_RESPONSE_MB` (0 = uncapped), bounding memory blow-up from a
+    /// backend returning an enormous payload.
+    fn check_response_size<T: serde::Serialize>(&self, value: &T) -> Result<(), McpError> {
+        let mb = self.state.config.limits.max_response_mb;
+        if mb == 0 {
+            return Ok(());
+        }
+        let cap = mb as usize * 1024 * 1024;
+        if let Ok(bytes) = serde_json::to_vec(value) {
+            if bytes.len() > cap {
+                return Err(McpError::internal_error(
+                    format!("backend response of {} bytes exceeds the {mb} MB limit", bytes.len()),
+                    None,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Persist a backend's connection outcome so the UI / hub__ tools can show
@@ -374,10 +427,12 @@ impl ServerHandler for HubProxy {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
 
-        backend
-            .call_tool(original.to_string(), request.arguments)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+        let result = self
+            .with_call_timeout(backend.call_tool(original.to_string(), request.arguments))
+            .await?
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        self.check_response_size(&result)?;
+        Ok(result)
     }
 
     async fn list_resources(
@@ -449,10 +504,12 @@ impl ServerHandler for HubProxy {
             .ok_or_else(|| {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
-        backend
-            .read_resource(original.to_string())
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+        let result = self
+            .with_call_timeout(backend.read_resource(original.to_string()))
+            .await?
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        self.check_response_size(&result)?;
+        Ok(result)
     }
 
     async fn list_prompts(
@@ -497,9 +554,11 @@ impl ServerHandler for HubProxy {
             .ok_or_else(|| {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
-        backend
-            .get_prompt(original.to_string(), request.arguments)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+        let result = self
+            .with_call_timeout(backend.get_prompt(original.to_string(), request.arguments))
+            .await?
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        self.check_response_size(&result)?;
+        Ok(result)
     }
 }
