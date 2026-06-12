@@ -70,6 +70,29 @@ impl ServerDef {
     }
 }
 
+/// What a backend advertised to the hub the last time it was probed (Test
+/// connection / Refresh capabilities). Cached as JSON in
+/// `user_server_instances.capabilities_json`. Persists rmcp's own wire shapes;
+/// if a future rmcp upgrade can no longer parse an old row, the cache simply
+/// reads as "never fetched" and one refresh re-captures it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilitiesSnapshot {
+    /// When the snapshot was captured (unix seconds).
+    pub fetched_at: i64,
+    /// The server's `initialize` result: protocol version, capabilities,
+    /// serverInfo (name/version), instructions.
+    pub server: rmcp::model::InitializeResult,
+    /// Tool definitions under their *original* (un-namespaced) names.
+    #[serde(default)]
+    pub tools: Vec<rmcp::model::Tool>,
+    #[serde(default)]
+    pub prompts: Vec<rmcp::model::Prompt>,
+    #[serde(default)]
+    pub resources: Vec<rmcp::model::Resource>,
+    #[serde(default)]
+    pub resource_templates: Vec<rmcp::model::ResourceTemplate>,
+}
+
 /// Namespace reserved for the built-in management interface (see M6).
 pub const RESERVED_NAMESPACE: &str = "hub";
 
@@ -285,6 +308,37 @@ pub async fn set_runtime_status(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Store the latest capabilities snapshot for an instance.
+pub async fn set_capabilities_snapshot(
+    pool: &SqlitePool,
+    id: &str,
+    snap: &CapabilitiesSnapshot,
+) -> Result<()> {
+    sqlx::query("UPDATE user_server_instances SET capabilities_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(snap)?)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Load the cached capabilities snapshot. A missing value and a JSON shape we
+/// can no longer parse both read as `None` — the UI then shows the
+/// "never fetched" state and a refresh re-captures it.
+pub async fn get_capabilities_snapshot(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<CapabilitiesSnapshot>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT capabilities_json FROM user_server_instances WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row
+        .and_then(|(json,)| json)
+        .and_then(|json| serde_json::from_str(&json).ok()))
 }
 
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<()> {
@@ -665,7 +719,7 @@ async fn decrypt_config_file(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_remote_url;
+    use super::{validate_remote_url, CapabilitiesSnapshot};
 
     #[test]
     fn remote_url_validation() {
@@ -674,5 +728,33 @@ mod tests {
         assert!(validate_remote_url("ftp://example.com").is_err());
         assert!(validate_remote_url("not a url").is_err());
         assert!(validate_remote_url("").is_err());
+    }
+
+    /// The snapshot must survive a JSON round-trip (it is cached in SQLite),
+    /// and the list fields must tolerate being absent in stored JSON.
+    #[test]
+    fn capabilities_snapshot_round_trips() {
+        let snap = CapabilitiesSnapshot {
+            fetched_at: 1_700_000_000,
+            server: rmcp::model::InitializeResult::default(),
+            tools: vec![rmcp::model::Tool::new(
+                "do_thing",
+                "Does the thing",
+                std::sync::Arc::new(serde_json::Map::new()),
+            )],
+            prompts: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CapabilitiesSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.fetched_at, snap.fetched_at);
+        assert_eq!(back.tools.len(), 1);
+        assert_eq!(back.tools[0].name, "do_thing");
+
+        // Older/partial rows without the list fields still parse.
+        let partial = r#"{"fetched_at":1,"server":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#;
+        let back: CapabilitiesSnapshot = serde_json::from_str(partial).unwrap();
+        assert!(back.tools.is_empty());
     }
 }

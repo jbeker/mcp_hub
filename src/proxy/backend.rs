@@ -74,12 +74,16 @@ impl Backend {
     }
 
     /// Try to start the backend once, complete the MCP `initialize` handshake,
-    /// then shut it straight back down — reporting why it failed. Unlike
+    /// capture what the server advertises (a [`CapabilitiesSnapshot`]), then
+    /// shut it straight back down — reporting why it failed. Unlike
     /// [`spawn`](Self::spawn), a failing stdio child's **stderr is captured** and
     /// folded into the error, so the caller sees the subprocess's own crash
     /// output (e.g. a Python traceback) rather than just "connection closed".
-    /// Used by the "Test connection" button so a user can verify a server starts
-    /// without opening a fresh MCP client connection.
+    /// Used by the "Test connection" and "Refresh capabilities" buttons so a
+    /// user can verify a server starts without opening a fresh MCP client
+    /// connection.
+    ///
+    /// [`CapabilitiesSnapshot`]: crate::instances::CapabilitiesSnapshot
     pub async fn probe(
         def: &ServerDef,
         env: &BTreeMap<String, String>,
@@ -87,7 +91,7 @@ impl Backend {
         env_dir: &str,
         instance_id: &str,
         config_file: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<crate::instances::CapabilitiesSnapshot> {
         match def.transport.as_str() {
             "stdio" => {
                 let cmd = stdio_command(def, env, sandbox, env_dir, instance_id, config_file)?;
@@ -99,8 +103,9 @@ impl Backend {
                     .context("spawning backend")?;
                 match serve_client((), transport).await {
                     Ok(peer) => {
+                        let snap = capture_snapshot(&peer).await;
                         let _ = peer.cancel().await;
-                        Ok(())
+                        Ok(snap)
                     }
                     Err(e) => {
                         let tail = match stderr {
@@ -120,8 +125,9 @@ impl Backend {
                 let peer = serve_client((), transport)
                     .await
                     .context("connecting http backend")?;
+                let snap = capture_snapshot(&peer).await;
                 let _ = peer.cancel().await;
-                Ok(())
+                Ok(snap)
             }
             other => bail!("unsupported transport '{other}'"),
         }
@@ -236,6 +242,56 @@ impl Backend {
     /// Cleanly shut down the backend connection.
     pub async fn shutdown(self) {
         let _ = self.peer.cancel().await;
+    }
+}
+
+/// Read everything the just-initialized backend advertises. Each list call is
+/// gated on the advertised capability *and* error-tolerant: a server that
+/// doesn't support prompts/resources (or errors mid-list) contributes empty
+/// lists rather than failing the probe — the probe's job is still "did it
+/// start"; the snapshot is best-effort extra.
+async fn capture_snapshot(
+    peer: &RunningService<RoleClient, ()>,
+) -> crate::instances::CapabilitiesSnapshot {
+    let server = peer.peer_info().cloned().unwrap_or_default();
+    let caps = server.capabilities.clone();
+    let tools = if caps.tools.is_some() {
+        peer.list_all_tools().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "listing tools for snapshot");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    let prompts = if caps.prompts.is_some() {
+        peer.list_all_prompts().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "listing prompts for snapshot");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    let (resources, resource_templates) = if caps.resources.is_some() {
+        (
+            peer.list_all_resources().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "listing resources for snapshot");
+                Vec::new()
+            }),
+            peer.list_all_resource_templates().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "listing resource templates for snapshot");
+                Vec::new()
+            }),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    crate::instances::CapabilitiesSnapshot {
+        fetched_at: crate::util::now_unix(),
+        server,
+        tools,
+        prompts,
+        resources,
+        resource_templates,
     }
 }
 

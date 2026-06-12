@@ -173,3 +173,16 @@ ul.conns li {
 .access button { margin-top: 4px; width: auto; }
 
 .hidden { display: none; }
+
+/* Server detail tabs: the active tab is just a highlighted link. */
+nav.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 16px 0 12px; }
+nav.tabs a { padding: 7px 14px; font-size: 14px; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+nav.tabs a.active { color: var(--fg); border-bottom-color: var(--accent); }
+nav.tabs a:hover { color: var(--fg); }
+
+/* Capabilities page: expandable tool/prompt entries. */
+details.tool { border-bottom: 1px solid var(--border); padding: 8px 0; }
+details.tool summary { cursor: pointer; }
+details.tool summary code { font-size: 14px; }
+details.tool > p { margin: 8px 0 4px; }
+details.tool pre.cmd { margin: 4px 0 8px; max-height: 360px; overflow: auto; }

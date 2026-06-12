@@ -456,6 +456,7 @@ pub async fn server_detail(
     let body = format!(
         r#"<header class="row"><h1>{name}</h1><a href="/">← Back</a></header>
 <p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
+{tabs}
 {runtime}
 {command}
 <form method="post" action="/servers/{id}/config">
@@ -473,6 +474,7 @@ pub async fn server_detail(
         ns = esc(&inst.namespace),
         transport = esc(&def.transport),
         status = if inst.enabled { "enabled" } else { "disabled" },
+        tabs = server_tabs(&inst.id, "config"),
         runtime = runtime_banner(&inst),
         command = command_line(&state, &inst, &def),
         id = esc(&inst.id),
@@ -518,18 +520,22 @@ fn command_line(
     }
 }
 
+/// Two-tab nav for the server pages; the active tab is just a styled link.
+fn server_tabs(id: &str, active: &str) -> String {
+    let cls = |t: &str| if t == active { r#" class="active""# } else { "" };
+    format!(
+        r#"<nav class="tabs"><a href="/servers/{id}"{a}>Configuration</a><a href="/servers/{id}/capabilities"{b}>Capabilities</a></nav>"#,
+        id = esc(id),
+        a = cls("config"),
+        b = cls("capabilities"),
+    )
+}
+
 /// Render the backend's last connection outcome as a coloured banner.
 fn runtime_banner(inst: &instances::Instance) -> String {
     let when = inst
         .runtime_checked_at
-        .map(|t| {
-            let secs = (crate::util::now_unix() - t).max(0);
-            if secs < 90 {
-                format!(" · checked {secs}s ago")
-            } else {
-                format!(" · checked {}m ago", secs / 60)
-            }
-        })
+        .map(|t| format!(" · checked {}", ago(crate::util::now_unix() - t)))
         .unwrap_or_default();
     let (class, label) = match inst.runtime_status.as_str() {
         "ok" => ("ok", "running".to_string()),
@@ -724,8 +730,11 @@ pub async fn test_server(
     let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
         return error_page("server not found");
     };
-    let (status, detail) = probe_instance(&state, &user.id, &inst).await;
+    let (status, detail, snapshot) = probe_instance(&state, &user.id, &inst).await;
     let _ = instances::set_runtime_status(&state.db, &inst.id, status, detail.as_deref()).await;
+    if let Some(snap) = &snapshot {
+        let _ = instances::set_capabilities_snapshot(&state.db, &inst.id, snap).await;
+    }
     if status == "ok" {
         audit_ok("server.test", &user, &headers, &inst.namespace);
     } else {
@@ -741,19 +750,23 @@ async fn probe_instance(
     state: &AppState,
     user_id: &str,
     inst: &instances::Instance,
-) -> (&'static str, Option<String>) {
+) -> (
+    &'static str,
+    Option<String>,
+    Option<instances::CapabilitiesSnapshot>,
+) {
     let mut def = match instances::resolve_def(&state.db, inst).await {
         Ok(d) => d,
-        Err(e) => return ("error", Some(format!("resolve failed: {e:#}"))),
+        Err(e) => return ("error", Some(format!("resolve failed: {e:#}")), None),
     };
     if def.transport == "http" && def.url.as_deref().unwrap_or("").trim().is_empty() {
-        return ("error", Some("no remote URL set".into()));
+        return ("error", Some("no remote URL set".into()), None);
     }
     // Fail closed: resolve the sandbox identity up front (used for both the
     // self-heal rebuild and the probe spawn) rather than ever running as root.
     let sandbox = match state.sandbox_or_fail(user_id).await {
         Ok(s) => s,
-        Err(e) => return ("error", Some(format!("sandbox unavailable: {e:#}"))),
+        Err(e) => return ("error", Some(format!("sandbox unavailable: {e:#}")), None),
     };
     // Git-sourced backends run from their prebuilt virtualenv; rewrite to a
     // direct stdio exec, or report that they need building first.
@@ -764,6 +777,7 @@ async fn probe_instance(
             return (
                 "unbuilt",
                 Some("not built yet; run “Update from repository” first".into()),
+                None,
             );
         }
         // A venv built before the interpreter was relocated cannot exec under
@@ -779,7 +793,7 @@ async fn probe_instance(
             )
             .await
             {
-                return ("error", Some(format!("rebuild failed: {e:#}")));
+                return ("error", Some(format!("rebuild failed: {e:#}")), None);
             }
         }
         match crate::gitsrc::launch_command(&state.config.env_dir, &inst.id, &def) {
@@ -788,17 +802,17 @@ async fn probe_instance(
                 def.command = Some(program);
                 def.args = args;
             }
-            Err(e) => return ("error", Some(format!("git launch failed: {e:#}"))),
+            Err(e) => return ("error", Some(format!("git launch failed: {e:#}")), None),
         }
     }
     let env = match instances::resolved_env(&state.db, &state.secrets, inst).await {
         Ok(e) => e,
-        Err(e) => return ("error", Some(format!("config error: {e:#}"))),
+        Err(e) => return ("error", Some(format!("config error: {e:#}")), None),
     };
     let config_file = match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await
     {
         Ok(c) => c,
-        Err(e) => return ("error", Some(format!("config error: {e:#}"))),
+        Err(e) => return ("error", Some(format!("config error: {e:#}")), None),
     };
     match crate::proxy::backend::Backend::probe(
         &def,
@@ -810,9 +824,302 @@ async fn probe_instance(
     )
     .await
     {
-        Ok(()) => ("ok", None),
-        Err(e) => ("error", Some(format!("failed to start: {e:#}"))),
+        Ok(snap) => ("ok", None, Some(snap)),
+        Err(e) => ("error", Some(format!("failed to start: {e:#}")), None),
     }
+}
+
+/// `/servers/{id}/capabilities` — the Capabilities tab: everything the backend
+/// advertised to MCP clients the last time it was probed, rendered from the
+/// cached snapshot.
+pub async fn server_capabilities(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    Path(id): Path<String>,
+) -> Response {
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+        return error_page("server not found");
+    };
+    let def = match instances::resolve_def(&state.db, &inst).await {
+        Ok(d) => d,
+        Err(e) => return error_page(&e.to_string()),
+    };
+    let snapshot = instances::get_capabilities_snapshot(&state.db, &inst.id)
+        .await
+        .unwrap_or_default();
+
+    let fetched = match &snapshot {
+        Some(s) => format!("Fetched {}", ago(crate::util::now_unix() - s.fetched_at)),
+        None => "Never fetched".to_string(),
+    };
+    let content = match &snapshot {
+        Some(s) => render_snapshot(s, &inst.namespace),
+        None => r#"<p class="muted">No capability snapshot yet. Click Refresh (or Test connection on the Configuration tab) to fetch what this server advertises.</p>"#.to_string(),
+    };
+
+    let body = format!(
+        r#"<header class="row"><h1>{name}</h1><a href="/">← Back</a></header>
+<p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
+{tabs}
+{runtime}
+<div class="row">
+  <p class="muted">{fetched}</p>
+  <form method="post" action="/servers/{id}/capabilities/refresh">{csrf}<button class="ghost inline">Refresh</button></form>
+</div>
+{content}"#,
+        name = esc(&inst.display_name),
+        ns = esc(&inst.namespace),
+        transport = esc(&def.transport),
+        status = if inst.enabled { "enabled" } else { "disabled" },
+        tabs = server_tabs(&inst.id, "capabilities"),
+        runtime = runtime_banner(&inst),
+        fetched = esc(&fetched),
+        id = esc(&inst.id),
+        csrf = csrf,
+        content = content,
+    );
+    page_wide(&inst.display_name, &body).into_response()
+}
+
+/// `POST /servers/{id}/capabilities/refresh` — reconnect to the backend, store
+/// a fresh capabilities snapshot, and return to the Capabilities tab. On
+/// failure the runtime banner shows the error and any stale snapshot stays.
+pub async fn refresh_capabilities(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.capabilities", &user, &headers, &id, "csrf");
+        return forbidden();
+    }
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+        return error_page("server not found");
+    };
+    let (status, detail, snapshot) = probe_instance(&state, &user.id, &inst).await;
+    let _ = instances::set_runtime_status(&state.db, &inst.id, status, detail.as_deref()).await;
+    if let Some(snap) = &snapshot {
+        let _ = instances::set_capabilities_snapshot(&state.db, &inst.id, snap).await;
+    }
+    if status == "ok" {
+        audit_ok("server.capabilities", &user, &headers, &inst.namespace);
+    } else {
+        audit_denied("server.capabilities", &user, &headers, &inst.namespace, status);
+    }
+    Redirect::to(&format!("/servers/{id}/capabilities")).into_response()
+}
+
+/// Truncate a one-line summary at ~`max` characters on a char boundary.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+/// Pretty-print a JSON schema object for an expandable `<pre>` block.
+fn schema_block(label: &str, schema: &serde_json::Map<String, serde_json::Value>) -> String {
+    let json = serde_json::to_string_pretty(schema).unwrap_or_default();
+    format!(
+        r#"<p class="muted">{label}</p><pre class="cmd"><code>{}</code></pre>"#,
+        esc(&json)
+    )
+}
+
+/// Render a cached [`instances::CapabilitiesSnapshot`] as the body of the
+/// Capabilities tab: server summary, instructions, then tools / prompts /
+/// resources with `<details>` expanders.
+fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> String {
+    let caps = &snap.server.capabilities;
+    let mut out = String::new();
+
+    // --- Server summary -----------------------------------------------------
+    let mut badges = String::new();
+    let mut badge = |label: String| {
+        badges.push_str(&format!(r#"<span class="badge">{}</span> "#, esc(&label)));
+    };
+    if let Some(t) = &caps.tools {
+        badge(if t.list_changed == Some(true) { "tools · listChanged".into() } else { "tools".into() });
+    }
+    if let Some(p) = &caps.prompts {
+        badge(if p.list_changed == Some(true) { "prompts · listChanged".into() } else { "prompts".into() });
+    }
+    if let Some(r) = &caps.resources {
+        let mut label = "resources".to_string();
+        if r.subscribe == Some(true) {
+            label.push_str(" · subscribe");
+        }
+        if r.list_changed == Some(true) {
+            label.push_str(" · listChanged");
+        }
+        badge(label);
+    }
+    if caps.logging.is_some() {
+        badge("logging".into());
+    }
+    if caps.completions.is_some() {
+        badge("completions".into());
+    }
+    if caps.experimental.is_some() {
+        badge("experimental".into());
+    }
+    if badges.is_empty() {
+        badges = r#"<span class="muted">none advertised</span>"#.into();
+    }
+
+    let info = &snap.server.server_info;
+    let title_row = match &info.title {
+        Some(t) if !t.is_empty() => format!(
+            "<tr><th>Title</th><td>{}</td></tr>",
+            esc(t)
+        ),
+        _ => String::new(),
+    };
+    out.push_str(&format!(
+        r#"<section>
+<h2>Server</h2>
+<table class="invites"><tbody>
+<tr><th>Name</th><td>{name}</td></tr>
+{title_row}
+<tr><th>Version</th><td>{version}</td></tr>
+<tr><th>Protocol</th><td>{protocol}</td></tr>
+<tr><th>Capabilities</th><td>{badges}</td></tr>
+</tbody></table>
+</section>"#,
+        name = esc(&info.name),
+        title_row = title_row,
+        version = esc(&info.version),
+        protocol = esc(&snap.server.protocol_version.to_string()),
+        badges = badges,
+    ));
+
+    if let Some(instructions) = snap.server.instructions.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!(
+            r#"<section><h2>Instructions</h2><pre class="cmd"><code>{}</code></pre></section>"#,
+            esc(instructions)
+        ));
+    }
+
+    // --- Tools ---------------------------------------------------------------
+    out.push_str(&format!("<section><h2>Tools ({})</h2>", snap.tools.len()));
+    if caps.tools.is_none() {
+        out.push_str(r#"<p class="muted">Not supported by this server.</p>"#);
+    } else if snap.tools.is_empty() {
+        out.push_str(r#"<p class="muted">None advertised.</p>"#);
+    } else {
+        out.push_str(&format!(
+            r#"<p class="muted">Names shown are the server's own; clients see them as <code>{}__&lt;name&gt;</code>.</p>"#,
+            esc(namespace)
+        ));
+        for tool in &snap.tools {
+            let desc = tool.description.as_deref().unwrap_or("");
+            let mut body = String::new();
+            if let Some(title) = tool.title.as_deref().filter(|t| !t.is_empty()) {
+                body.push_str(&format!("<p><strong>{}</strong></p>", esc(title)));
+            }
+            if !desc.is_empty() {
+                body.push_str(&format!("<p>{}</p>", esc(desc)));
+            }
+            body.push_str(&schema_block("Input schema", &tool.input_schema));
+            if let Some(output) = &tool.output_schema {
+                body.push_str(&schema_block("Output schema", output));
+            }
+            out.push_str(&format!(
+                r#"<details class="tool"><summary><code>{name}</code> <span class="muted">{summary}</span></summary>{body}</details>"#,
+                name = esc(&tool.name),
+                summary = esc(&truncate_chars(desc, 120)),
+                body = body,
+            ));
+        }
+    }
+    out.push_str("</section>");
+
+    // --- Prompts ---------------------------------------------------------------
+    out.push_str(&format!("<section><h2>Prompts ({})</h2>", snap.prompts.len()));
+    if caps.prompts.is_none() {
+        out.push_str(r#"<p class="muted">Not supported by this server.</p>"#);
+    } else if snap.prompts.is_empty() {
+        out.push_str(r#"<p class="muted">None advertised.</p>"#);
+    } else {
+        for prompt in &snap.prompts {
+            let desc = prompt.description.as_deref().unwrap_or("");
+            let mut body = String::new();
+            if !desc.is_empty() {
+                body.push_str(&format!("<p>{}</p>", esc(desc)));
+            }
+            if let Some(args) = prompt.arguments.as_deref().filter(|a| !a.is_empty()) {
+                body.push_str(r#"<p class="muted">Arguments</p><ul>"#);
+                for arg in args {
+                    let required = if arg.required == Some(true) { " (required)" } else { "" };
+                    let arg_desc = arg
+                        .description
+                        .as_deref()
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!(r#" — <span class="muted">{}</span>"#, esc(d)))
+                        .unwrap_or_default();
+                    body.push_str(&format!(
+                        "<li><code>{}</code>{}{}</li>",
+                        esc(&arg.name),
+                        required,
+                        arg_desc
+                    ));
+                }
+                body.push_str("</ul>");
+            }
+            out.push_str(&format!(
+                r#"<details class="tool"><summary><code>{name}</code> <span class="muted">{summary}</span></summary>{body}</details>"#,
+                name = esc(&prompt.name),
+                summary = esc(&truncate_chars(desc, 120)),
+                body = body,
+            ));
+        }
+    }
+    out.push_str("</section>");
+
+    // --- Resources ---------------------------------------------------------------
+    out.push_str(&format!("<section><h2>Resources ({})</h2>", snap.resources.len()));
+    if caps.resources.is_none() {
+        out.push_str(r#"<p class="muted">Not supported by this server.</p>"#);
+    } else if snap.resources.is_empty() {
+        out.push_str(r#"<p class="muted">None advertised.</p>"#);
+    } else {
+        out.push_str(r#"<table class="invites"><thead><tr><th>URI</th><th>Name</th><th>MIME type</th></tr></thead><tbody>"#);
+        for r in &snap.resources {
+            out.push_str(&format!(
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                esc(&r.uri),
+                esc(&r.name),
+                esc(r.mime_type.as_deref().unwrap_or("—")),
+            ));
+        }
+        out.push_str("</tbody></table>");
+    }
+    if !snap.resource_templates.is_empty() {
+        out.push_str(&format!(
+            "<h2>Resource templates ({})</h2>",
+            snap.resource_templates.len()
+        ));
+        out.push_str(r#"<table class="invites"><thead><tr><th>URI template</th><th>Name</th><th>MIME type</th></tr></thead><tbody>"#);
+        for t in &snap.resource_templates {
+            out.push_str(&format!(
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                esc(&t.uri_template),
+                esc(&t.name),
+                esc(t.mime_type.as_deref().unwrap_or("—")),
+            ));
+        }
+        out.push_str("</tbody></table>");
+    }
+    out.push_str("</section>");
+
+    out
 }
 
 fn error_page(msg: &str) -> Response {
@@ -1903,4 +2210,52 @@ pub async fn register_page(
 /// `/logout` GET fallback (the POST handler lives in auth::webauthn::logout).
 pub async fn logout_get(State(_state): State<AppState>) -> Redirect {
     Redirect::to("/login")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_snapshot;
+    use crate::instances::CapabilitiesSnapshot;
+
+    /// The capabilities page shows the server identity, marks unsupported
+    /// sections as such, renders tools with their schemas, and escapes
+    /// backend-supplied text.
+    #[test]
+    fn snapshot_renders_sections_and_escapes() {
+        let mut server = rmcp::model::InitializeResult::default();
+        server.server_info.name = "demo <server>".into();
+        server.server_info.version = "1.2.3".into();
+        server.instructions = Some("Use the tools wisely.".into());
+        server.capabilities = rmcp::model::ServerCapabilities {
+            tools: Some(rmcp::model::ToolsCapability { list_changed: None }),
+            ..Default::default()
+        };
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::Value::String("object".into()));
+        let snap = CapabilitiesSnapshot {
+            fetched_at: 0,
+            server,
+            tools: vec![rmcp::model::Tool::new(
+                "search",
+                "Find <things> fast",
+                std::sync::Arc::new(schema),
+            )],
+            prompts: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+        };
+
+        let html = render_snapshot(&snap, "demo");
+        assert!(html.contains("demo &lt;server&gt;"), "server name escaped: {html}");
+        assert!(html.contains("1.2.3"));
+        assert!(html.contains("Use the tools wisely."));
+        assert!(html.contains("Tools (1)"));
+        assert!(html.contains("<code>search</code>"));
+        assert!(html.contains("Find &lt;things&gt; fast"));
+        assert!(html.contains("&quot;type&quot;: &quot;object&quot;"), "schema rendered: {html}");
+        assert!(html.contains("<code>demo__&lt;name&gt;</code>"), "namespacing note present");
+        // Prompts/resources capabilities are absent → marked unsupported.
+        assert!(html.contains("Prompts (0)"));
+        assert!(html.contains("Not supported by this server."));
+    }
 }

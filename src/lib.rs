@@ -149,6 +149,8 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/new", get(web::new_server))
         .route("/servers/create", post(web::create_server))
         .route("/servers/{id}", get(web::server_detail))
+        .route("/servers/{id}/capabilities", get(web::server_capabilities))
+        .route("/servers/{id}/capabilities/refresh", post(web::refresh_capabilities))
         .route("/servers/{id}/config", post(web::save_config))
         .route("/servers/{id}/test", post(web::test_server))
         .route("/servers/{id}/enable", post(web::enable_server))
