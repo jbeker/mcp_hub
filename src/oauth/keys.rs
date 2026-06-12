@@ -47,23 +47,39 @@ impl Signer {
     /// database compromise alone cannot forge tokens.
     pub async fn load_or_create(pool: &SqlitePool, secrets: &SecretBox, issuer: &str) -> Result<Self> {
         if let Some((kid, stored)) = load_active(pool).await? {
-            let pem = unseal_pem(secrets, &stored)?;
-            Self::from_pem(&kid, issuer, &pem)
-        } else {
-            let (kid, pem) = generate_pem()?;
-            let stored = seal_pem(secrets, &pem)?;
-            sqlx::query(
-                "INSERT INTO oauth_signing_keys (kid, private_pkcs8_b64, created_at, active) VALUES (?, ?, ?, 1)",
-            )
-            .bind(&kid)
-            .bind(&stored)
-            .bind(now_unix())
-            .execute(pool)
-            .await
-            .context("persisting signing key")?;
-            tracing::info!(kid = %kid, "generated new ES256 signing key");
-            Self::from_pem(&kid, issuer, &pem)
+            match unseal_pem(secrets, &stored).and_then(|pem| Self::from_pem(&kid, issuer, &pem)) {
+                Ok(signer) => return Ok(signer),
+                Err(e) => {
+                    // The stored key can't be decrypted (e.g. sealed by a build
+                    // whose key derivation this binary doesn't share). Rather
+                    // than refuse to start, rotate to a fresh key. Outstanding
+                    // access tokens and OAuth sessions signed by the old key
+                    // stop verifying, so clients re-authorize once.
+                    tracing::warn!(
+                        kid = %kid, error = %e,
+                        "active signing key could not be decrypted; rotating to a new key \
+                         (existing OAuth tokens/sessions are invalidated)"
+                    );
+                    let _ = sqlx::query("UPDATE oauth_signing_keys SET active = 0 WHERE kid = ?")
+                        .bind(&kid)
+                        .execute(pool)
+                        .await;
+                }
+            }
         }
+        let (kid, pem) = generate_pem()?;
+        let stored = seal_pem(secrets, &pem)?;
+        sqlx::query(
+            "INSERT INTO oauth_signing_keys (kid, private_pkcs8_b64, created_at, active) VALUES (?, ?, ?, 1)",
+        )
+        .bind(&kid)
+        .bind(&stored)
+        .bind(now_unix())
+        .execute(pool)
+        .await
+        .context("persisting signing key")?;
+        tracing::info!(kid = %kid, "generated new ES256 signing key");
+        Self::from_pem(&kid, issuer, &pem)
     }
 
     fn from_pem(kid: &str, issuer: &str, pem: &str) -> Result<Self> {

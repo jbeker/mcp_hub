@@ -48,28 +48,68 @@ def hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
 
 
 def candidates(master: bytes) -> dict[str, bytes]:
-    return {
-        "raw master key (legacy, pre-HKDF)": master,
+    import hashlib as h
+
+    ctx_nul = CONTEXT + b"\x00"
+    out: dict[str, bytes] = {
+        # No derivation.
+        "raw master key": master,
+        # Full HKDF (extract+expand), every salt/info placement.
         'HKDF(salt="", ikm=master, info=CONTEXT)': hkdf_sha256(master, b"", CONTEXT),
-        "HKDF(salt=CONTEXT, ikm=master, info=\"\")": hkdf_sha256(master, CONTEXT, b""),
-        "HKDF-Expand-only(prk=master, info=CONTEXT)": hkdf_expand(master, CONTEXT),
+        'HKDF(salt=CONTEXT, ikm=master, info="")': hkdf_sha256(master, CONTEXT, b""),
         "HKDF(salt=CONTEXT, ikm=master, info=CONTEXT)": hkdf_sha256(master, CONTEXT, CONTEXT),
+        "HKDF-Expand-only(prk=master, info=CONTEXT)": hkdf_expand(master, CONTEXT),
+        # Plain single HMAC-SHA256 (no HKDF counter byte) — both key/msg orders,
+        # with and without a trailing NUL on the context.
+        "HMAC(key=master, msg=CONTEXT)": hmac.new(master, CONTEXT, hashlib.sha256).digest(),
+        "HMAC(key=master, msg=CONTEXT+NUL)": hmac.new(master, ctx_nul, hashlib.sha256).digest(),
+        "HMAC(key=CONTEXT, msg=master)": hmac.new(CONTEXT, master, hashlib.sha256).digest(),
+        "HMAC(key=CONTEXT+NUL, msg=master)": hmac.new(ctx_nul, master, hashlib.sha256).digest(),
+        # Plain SHA-256 of concatenations.
+        "SHA256(CONTEXT || master)": h.sha256(CONTEXT + master).digest(),
+        "SHA256(master || CONTEXT)": h.sha256(master + CONTEXT).digest(),
+        "SHA256(CONTEXT+NUL || master)": h.sha256(ctx_nul + master).digest(),
+        "SHA256(master || CONTEXT+NUL)": h.sha256(master + ctx_nul).digest(),
+        "SHA256(master)": h.sha256(master).digest(),
+    }
+    return out
+
+
+# Associated-data candidates tried for every key (the seal may bind the row's
+# identity into the AEAD tag). Filled per-row in check_row.
+def aad_variants(instance_id: str, key_name: str) -> dict[str, bytes]:
+    return {
+        "": b"",
+        "key_name": key_name.encode(),
+        "instance_id": instance_id.encode(),
+        "instance_id/key_name": f"{instance_id}/{key_name}".encode(),
+        "CONTEXT": CONTEXT,
     }
 
 
-def try_open(key: bytes, nonce: bytes, ciphertext: bytes) -> bool:
+def try_open(key: bytes, aad: bytes, nonce: bytes, ciphertext: bytes) -> bool:
     try:
-        crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, b"", nonce, key)
+        crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, aad, nonce, key)
         return True
     except Exception:
         return False
 
 
-def check_row(label: str, nonce: bytes, ciphertext: bytes, keys: dict[str, bytes]) -> list[str]:
+def check_row(
+    label: str,
+    nonce: bytes,
+    ciphertext: bytes,
+    keys: dict[str, bytes],
+    aads: dict[str, bytes],
+) -> list[str]:
     if len(nonce) != NONCE_LEN:
         print(f"  {label}: SKIP (nonce is {len(nonce)} bytes, expected {NONCE_LEN})")
         return []
-    hits = [name for name, key in keys.items() if try_open(key, nonce, ciphertext)]
+    hits = []
+    for kname, key in keys.items():
+        for aname, aad in aads.items():
+            if try_open(key, aad, nonce, ciphertext):
+                hits.append(f"{kname}" + (f" [aad={aname}]" if aad else ""))
     print(f"  {label}: {', '.join(hits) if hits else 'NO candidate opens this row'}")
     return hits
 
@@ -96,7 +136,7 @@ def main() -> int:
     if not rows:
         print("  (none)")
     for inst, key_name, nonce, ct in rows:
-        all_hits.update(check_row(f"{inst}/{key_name}", nonce, ct, keys))
+        all_hits.update(check_row(f"{inst}/{key_name}", nonce, ct, keys, aad_variants(inst, key_name)))
 
     print("instance_config_files:")
     rows = db.execute(
@@ -105,7 +145,7 @@ def main() -> int:
     if not rows:
         print("  (none)")
     for inst, nonce, ct in rows:
-        all_hits.update(check_row(inst, nonce, ct, keys))
+        all_hits.update(check_row(inst, nonce, ct, keys, aad_variants(inst, "")))
 
     print("oauth_signing_keys:")
     rows = db.execute(
@@ -118,20 +158,16 @@ def main() -> int:
             print(f"  {kid}: legacy plaintext PEM (not sealed)")
             continue
         blob = base64.b64decode(stored)
-        all_hits.update(check_row(kid, blob[:NONCE_LEN], blob[NONCE_LEN:], keys))
+        all_hits.update(check_row(kid, blob[:NONCE_LEN], blob[NONCE_LEN:], keys, aad_variants(kid, "")))
 
     print()
-    derived = sorted(h for h in all_hits if not h.startswith("raw "))
-    if len(derived) == 1:
-        print(f"RESULT: derived construction is -> {derived[0]}")
-    elif not derived:
-        print("RESULT: only the raw master key matched (or nothing did) — "
-              "the DB may not be in the HKDF format, or the key is wrong.")
+    if len(all_hits) == 1:
+        print(f"RESULT: construction is -> {next(iter(all_hits))}")
+    elif not all_hits:
+        print("RESULT: NOTHING matched. Either HUB_MASTER_KEY is not the key that "
+              "sealed this DB, or the construction is none of those tried.")
     else:
-        print(f"RESULT: ambiguous, multiple constructions matched: {derived}")
-    if any(h.startswith("raw ") for h in all_hits):
-        print("NOTE: some rows still use the raw master key — the reimplementation "
-              "must keep raw-key fallback + re-seal-on-read.")
+        print(f"RESULT: multiple matched (pick the non-raw one if present): {sorted(all_hits)}")
     return 0
 
 

@@ -622,8 +622,18 @@ pub async fn env_for_edit(
             .await?;
     let mut out = BTreeMap::new();
     for (key, nonce, ciphertext) in rows {
-        let plain = secrets.open(&Sealed { nonce, ciphertext })?;
-        out.insert(key, String::from_utf8(plain).context("env value was not UTF-8")?);
+        match secrets.open(&Sealed { nonce, ciphertext }) {
+            Ok(plain) => {
+                out.insert(key, String::from_utf8(plain).context("env value was not UTF-8")?);
+            }
+            // A row sealed under a key/format this binary can't read is omitted
+            // so the edit form still loads; the user simply re-enters its value.
+            Err(_) => tracing::warn!(
+                instance = %instance_id,
+                key = %key,
+                "secret could not be decrypted; omitting from the edit form (needs re-entry)"
+            ),
+        }
     }
     Ok(out)
 }
@@ -706,10 +716,26 @@ pub async fn resolved_env(
             .bind(&inst.id)
             .fetch_all(pool)
             .await?;
+    let mut undecryptable = Vec::new();
     for (key, nonce, ciphertext) in rows {
-        let plain = secrets.open(&Sealed { nonce, ciphertext })?;
-        let value = String::from_utf8(plain).context("secret was not valid UTF-8")?;
-        env.insert(key, value);
+        match secrets.open(&Sealed { nonce, ciphertext }) {
+            Ok(plain) => {
+                let value = String::from_utf8(plain).context("secret was not valid UTF-8")?;
+                env.insert(key, value);
+            }
+            Err(_) => undecryptable.push(key),
+        }
+    }
+    // Fail with an actionable message rather than launching a backend that is
+    // missing its credentials (which would surface as a confusing auth error
+    // from the backend itself).
+    if !undecryptable.is_empty() {
+        undecryptable.sort();
+        bail!(
+            "secret(s) could not be decrypted — re-enter them in this server's \
+             configuration: {}",
+            undecryptable.join(", ")
+        );
     }
     Ok(env)
 }
@@ -758,7 +784,9 @@ pub async fn config_file_for_edit(
     secrets: &SecretBox,
     instance_id: &str,
 ) -> Result<Option<String>> {
-    decrypt_config_file(pool, secrets, instance_id).await
+    // On the edit form, an undecryptable file reads as "none" so the page loads
+    // and the user can paste a fresh one.
+    decrypt_config_file(pool, secrets, instance_id, true).await
 }
 
 /// Decrypt an instance's config file for launch, or `None` if unset. Plaintext
@@ -768,13 +796,16 @@ pub async fn resolved_config_file(
     secrets: &SecretBox,
     instance_id: &str,
 ) -> Result<Option<String>> {
-    decrypt_config_file(pool, secrets, instance_id).await
+    // At launch, an undecryptable file is a hard error with an actionable
+    // message rather than silently launching without it.
+    decrypt_config_file(pool, secrets, instance_id, false).await
 }
 
 async fn decrypt_config_file(
     pool: &SqlitePool,
     secrets: &SecretBox,
     instance_id: &str,
+    tolerate_undecryptable: bool,
 ) -> Result<Option<String>> {
     let row: Option<(Vec<u8>, Vec<u8>)> =
         sqlx::query_as("SELECT nonce, ciphertext FROM instance_config_files WHERE instance_id = ?")
@@ -784,10 +815,22 @@ async fn decrypt_config_file(
     let Some((nonce, ciphertext)) = row else {
         return Ok(None);
     };
-    let plain = secrets.open(&Sealed { nonce, ciphertext })?;
-    Ok(Some(
-        String::from_utf8(plain).context("config file was not valid UTF-8")?,
-    ))
+    match secrets.open(&Sealed { nonce, ciphertext }) {
+        Ok(plain) => Ok(Some(
+            String::from_utf8(plain).context("config file was not valid UTF-8")?,
+        )),
+        Err(_) if tolerate_undecryptable => {
+            tracing::warn!(
+                instance = %instance_id,
+                "config file could not be decrypted; omitting from the edit form (needs re-entry)"
+            );
+            Ok(None)
+        }
+        Err(_) => bail!(
+            "the attached config file could not be decrypted — re-save it in this \
+             server's configuration"
+        ),
+    }
 }
 
 #[cfg(test)]
