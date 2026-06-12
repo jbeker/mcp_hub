@@ -24,6 +24,16 @@ if [[ -n "$(git status --porcelain)" ]]; then
          "the image will not match commit $TAG" >&2
 fi
 
+# Refuse to ship a commit that exists only on this machine. A pushed image
+# whose source was never pushed becomes the sole copy of deployed code — which
+# is exactly how the 1e90964 build's source was lost. Override with FORCE=1.
+if ! git branch -r --contains HEAD 2>/dev/null | grep -q .; then
+    echo "error: HEAD ($TAG) is not on any remote branch — push it first so the" \
+         "image's source is recoverable. Set FORCE=1 to override." >&2
+    [[ "${FORCE:-}" == "1" ]] || exit 1
+    echo "FORCE=1 set; building from an unpushed commit anyway." >&2
+fi
+
 # buildx handles cross-building (e.g. an arm64 Mac targeting linux/amd64)
 # and pushes in the same step.
 docker buildx build \
