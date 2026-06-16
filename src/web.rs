@@ -136,7 +136,7 @@ pub async fn dashboard(
         badge = admin_badge,
         rows = rows,
         admin_section = if user.is_admin {
-            r#"<section><div class="row"><h2>Administration</h2><span><a href="/invites">Invites</a> · <a href="/users">Users</a></span></div></section>"#
+            r#"<section><div class="row"><h2>Administration</h2><span><a href="/invites">Invites</a> · <a href="/users">Users</a> · <a href="/stats">Stats</a></span></div></section>"#
         } else {
             ""
         },
@@ -2037,6 +2037,131 @@ pub async fn users_page(
         rows = rows,
     );
     page_wide("Users", &body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Runtime statistics (admin)
+// ---------------------------------------------------------------------------
+
+/// `/stats` — admin view: live backend-slot usage, active session count,
+/// configured limits, and each backend's last-known runtime status. The slot
+/// gauge and session count are live; the instance table is a snapshot.
+pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser) -> Response {
+    if !admin.is_admin {
+        return admin_forbidden();
+    }
+    let s = crate::stats::gather(&state).await;
+
+    // Headline: how close the global backend pool is to its ceiling, and how
+    // many MCP sessions are live (the signal behind "global backend capacity
+    // reached" — each session holds its own copy of a user's backends).
+    let pct = (s.slots.used * 100).checked_div(s.slots.total).unwrap_or(0);
+    let slots_class = match pct {
+        p if p >= 90 => "danger",
+        p if p >= 75 => "warn",
+        _ => "ok",
+    };
+    let headline = format!(
+        r#"<div class="row">
+  <div class="status status-{slots_class}">Backend slots: <strong>{used} / {total}</strong> ({pct}% in use)</div>
+  <div class="status status-ok">Active sessions: <strong>{sessions}</strong></div>
+</div>"#,
+        slots_class = slots_class,
+        used = s.slots.used,
+        total = s.slots.total,
+        pct = pct,
+        sessions = s.active_sessions,
+    );
+
+    // Configured ceilings, with their env-var names so the admin knows the knob.
+    let limits = format!(
+        r#"<table class="invites"><thead><tr><th>Limit</th><th>Value</th><th>Env var</th></tr></thead><tbody>
+<tr><td>Max backends (global)</td><td>{global}</td><td><code>HUB_MAX_BACKENDS_GLOBAL</code></td></tr>
+<tr><td>Max backends per user</td><td>{per_user}</td><td><code>HUB_MAX_BACKENDS_PER_USER</code></td></tr>
+<tr><td>Backend idle timeout</td><td>{idle}s</td><td><code>HUB_BACKEND_IDLE_SECS</code></td></tr>
+<tr><td>Per-call timeout</td><td>{call}</td><td><code>HUB_BACKEND_CALL_TIMEOUT_SECS</code></td></tr>
+<tr><td>Max response size</td><td>{resp}</td><td><code>HUB_MAX_RESPONSE_MB</code></td></tr>
+</tbody></table>"#,
+        global = s.limits.max_backends_global,
+        per_user = s.limits.max_backends_per_user,
+        idle = s.limits.backend_idle_secs,
+        call = if s.limits.backend_call_timeout_secs == 0 {
+            "off".to_string()
+        } else {
+            format!("{}s", s.limits.backend_call_timeout_secs)
+        },
+        resp = if s.limits.max_response_mb == 0 {
+            "uncapped".to_string()
+        } else {
+            format!("{} MB", s.limits.max_response_mb)
+        },
+    );
+
+    // Aggregate counts across every user's instances.
+    let totals = format!(
+        r#"<p class="muted">{users} user(s) · {insts} server(s) ({enabled} enabled) · running {running} · error {error} · not started {skipped} · not built {unbuilt} · unknown {unknown}</p>"#,
+        users = s.totals.users,
+        insts = s.totals.instances,
+        enabled = s.totals.enabled_instances,
+        running = s.totals.running,
+        error = s.totals.error,
+        skipped = s.totals.skipped,
+        unbuilt = s.totals.unbuilt,
+        unknown = s.totals.unknown,
+    );
+
+    // Per-instance status table.
+    let now = crate::util::now_unix();
+    let mut rows = String::new();
+    rows.push_str(
+        "<table class=\"invites\"><thead><tr><th>Owner</th><th>Server</th><th>Status</th><th>Detail</th><th>Checked</th></tr></thead><tbody>",
+    );
+    if s.instances.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="muted">No servers configured.</td></tr>"#);
+    } else {
+        for i in &s.instances {
+            let (class, label) = match i.runtime_status.as_str() {
+                "ok" => ("ok", "running"),
+                "error" => ("danger", "error"),
+                "skipped" => ("warn", "not started"),
+                "unbuilt" => ("warn", "not built"),
+                _ => ("muted", "unknown"),
+            };
+            // Detail can carry captured stderr; collapse to a single line here.
+            let detail = match &i.runtime_detail {
+                Some(d) if !d.is_empty() => esc(d.lines().next().unwrap_or("")),
+                _ => String::new(),
+            };
+            let checked = i
+                .runtime_checked_at
+                .map(|t| ago(now - t))
+                .unwrap_or_else(|| "—".to_string());
+            rows.push_str(&format!(
+                r#"<tr><td><code>{owner}</code></td><td><code>{ns}</code> · {name}</td><td><span class="status status-{class}">{label}</span></td><td class="muted">{detail}</td><td class="muted">{checked}</td></tr>"#,
+                owner = esc(&i.owner),
+                ns = esc(&i.namespace),
+                name = esc(&i.display_name),
+                class = class,
+                label = label,
+                detail = detail,
+                checked = checked,
+            ));
+        }
+    }
+    rows.push_str("</tbody></table>");
+
+    let body = format!(
+        r#"<header class="row"><h1>Runtime stats</h1><a href="/">← Back</a></header>
+<p class="muted">Backend slots and active sessions are live; the server table shows each backend's last-known status. Reload to refresh.</p>
+{headline}
+<section><h2>Limits</h2>{limits}</section>
+<section><h2>Servers</h2>{totals}{rows}</section>"#,
+        headline = headline,
+        limits = limits,
+        totals = totals,
+        rows = rows,
+    );
+    page_wide("Runtime stats", &body).into_response()
 }
 
 #[derive(Deserialize)]

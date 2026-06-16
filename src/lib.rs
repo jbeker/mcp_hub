@@ -12,6 +12,7 @@ pub mod invites;
 pub mod oauth;
 pub mod proxy;
 pub mod sandbox;
+pub mod stats;
 pub mod tokens;
 pub mod users;
 pub mod util;
@@ -24,6 +25,7 @@ use axum::extract::FromRef;
 use axum::routing::{get, post};
 use axum::Router;
 use axum_extra::extract::cookie::Key;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 use webauthn_rs::Webauthn;
@@ -49,6 +51,9 @@ pub struct AppState {
     pub backend_slots: Arc<Semaphore>,
     /// Serializes git-source builds (they are slow and disk-bound).
     pub build_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The `/mcp` endpoint's session store. Shared with the proxy router so the
+    /// admin stats page can read the live active-session count.
+    pub session_manager: Arc<LocalSessionManager>,
 }
 
 impl AppState {
@@ -76,6 +81,7 @@ impl AppState {
             cookie_key,
             backend_slots,
             build_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_manager: Arc::new(LocalSessionManager::default()),
             config: Arc::new(config),
             db,
         })
@@ -142,6 +148,7 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account/tokens/access", post(web::update_token_access))
         // User administration (admin)
         .route("/users", get(web::users_page))
+        .route("/stats", get(web::stats_page))
         .route("/users/disable", post(web::disable_user))
         .route("/users/enable", post(web::enable_user))
         .route("/users/delete", post(web::delete_user))

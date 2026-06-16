@@ -5,14 +5,11 @@ pub mod backend;
 pub mod management;
 pub mod server;
 
-use std::sync::Arc;
-
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{StreamableHttpServerConfig, StreamableHttpService};
 
 use crate::proxy::server::HubProxy;
@@ -51,7 +48,9 @@ impl AuthedUser {
 /// Build the router serving the `/mcp` Streamable HTTP endpoint, gated by an
 /// OAuth bearer-token check.
 pub fn mcp_router(state: AppState) -> Router {
-    let session_manager = Arc::new(LocalSessionManager::default());
+    // Use the shared session manager held in AppState so the admin stats page
+    // can observe the same live session count this router maintains.
+    let session_manager = state.session_manager.clone();
     let config = StreamableHttpServerConfig::default();
 
     let factory_state = state.clone();

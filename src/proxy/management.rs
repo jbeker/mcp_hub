@@ -156,6 +156,12 @@ pub fn tools(admin: bool) -> Vec<Tool> {
     ];
     if admin {
         t.push(tool(
+            "hub__runtime_stats",
+            "(admin) Show live backend-slot usage, active MCP session count, the \
+             configured limits, and each backend's last-known runtime status.",
+            schema(json!({}), &[]),
+        ));
+        t.push(tool(
             "hub__list_users",
             "(admin) List all hub users.",
             schema(json!({}), &[]),
@@ -272,6 +278,10 @@ async fn run(
         "remove" => remove(state, user_id, args).await,
         "list_tokens" => list_tokens(state, user_id).await,
         "revoke_token" => revoke_token(state, user_id, args).await,
+        "runtime_stats" => {
+            require_admin(admin)?;
+            runtime_stats(state).await
+        }
         "list_users" => {
             require_admin(admin)?;
             list_users(state).await
@@ -753,6 +763,14 @@ async fn revoke_token(
         .await
         .map_err(internal)?;
     ok(json!({ "revoked": revoked }))
+}
+
+/// `hub__runtime_stats` — live backend-slot usage, active session count, the
+/// configured limits, and each backend's last-known runtime status.
+async fn runtime_stats(state: &AppState) -> Result<CallToolResult, McpError> {
+    let stats = crate::stats::gather(state).await;
+    let value = serde_json::to_value(&stats).map_err(|e| internal(anyhow::anyhow!(e)))?;
+    ok(value)
 }
 
 async fn list_users(state: &AppState) -> Result<CallToolResult, McpError> {

@@ -265,6 +265,14 @@ pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> Result<Vec<Insta
     Ok(rows.into_iter().map(Row::into_instance).collect())
 }
 
+/// Every instance across all users, for the admin runtime-stats view.
+pub async fn list_all(pool: &SqlitePool) -> Result<Vec<Instance>> {
+    let rows: Vec<Row> = sqlx::query_as(&format!("{SELECT} ORDER BY user_id, namespace"))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(Row::into_instance).collect())
+}
+
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Instance>> {
     let row: Option<Row> = sqlx::query_as(&format!("{SELECT} WHERE id = ?"))
         .bind(id)
