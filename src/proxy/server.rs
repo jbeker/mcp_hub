@@ -8,7 +8,7 @@ use rmcp::model::{
     ListToolsResult, PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam,
     ReadResourceResult, ServerCapabilities, ServerInfo,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -44,6 +44,11 @@ struct Bound {
     handle: String,
     admin: bool,
     backends: Vec<Backend>,
+    /// instance_id -> reload epoch this session has acted on, for every enabled
+    /// instance seen at bind time (running or not). Drives surgical restarts: a
+    /// Restart click bumps the shared epoch, and `reconcile_reloads` respawns any
+    /// instance whose shared epoch has moved past the one recorded here.
+    applied_epochs: HashMap<String, u64>,
 }
 
 impl HubProxy {
@@ -78,55 +83,128 @@ impl HubProxy {
         }
     }
 
-    /// Ensure backends are connected for the request's user (lazy, once).
+    /// Ensure backends are connected for the request's user (lazy, once), then
+    /// reconcile any backend whose reload epoch advanced since this session last
+    /// acted on it (the web Restart button). Both run under the same `bound`
+    /// guard, so a request always observes a consistent backend set.
     async fn ensure_bound(&self, ctx: &RequestContext<RoleServer>) -> Result<(), McpError> {
         let authed = Self::authed(ctx)?;
         let mut guard = self.bound.lock().await;
-        if guard.as_ref().is_some_and(|b| b.user_id == authed.user_id) {
-            return Ok(());
-        }
-        if let Some(old) = guard.take() {
-            for b in old.backends {
-                b.shutdown().await;
+        if guard.as_ref().is_none_or(|b| b.user_id != authed.user_id) {
+            if let Some(old) = guard.take() {
+                for b in old.backends {
+                    b.shutdown().await;
+                }
             }
+            let (backends, applied_epochs) = self.build_backends(&authed.user_id).await;
+            // Resolve the handle once so per-call audit events can name the actor.
+            let handle = crate::users::find_by_id(&self.state.db, &authed.user_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.handle)
+                .unwrap_or_default();
+            crate::audit::event("mcp.bind")
+                .actor(&handle)
+                .actor_id(&authed.user_id)
+                .client_id(authed.client_id.as_deref())
+                .request(&authed.request)
+                .object(&backends.len().to_string())
+                .ok();
+            *guard = Some(Bound {
+                user_id: authed.user_id.clone(),
+                handle,
+                admin: authed.admin,
+                backends,
+                applied_epochs,
+            });
         }
-        let backends = self.build_backends(&authed.user_id).await;
-        // Resolve the handle once so per-call audit events can name the actor.
-        let handle = crate::users::find_by_id(&self.state.db, &authed.user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.handle)
-            .unwrap_or_default();
-        crate::audit::event("mcp.bind")
-            .actor(&handle)
-            .actor_id(&authed.user_id)
-            .client_id(authed.client_id.as_deref())
-            .request(&authed.request)
-            .object(&backends.len().to_string())
-            .ok();
-        *guard = Some(Bound {
-            user_id: authed.user_id,
-            handle,
-            admin: authed.admin,
-            backends,
-        });
+        self.reconcile_reloads(guard.as_mut().expect("bound above"), &authed.user_id)
+            .await;
         Ok(())
     }
 
+    /// Respawn any of this session's backends whose shared reload epoch has moved
+    /// past the epoch recorded at bind/last-reconcile time. Only instances whose
+    /// epoch actually changed do any work — the common path is a cheap compare
+    /// with no DB or process activity. A surgical restart: untouched backends keep
+    /// their live connections.
+    async fn reconcile_reloads(&self, bound: &mut Bound, user_id: &str) {
+        let stale: Vec<String> = bound
+            .applied_epochs
+            .iter()
+            .filter(|(id, applied)| self.state.reload_epoch(id) != **applied)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        // A restart relaunches a stdio subprocess; resolve the sandbox identity
+        // the same fail-closed way `build_backends` does.
+        let sandbox = match self.state.sandbox_or_fail(user_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "restart skipped: sandbox unavailable");
+                return;
+            }
+        };
+        for id in stale {
+            let cur = self.state.reload_epoch(&id);
+            // Drop the running instance (if any), freeing its global slot first.
+            if let Some(pos) = bound.backends.iter().position(|b| b.instance_id == id) {
+                bound.backends.remove(pos).shutdown().await;
+            }
+            // Re-read from the DB so the relaunch picks up the latest def/config.
+            // Gone or now-disabled instances stay down and stop being tracked.
+            let inst = match instances::get_owned(&self.state.db, &id, user_id).await {
+                Ok(Some(i)) if i.enabled => i,
+                Ok(_) => {
+                    bound.applied_epochs.remove(&id);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(instance = %id, error = %e, "restart skipped: instance lookup failed");
+                    continue;
+                }
+            };
+            let permit = match self.state.backend_slots.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!("restart skipped: global backend capacity reached");
+                    self.mark_status(&inst, "skipped", Some("global backend capacity reached")).await;
+                    bound.applied_epochs.insert(id, cur);
+                    continue;
+                }
+            };
+            if let Some(b) = self.spawn_one(&inst, sandbox.as_ref(), permit).await {
+                bound.backends.push(b);
+            }
+            bound.applied_epochs.insert(id, cur);
+        }
+    }
+
     /// Connect every enabled instance; a failing backend is logged and skipped
-    /// so it can't take down the whole session.
-    async fn build_backends(&self, user_id: &str) -> Vec<Backend> {
+    /// so it can't take down the whole session. Returns the live backends plus
+    /// the reload epoch recorded for every enabled instance seen (running or
+    /// not), so [`reconcile_reloads`] can later restart just the ones that change.
+    async fn build_backends(&self, user_id: &str) -> (Vec<Backend>, HashMap<String, u64>) {
         let mut out = Vec::new();
+        let mut applied_epochs = HashMap::new();
         let instances = match instances::list_for_user(&self.state.db, user_id).await {
             Ok(i) => i,
             Err(e) => {
                 tracing::error!(error = %e, "listing instances failed");
-                return out;
+                return (out, applied_epochs);
             }
         };
         let per_user_cap = self.state.config.limits.max_backends_per_user;
         let enabled: Vec<_> = instances.into_iter().filter(|i| i.enabled).collect();
+        // Track the reload epoch of every enabled instance up front, so a later
+        // Restart can (re)start one that failed to spawn here, not just recycle a
+        // running one.
+        for inst in &enabled {
+            applied_epochs.insert(inst.id.clone(), self.state.reload_epoch(&inst.id));
+        }
         // The per-user sandbox identity for this user's stdio subprocesses. Fail
         // closed: if sandboxing is configured but unavailable, start no backends
         // rather than running user commands as root.
@@ -134,7 +212,7 @@ impl HubProxy {
             Ok(s) => s,
             Err(e) => {
                 self.mark_skipped(&enabled, &format!("sandbox unavailable: {e:#}")).await;
-                return out;
+                return (out, applied_epochs);
             }
         };
         for (idx, inst) in enabled.iter().enumerate() {
@@ -152,109 +230,120 @@ impl HubProxy {
                     break;
                 }
             };
-            let mut def = match instances::resolve_def(&self.state.db, inst).await {
-                Ok(d) => d,
-                Err(e) => {
-                    self.mark_status(inst, "error", Some(&format!("resolve failed: {e:#}"))).await;
-                    continue;
-                }
-            };
-            if def.transport == "http" {
-                let url = def.url.as_deref().unwrap_or("").trim();
-                if url.is_empty() {
-                    self.mark_status(inst, "error", Some("no remote URL set")).await;
-                    continue;
-                }
-                // Re-resolve the host at connect time (not just at save) so the
-                // SSRF guard also defeats DNS rebinding.
-                if let Err(e) = instances::check_backend_host(
-                    url,
-                    self.state.config.block_private_backend_ips,
-                ) {
-                    self.mark_status(inst, "error", Some(&format!("{e}"))).await;
-                    continue;
-                }
+            if let Some(b) = self.spawn_one(inst, sandbox.as_ref(), permit).await {
+                out.push(b);
             }
-            // Git-sourced backends run from their prebuilt virtualenv. Rewrite
-            // the def to a direct stdio exec; skip if it has not been built yet.
-            if crate::gitsrc::is_git_source(&def) {
-                let ready = inst.build_status == "ready"
-                    && crate::gitsrc::env_path(&self.state.config.env_dir, &inst.id).exists();
-                // A venv from before the interpreter relocation can't exec under
-                // the sandbox. Don't launch it (that yields a cryptic EACCES);
-                // point the user at the one-click heal instead. Rebuilding here
-                // would block every MCP connection on a slow build.
-                if ready && crate::gitsrc::venv_is_stale(&self.state.config.env_dir, inst, &def) {
-                    self.mark_status(
-                        inst,
-                        "unbuilt",
-                        Some("needs rebuild after upgrade — open its page and click “Test connection”"),
-                    )
-                    .await;
-                    continue;
-                }
-                if ready {
-                    match crate::gitsrc::launch_command(&self.state.config.env_dir, &inst.id, &def) {
-                        Ok((program, args)) => {
-                            def.transport = "stdio".into();
-                            def.command = Some(program);
-                            def.args = args;
-                        }
-                        Err(e) => {
-                            self.mark_status(inst, "error", Some(&format!("git launch failed: {e:#}"))).await;
-                            continue;
-                        }
-                    }
-                } else {
-                    self.mark_status(inst, "unbuilt", Some("not built yet; run hub__update_server")).await;
-                    continue;
-                }
+        }
+        (out, applied_epochs)
+    }
+
+    /// Resolve, launch, and initialize a single backend, recording its connection
+    /// outcome. Returns the live [`Backend`] on success, or `None` (with the
+    /// instance's status marked) on any failure — so a bad backend can't take
+    /// down the session. Shared by the initial bind and by restarts.
+    async fn spawn_one(
+        &self,
+        inst: &instances::Instance,
+        sandbox: Option<&crate::sandbox::Sandbox>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Option<Backend> {
+        let mut def = match instances::resolve_def(&self.state.db, inst).await {
+            Ok(d) => d,
+            Err(e) => {
+                self.mark_status(inst, "error", Some(&format!("resolve failed: {e:#}"))).await;
+                return None;
             }
-            let env = match instances::resolved_env(&self.state.db, &self.state.secrets, inst).await
+        };
+        if def.transport == "http" {
+            let url = def.url.as_deref().unwrap_or("").trim();
+            if url.is_empty() {
+                self.mark_status(inst, "error", Some("no remote URL set")).await;
+                return None;
+            }
+            // Re-resolve the host at connect time (not just at save) so the
+            // SSRF guard also defeats DNS rebinding.
+            if let Err(e) =
+                instances::check_backend_host(url, self.state.config.block_private_backend_ips)
             {
-                Ok(e) => e,
-                Err(e) => {
-                    self.mark_status(inst, "error", Some(&format!("config error: {e:#}"))).await;
-                    continue;
+                self.mark_status(inst, "error", Some(&format!("{e}"))).await;
+                return None;
+            }
+        }
+        // Git-sourced backends run from their prebuilt virtualenv. Rewrite
+        // the def to a direct stdio exec; skip if it has not been built yet.
+        if crate::gitsrc::is_git_source(&def) {
+            let ready = inst.build_status == "ready"
+                && crate::gitsrc::env_path(&self.state.config.env_dir, &inst.id).exists();
+            // A venv from before the interpreter relocation can't exec under
+            // the sandbox. Don't launch it (that yields a cryptic EACCES);
+            // point the user at the one-click heal instead. Rebuilding here
+            // would block every MCP connection on a slow build.
+            if ready && crate::gitsrc::venv_is_stale(&self.state.config.env_dir, inst, &def) {
+                self.mark_status(
+                    inst,
+                    "unbuilt",
+                    Some("needs rebuild after upgrade — open its page and click “Test connection”"),
+                )
+                .await;
+                return None;
+            }
+            if ready {
+                match crate::gitsrc::launch_command(&self.state.config.env_dir, &inst.id, &def) {
+                    Ok((program, args)) => {
+                        def.transport = "stdio".into();
+                        def.command = Some(program);
+                        def.args = args;
+                    }
+                    Err(e) => {
+                        self.mark_status(inst, "error", Some(&format!("git launch failed: {e:#}"))).await;
+                        return None;
+                    }
                 }
-            };
-            let config_file = match instances::resolved_config_file(
-                &self.state.db,
-                &self.state.secrets,
-                &inst.id,
-            )
-            .await
+            } else {
+                self.mark_status(inst, "unbuilt", Some("not built yet; run hub__update_server")).await;
+                return None;
+            }
+        }
+        let env = match instances::resolved_env(&self.state.db, &self.state.secrets, inst).await {
+            Ok(e) => e,
+            Err(e) => {
+                self.mark_status(inst, "error", Some(&format!("config error: {e:#}"))).await;
+                return None;
+            }
+        };
+        let config_file =
+            match instances::resolved_config_file(&self.state.db, &self.state.secrets, &inst.id)
+                .await
             {
                 Ok(c) => c,
                 Err(e) => {
                     self.mark_status(inst, "error", Some(&format!("config error: {e:#}"))).await;
-                    continue;
+                    return None;
                 }
             };
-            match Backend::spawn(
-                &def,
-                &env,
-                inst.id.clone(),
-                inst.namespace.clone(),
-                inst.display_name.clone(),
-                permit,
-                sandbox.as_ref(),
-                &self.state.config.env_dir,
-                config_file.as_deref(),
-                self.state.config.child_limits,
-            )
-            .await
-            {
-                Ok(b) => {
-                    self.mark_status(inst, "ok", None).await;
-                    out.push(b);
-                }
-                Err(e) => {
-                    self.mark_status(inst, "error", Some(&format!("failed to start: {e:#}"))).await;
-                }
+        match Backend::spawn(
+            &def,
+            &env,
+            inst.id.clone(),
+            inst.namespace.clone(),
+            inst.display_name.clone(),
+            permit,
+            sandbox,
+            &self.state.config.env_dir,
+            config_file.as_deref(),
+            self.state.config.child_limits,
+        )
+        .await
+        {
+            Ok(b) => {
+                self.mark_status(inst, "ok", None).await;
+                Some(b)
+            }
+            Err(e) => {
+                self.mark_status(inst, "error", Some(&format!("failed to start: {e:#}"))).await;
+                None
             }
         }
-        out
     }
 
     /// Run a proxied backend call under the configured wall-clock timeout

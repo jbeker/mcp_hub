@@ -206,6 +206,79 @@ async fn proxy_aggregates_a_stdio_backend() {
     let _ = client.cancel().await;
 }
 
+/// Bumping a server's reload epoch (what the web Restart button does) relaunches
+/// just that backend in a live session, so a configuration change takes effect
+/// without reconnecting the MCP client — and a config change alone does NOT
+/// reload (the action is explicit, by design).
+#[tokio::test]
+async fn restart_reloads_backend_config_in_a_live_session() {
+    let exe = mock_server_path();
+    assert!(
+        std::path::Path::new(&exe).exists(),
+        "build the example first: cargo build --example mock_mcp_server"
+    );
+
+    let (base, state) = spawn_hub().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let def = ServerDef {
+        name: "Mock".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some(exe),
+        args: vec![],
+        url: None,
+        runtime: "binary".into(),
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    };
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
+        .await
+        .unwrap();
+    instances::set_config_value(&state.db, &inst.id, "MOCK_PREFIX", "PFX:")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    async fn echo(client: &RunningService<RoleClient, ()>) -> String {
+        let result = client
+            .call_tool(CallToolRequestParam {
+                name: "mock__echo".into(),
+                arguments: args(serde_json::json!({ "msg": "hi" })),
+            })
+            .await
+            .unwrap();
+        serde_json::to_string(&result.content).unwrap()
+    }
+
+    // First call binds the backend with the original prefix.
+    assert!(echo(&client).await.contains("PFX:hi"));
+
+    // Change the config but do NOT restart: the live session keeps the old
+    // process, so the prefix is unchanged (config edits don't auto-reload).
+    instances::set_config_value(&state.db, &inst.id, "MOCK_PREFIX", "NEW:")
+        .await
+        .unwrap();
+    let still_old = echo(&client).await;
+    assert!(still_old.contains("PFX:hi"), "should not auto-reload: {still_old}");
+
+    // Bump the reload epoch (the Restart button) — the next request respawns
+    // just this backend with the new config, over the same MCP session.
+    state.bump_reload(&inst.id);
+    let reloaded = echo(&client).await;
+    assert!(reloaded.contains("NEW:hi"), "should reload after restart: {reloaded}");
+
+    let _ = client.cancel().await;
+}
+
 #[tokio::test]
 async fn failed_backend_reports_error_status() {
     let (base, state) = spawn_hub().await;
