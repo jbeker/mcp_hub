@@ -54,6 +54,11 @@ pub struct AppState {
     /// The `/mcp` endpoint's session store. Shared with the proxy router so the
     /// admin stats page can read the live active-session count.
     pub session_manager: Arc<LocalSessionManager>,
+    /// Per-instance "reload epoch". The web Restart button bumps an instance's
+    /// counter; each live proxy session compares it against the epoch it last
+    /// acted on and respawns that backend when it advances. In-memory only —
+    /// a hub restart re-binds every session from scratch anyway.
+    pub reload_epochs: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl AppState {
@@ -82,9 +87,31 @@ impl AppState {
             backend_slots,
             build_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_manager: Arc::new(LocalSessionManager::default()),
+            reload_epochs: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(config),
             db,
         })
+    }
+
+    /// Bump an instance's reload epoch so every live proxy session relaunches
+    /// that backend on its next request (the web Restart button).
+    pub fn bump_reload(&self, instance_id: &str) {
+        *self
+            .reload_epochs
+            .lock()
+            .unwrap()
+            .entry(instance_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// The current reload epoch for an instance (0 if it has never been bumped).
+    pub fn reload_epoch(&self, instance_id: &str) -> u64 {
+        self.reload_epochs
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The absolute sandbox UID a given user's stdio subprocesses run as, or
@@ -162,6 +189,7 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/{id}/test", post(web::test_server))
         .route("/servers/{id}/enable", post(web::enable_server))
         .route("/servers/{id}/disable", post(web::disable_server))
+        .route("/servers/{id}/restart", post(web::restart_server))
         .route("/servers/{id}/update", post(web::update_server))
         .route("/servers/{id}/delete", post(web::delete_server))
         // Invite management (admin)

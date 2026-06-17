@@ -429,6 +429,15 @@ pub async fn server_detail(
     }
     .replace("{id}", &esc(&inst.id));
 
+    // Restart only makes sense for an enabled server (a disabled one isn't
+    // running). It relaunches the backend in the user's live MCP sessions.
+    let restart = if inst.enabled {
+        format!(r#"<form method="post" action="/servers/{{id}}/restart">{csrf}<button class="ghost">Restart</button></form>"#)
+            .replace("{id}", &esc(&inst.id))
+    } else {
+        String::new()
+    };
+
     // Git-sourced servers get a build status line and an Update button.
     let git_section = if crate::gitsrc::is_git_source(&def) {
         let commit = inst
@@ -467,9 +476,11 @@ pub async fn server_detail(
 {git_section}
 <div class="row" style="margin-top:18px">
   <form method="post" action="/servers/{id}/test">{csrf}<button class="ghost">Test connection</button></form>
+  {restart}
   {toggle}
   <form method="post" action="/servers/{id}/delete" data-confirm="Remove this server?">{csrf}<button class="ghost danger">Remove</button></form>
-</div>"#,
+</div>
+<p class="muted">Restart relaunches this server in your connected MCP sessions to apply configuration changes (it takes effect on their next request).</p>"#,
         name = esc(&inst.display_name),
         ns = esc(&inst.namespace),
         transport = esc(&def.transport),
@@ -482,6 +493,7 @@ pub async fn server_detail(
         fields = fields,
         git_section = git_section,
         toggle = toggle,
+        restart = restart,
     );
     page_wide(&inst.display_name, &body).into_response()
 }
@@ -647,6 +659,31 @@ pub async fn disable_server(
         return forbidden();
     }
     set_enabled_and_redirect(&state, &user, &headers, &id, false).await
+}
+
+/// `POST /servers/{id}/restart` — relaunch this one server in the user's live
+/// MCP sessions so a configuration change takes effect without reconnecting the
+/// client. The web layer can't reach a session's child processes directly, so it
+/// bumps the instance's reload epoch; each session respawns just this backend on
+/// its next request (see `proxy::server::reconcile_reloads`).
+pub async fn restart_server(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("server.restart", &user, &headers, &id, "csrf");
+        return forbidden();
+    }
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+        return error_page("server not found");
+    };
+    state.bump_reload(&inst.id);
+    audit_ok("server.restart", &user, &headers, &inst.namespace);
+    Redirect::to(&format!("/servers/{id}")).into_response()
 }
 
 pub async fn delete_server(
