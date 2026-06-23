@@ -26,6 +26,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use axum_extra::extract::cookie::Key;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::{Peer, RoleServer};
 use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 use webauthn_rs::Webauthn;
@@ -59,6 +60,18 @@ pub struct AppState {
     /// acted on and respawns that backend when it advances. In-memory only —
     /// a hub restart re-binds every session from scratch anyway.
     pub reload_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    /// Live MCP client peers, keyed by an opaque per-session id. Lets the hub
+    /// push `notifications/tools/list_changed` to a connected (even idle) client
+    /// when its backend set changes (e.g. the web Restart button), so it
+    /// re-fetches without a manual refresh. In-memory; entries are removed when
+    /// the session's `HubProxy` is dropped.
+    pub client_peers: Arc<Mutex<HashMap<uuid::Uuid, ClientPeer>>>,
+}
+
+/// A registered client session's notification channel.
+pub struct ClientPeer {
+    pub user_id: String,
+    pub peer: Peer<RoleServer>,
 }
 
 impl AppState {
@@ -88,9 +101,57 @@ impl AppState {
             build_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_manager: Arc::new(LocalSessionManager::default()),
             reload_epochs: Arc::new(Mutex::new(HashMap::new())),
+            client_peers: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(config),
             db,
         })
+    }
+
+    /// Register a live client session's notification peer under an opaque key,
+    /// so [`notify_tools_changed`](Self::notify_tools_changed) can later push to
+    /// it. Idempotent: re-registering the same key replaces the entry.
+    pub fn register_client_peer(&self, key: uuid::Uuid, user_id: &str, peer: Peer<RoleServer>) {
+        self.client_peers.lock().unwrap().insert(
+            key,
+            ClientPeer {
+                user_id: user_id.to_string(),
+                peer,
+            },
+        );
+    }
+
+    /// Drop a client session's notification peer (its `HubProxy` went away).
+    pub fn unregister_client_peer(&self, key: uuid::Uuid) {
+        self.client_peers.lock().unwrap().remove(&key);
+    }
+
+    /// Push `notifications/tools/list_changed` to every live session belonging to
+    /// `user_id`, so a connected (even idle) client re-fetches its tool list. The
+    /// hub advertises `tools.listChanged`, so this is the honest fulfilment of
+    /// that capability. Best-effort and non-blocking: peers are cloned out under
+    /// the lock and notified from a spawned task; a peer whose transport has
+    /// closed is pruned.
+    pub fn notify_tools_changed(&self, user_id: &str) {
+        let targets: Vec<(uuid::Uuid, Peer<RoleServer>)> = self
+            .client_peers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, cp)| cp.user_id == user_id)
+            .map(|(k, cp)| (*k, cp.peer.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let registry = self.client_peers.clone();
+        tokio::spawn(async move {
+            for (key, peer) in targets {
+                if let Err(e) = peer.notify_tool_list_changed().await {
+                    tracing::debug!(error = %e, "tools/list_changed send failed; pruning peer");
+                    registry.lock().unwrap().remove(&key);
+                }
+            }
+        });
     }
 
     /// Bump an instance's reload epoch so every live proxy session relaunches

@@ -682,6 +682,10 @@ pub async fn restart_server(
         return error_page("server not found");
     };
     state.bump_reload(&inst.id);
+    // Nudge the user's live MCP sessions to re-list now: the epoch bump alone
+    // only takes effect on a session's *next* request, which an idle client may
+    // not make for a while. The notification prompts that request immediately.
+    state.notify_tools_changed(&user.id);
     audit_ok("server.restart", &user, &headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }

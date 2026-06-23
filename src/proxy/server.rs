@@ -35,6 +35,15 @@ use crate::AppState;
 pub struct HubProxy {
     state: AppState,
     bound: Mutex<Option<Bound>>,
+    /// Opaque id for this session, used to register/unregister its client
+    /// notification peer in `AppState::client_peers`.
+    session_key: uuid::Uuid,
+}
+
+impl Drop for HubProxy {
+    fn drop(&mut self) {
+        self.state.unregister_client_peer(self.session_key);
+    }
 }
 
 /// The user-specific state, established on the first authenticated request.
@@ -56,6 +65,7 @@ impl HubProxy {
         Self {
             state,
             bound: Mutex::new(None),
+            session_key: uuid::Uuid::new_v4(),
         }
     }
 
@@ -96,7 +106,16 @@ impl HubProxy {
                     b.shutdown().await;
                 }
             }
+            let t0 = std::time::Instant::now();
             let (backends, applied_epochs) = self.build_backends(&authed.user_id).await;
+            let bind_ms = t0.elapsed().as_millis();
+            tracing::info!(
+                user = %authed.user_id,
+                connected = backends.len(),
+                attempted = applied_epochs.len(),
+                elapsed_ms = bind_ms as u64,
+                "bound MCP session backends"
+            );
             // Resolve the handle once so per-call audit events can name the actor.
             let handle = crate::users::find_by_id(&self.state.db, &authed.user_id)
                 .await
@@ -118,6 +137,11 @@ impl HubProxy {
                 backends,
                 applied_epochs,
             });
+            // Register this session's notification peer so a later backend-set
+            // change (e.g. the web Restart button) can push tools/list_changed
+            // to the client without it having to poll or manually refresh.
+            self.state
+                .register_client_peer(self.session_key, &authed.user_id, ctx.peer.clone());
         }
         self.reconcile_reloads(guard.as_mut().expect("bound above"), &authed.user_id)
             .await;
@@ -215,25 +239,35 @@ impl HubProxy {
                 return (out, applied_epochs);
             }
         };
+        // Acquire each backend's global slot up front (synchronously), bounded by
+        // the per-user cap, then spawn them all concurrently. Cold-start latency
+        // is then the slowest single backend, not the sum — the connect handshake
+        // of one backend no longer blocks the others, so the first `tools/list`
+        // returns promptly instead of timing out the client into an empty list.
+        let mut to_spawn = Vec::new();
         for (idx, inst) in enabled.iter().enumerate() {
-            if out.len() >= per_user_cap {
+            if to_spawn.len() >= per_user_cap {
                 tracing::warn!(cap = per_user_cap, "per-user backend cap reached");
                 self.mark_skipped(&enabled[idx..], "per-user backend cap reached").await;
                 break;
             }
             // Acquire a global slot; if exhausted, stop adding backends.
-            let permit = match self.state.backend_slots.clone().try_acquire_owned() {
-                Ok(p) => p,
+            match self.state.backend_slots.clone().try_acquire_owned() {
+                Ok(permit) => to_spawn.push((inst, permit)),
                 Err(_) => {
                     tracing::warn!("global backend capacity reached");
                     self.mark_skipped(&enabled[idx..], "global backend capacity reached").await;
                     break;
                 }
-            };
-            if let Some(b) = self.spawn_one(inst, sandbox.as_ref(), permit).await {
-                out.push(b);
             }
         }
+        let spawned = futures::future::join_all(
+            to_spawn
+                .into_iter()
+                .map(|(inst, permit)| self.spawn_one(inst, sandbox.as_ref(), permit)),
+        )
+        .await;
+        out.extend(spawned.into_iter().flatten());
         (out, applied_epochs)
     }
 
@@ -321,7 +355,8 @@ impl HubProxy {
                     return None;
                 }
             };
-        match Backend::spawn(
+        let t0 = std::time::Instant::now();
+        let result = Backend::spawn(
             &def,
             &env,
             inst.id.clone(),
@@ -333,13 +368,27 @@ impl HubProxy {
             config_file.as_deref(),
             self.state.config.child_limits,
         )
-        .await
-        {
+        .await;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        match result {
             Ok(b) => {
+                tracing::info!(
+                    namespace = %inst.namespace,
+                    transport = %def.transport,
+                    elapsed_ms,
+                    "backend connected"
+                );
                 self.mark_status(inst, "ok", None).await;
                 Some(b)
             }
             Err(e) => {
+                tracing::info!(
+                    namespace = %inst.namespace,
+                    transport = %def.transport,
+                    elapsed_ms,
+                    error = %format!("{e:#}"),
+                    "backend connect failed"
+                );
                 self.mark_status(inst, "error", Some(&format!("failed to start: {e:#}"))).await;
                 None
             }
@@ -445,6 +494,7 @@ impl ServerHandler for HubProxy {
         _request: Option<PaginatedRequestParam>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let t0 = std::time::Instant::now();
         self.ensure_bound(&context).await?;
         let denied = self.denied_instances(&context).await;
         let guard = self.bound.lock().await;
@@ -452,14 +502,37 @@ impl ServerHandler for HubProxy {
 
         // The built-in management tools always come first and are never restricted.
         let mut tools = management::tools(bound.admin);
-        for b in bound.backends.iter().filter(|b| !denied.contains(&b.instance_id)) {
-            match b.list_namespaced_tools().await {
-                Ok(mut t) => tools.append(&mut t),
+        // Fan the per-backend tools/list out concurrently so the warm-refresh
+        // latency is the slowest single backend, not the sum. Results are
+        // collected in backend order, so the aggregate list stays deterministic.
+        let backends: Vec<&Backend> = bound
+            .backends
+            .iter()
+            .filter(|b| !denied.contains(&b.instance_id))
+            .collect();
+        let lists = futures::future::join_all(backends.iter().map(|b| async move {
+            let bt0 = std::time::Instant::now();
+            let r = b.list_namespaced_tools().await;
+            (&b.namespace, bt0.elapsed().as_millis() as u64, r)
+        }))
+        .await;
+        for (namespace, elapsed_ms, r) in lists {
+            match r {
+                Ok(mut t) => {
+                    tracing::debug!(namespace = %namespace, elapsed_ms, count = t.len(), "listed backend tools");
+                    tools.append(&mut t);
+                }
                 Err(e) => {
-                    tracing::warn!(namespace = %b.namespace, error = %e, "list_tools failed")
+                    tracing::warn!(namespace = %namespace, error = %e, "list_tools failed")
                 }
             }
         }
+        tracing::info!(
+            backends = backends.len(),
+            tools = tools.len(),
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "served tools/list"
+        );
         Ok(ListToolsResult {
             tools,
             next_cursor: None,
