@@ -731,6 +731,7 @@ async fn remove(
         .await
         .map_err(internal)?;
     crate::proxy::backend::remove_workdir(&state.config.env_dir, &inst.id);
+    crate::proxy::backend::remove_home(&state.config.env_dir, &inst.id);
     ok(json!({ "removed": true, "namespace": namespace }))
 }
 

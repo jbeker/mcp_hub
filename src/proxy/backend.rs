@@ -331,6 +331,13 @@ fn stdio_command(
 
     let mut env = env.clone();
 
+    // Every stdio backend gets its own persistent HOME, so a tool that caches
+    // credentials/state under `$HOME` (e.g. mcp-remote's `~/.mcp-auth`, keyed
+    // only by destination URL) cannot collide with another instance of the same
+    // server pointed at the same endpoint. Per-instance, never wiped between
+    // spawns so the cached state can be reused across restarts.
+    let home = ensure_home(env_dir, instance_id, sandbox).context("preparing instance HOME")?;
+
     // If a config file is attached, write it into a fresh working directory and
     // expose its path before expanding `${MCP_CONFIG_FILE}` in the command line.
     let workdir = match config_file {
@@ -375,6 +382,14 @@ fn stdio_command(
         if let Some(dir) = &workdir {
             c.current_dir(dir);
         }
+        // Point HOME at the per-instance directory (always — even off-sandbox,
+        // where the child would otherwise inherit the hub's HOME). This isolates
+        // anything a backend caches under `$HOME`. Package caches stay shared via
+        // the explicit UV_CACHE_DIR / npm_config_cache / XDG_CACHE_HOME below.
+        c.env("HOME", &home);
+        // Belt-and-suspenders for mcp-remote builds that resolve their config
+        // dir before consulting HOME: pin it into the per-instance HOME too.
+        c.env("MCP_REMOTE_CONFIG_DIR", home.join(".mcp-auth"));
         // Apply per-child resource caps in the forked child, before the uid
         // drop below (std runs user `pre_exec` hooks before its own uid/gid
         // change). Setting limits while still privileged is what lets them
@@ -386,12 +401,13 @@ fn stdio_command(
                 c.pre_exec(move || apply_child_limits(child_limits));
             }
         }
-        // Drop the child to its per-user sandbox UID and point its caches/HOME
-        // at a writable per-UID directory.
+        // Drop the child to its per-user sandbox UID. HOME is the per-instance
+        // dir set above; the package caches stay shared across this user's
+        // instances (pointed at the sandbox cache_dir) so a duplicate server
+        // doesn't trigger a fresh uv/npm download.
         if let Some(sb) = &sandbox {
             c.uid(sb.uid);
             c.gid(sb.gid);
-            c.env("HOME", &sb.cache_dir);
             c.env("USER", "mcp-sandbox");
             c.env("XDG_CACHE_HOME", &sb.cache_dir);
             c.env("UV_CACHE_DIR", format!("{}/uv", sb.cache_dir));
@@ -439,6 +455,39 @@ fn apply_child_limits(limits: crate::config::ChildLimits) -> std::io::Result<()>
 /// The per-instance working directory used to host a config file.
 fn workdir_path(env_dir: &str, instance_id: &str) -> std::path::PathBuf {
     std::path::Path::new(env_dir).join("workdir").join(instance_id)
+}
+
+/// The per-instance HOME directory. Unlike [`workdir_path`] (recreated on every
+/// spawn to host a fresh config file), this persists so a backend can reuse the
+/// state it caches under `$HOME` — e.g. mcp-remote's `~/.mcp-auth` — across
+/// restarts. Keying it by `instance_id` keeps two instances of the same server
+/// from sharing that state even when they target the identical endpoint.
+fn home_path(env_dir: &str, instance_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(env_dir).join("home").join(instance_id)
+}
+
+/// Ensure the instance's HOME directory exists and, when a sandbox is active, is
+/// owned by the sandbox UID and locked to `0700` so only that UID can read the
+/// credentials a backend caches there. Idempotent — runs on every spawn, so an
+/// existing directory is re-tightened. Returns the path to use as `HOME`.
+fn ensure_home(
+    env_dir: &str,
+    instance_id: &str,
+    sandbox: Option<&crate::sandbox::Sandbox>,
+) -> std::io::Result<std::path::PathBuf> {
+    let home = home_path(env_dir, instance_id);
+    std::fs::create_dir_all(&home)?;
+    if let Some(sb) = sandbox {
+        crate::sandbox::chown(&home, sb.uid, sb.gid)?;
+        crate::sandbox::set_private(&home)?;
+    }
+    Ok(home)
+}
+
+/// Best-effort removal of an instance's HOME directory (e.g. on delete), so the
+/// credentials a backend cached there do not linger after the instance is gone.
+pub fn remove_home(env_dir: &str, instance_id: &str) {
+    let _ = std::fs::remove_dir_all(home_path(env_dir, instance_id));
 }
 
 /// (Re)create the instance's working directory and write `content` into it under
@@ -689,6 +738,42 @@ mod tests {
             !msg.contains("RLIMIT_F=unlimited"),
             "file-size limit was not applied: {msg}"
         );
+    }
+
+    /// Each stdio backend runs with `HOME` pointed at its own per-instance
+    /// directory, so two instances of the same server (same command, same
+    /// endpoint) can't collide on state a tool caches under `$HOME` — the
+    /// mcp-remote `~/.mcp-auth` leak this guards against. The child echoes its
+    /// `$HOME` to stderr, which the probe captures.
+    #[tokio::test]
+    async fn home_is_per_instance() {
+        let env_dir = std::env::temp_dir().join(format!("mcphub-hometest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&env_dir);
+        std::fs::create_dir_all(&env_dir).unwrap();
+
+        let def = stdio_def("sh", &["-c", "printf 'HOME=%s\\n' \"$HOME\" >&2; exit 1"]);
+        let env = BTreeMap::new();
+        let ed = env_dir.to_str().unwrap();
+        let a = format!(
+            "{:#}",
+            Backend::probe(&def, &env, None, ed, "inst-a", None, Default::default())
+                .await
+                .expect_err("probe always exits 1")
+        );
+        let b = format!(
+            "{:#}",
+            Backend::probe(&def, &env, None, ed, "inst-b", None, Default::default())
+                .await
+                .expect_err("probe always exits 1")
+        );
+        // Each child saw a HOME under <env_dir>/home/<its own id> — and the two
+        // differ, which is the whole point.
+        assert!(a.contains(&format!("HOME={}", env_dir.join("home").join("inst-a").display())), "{a}");
+        assert!(b.contains(&format!("HOME={}", env_dir.join("home").join("inst-b").display())), "{b}");
+        // The directories are created and persist (not wiped between spawns).
+        assert!(env_dir.join("home").join("inst-a").is_dir());
+        assert!(env_dir.join("home").join("inst-b").is_dir());
+        std::fs::remove_dir_all(&env_dir).ok();
     }
 
     #[test]

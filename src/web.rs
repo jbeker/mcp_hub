@@ -708,6 +708,7 @@ pub async fn delete_server(
     let _ = instances::delete(&state.db, &id).await;
     crate::gitsrc::remove_env(&state.config.env_dir, &id);
     crate::proxy::backend::remove_workdir(&state.config.env_dir, &id);
+    crate::proxy::backend::remove_home(&state.config.env_dir, &id);
     audit_ok("server.remove", &user, &headers, &inst.namespace);
     Redirect::to("/").into_response()
 }
@@ -2316,6 +2317,7 @@ pub async fn purge_user(state: &AppState, user_id: &str) -> anyhow::Result<()> {
     if let Ok(insts) = instances::list_for_user(&state.db, user_id).await {
         for inst in insts {
             crate::gitsrc::remove_env(&state.config.env_dir, &inst.id);
+            crate::proxy::backend::remove_home(&state.config.env_dir, &inst.id);
         }
     }
     users::delete(&state.db, user_id).await?;
