@@ -730,6 +730,10 @@ async fn remove(
     instances::delete(&state.db, &inst.id)
         .await
         .map_err(internal)?;
+    // Mirror the web delete path: drop the built git venv, the config-file
+    // working directory, and the per-instance HOME so nothing the instance
+    // owned lingers on disk after removal.
+    crate::gitsrc::remove_env(&state.config.env_dir, &inst.id);
     crate::proxy::backend::remove_workdir(&state.config.env_dir, &inst.id);
     crate::proxy::backend::remove_home(&state.config.env_dir, &inst.id);
     ok(json!({ "removed": true, "namespace": namespace }))
