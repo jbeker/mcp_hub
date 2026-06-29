@@ -21,6 +21,12 @@ fn mock_server_path() -> String {
 
 /// Bind an ephemeral port, build + serve a hub, and return its base URL + state.
 async fn spawn_hub() -> (String, AppState) {
+    spawn_hub_with_limits(Limits::default()).await
+}
+
+/// As [`spawn_hub`], but with caller-chosen backend limits (e.g. a short
+/// `backend_call_timeout_secs` to exercise the proxied-call timeout).
+async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // `localhost` resolves to 127.0.0.1; WebAuthn rejects bare IPs as RP ids.
@@ -38,7 +44,7 @@ async fn spawn_hub() -> (String, AppState) {
         bootstrap_admin: None,
         allow_open_registration: false,
         sandbox_uid_base: None,
-        limits: Limits::default(),
+        limits,
         child_limits: Default::default(),
 
         block_private_backend_ips: false,
@@ -202,6 +208,74 @@ async fn proxy_aggregates_a_stdio_backend() {
     let json = serde_json::to_string(&listed.structured_content).unwrap();
     assert!(json.contains("\"command\""), "got {json}");
     assert!(json.contains("mock_mcp_server"), "got {json}");
+
+    let _ = client.cancel().await;
+}
+
+/// A proxied tool call that outruns `backend_call_timeout_secs` is aborted by
+/// the hub and surfaced to the client as an error, rather than hanging forever.
+/// Exercises `with_call_timeout` end-to-end (including the timeout warn path).
+#[tokio::test]
+async fn slow_backend_call_times_out() {
+    let exe = mock_server_path();
+    assert!(
+        std::path::Path::new(&exe).exists(),
+        "build the example first: cargo build --example mock_mcp_server"
+    );
+
+    let limits = Limits {
+        backend_call_timeout_secs: 1,
+        ..Limits::default()
+    };
+    let (base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let def = ServerDef {
+        name: "Mock".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some(exe),
+        args: vec![],
+        url: None,
+        runtime: "binary".into(),
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    };
+    instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // A 5s sleep under a 1s cap must come back as an error to the client.
+    let result = client
+        .call_tool(CallToolRequestParam {
+            name: "mock__sleep".into(),
+            arguments: args(serde_json::json!({ "ms": 5000 })),
+        })
+        .await;
+    assert!(result.is_err(), "slow call should time out, got {result:?}");
+    assert!(
+        format!("{:?}", result.unwrap_err()).contains("timed out"),
+        "error should mention the timeout"
+    );
+
+    // A fast call on the same backend still succeeds (the cap is per-call).
+    let ok = client
+        .call_tool(CallToolRequestParam {
+            name: "mock__sleep".into(),
+            arguments: args(serde_json::json!({ "ms": 0 })),
+        })
+        .await
+        .unwrap();
+    assert!(serde_json::to_string(&ok.content).unwrap().contains("slept"));
 
     let _ = client.cancel().await;
 }

@@ -397,8 +397,10 @@ impl HubProxy {
 
     /// Run a proxied backend call under the configured wall-clock timeout
     /// (`HUB_BACKEND_CALL_TIMEOUT_SECS`; 0 = no timeout). A timeout maps to an
-    /// MCP internal error rather than hanging the client.
-    async fn with_call_timeout<F, T>(&self, fut: F) -> Result<T, McpError>
+    /// MCP internal error rather than hanging the client, and is logged loudly
+    /// (with `label` naming the offending call) since a wedged backend otherwise
+    /// leaves no server-side trace.
+    async fn with_call_timeout<F, T>(&self, label: &str, fut: F) -> Result<T, McpError>
     where
         F: std::future::Future<Output = T>,
     {
@@ -408,10 +410,13 @@ impl HubProxy {
         }
         match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
             Ok(v) => Ok(v),
-            Err(_) => Err(McpError::internal_error(
-                format!("backend call timed out after {secs}s"),
-                None,
-            )),
+            Err(_) => {
+                tracing::warn!(call = %label, secs, "proxied backend call timed out");
+                Err(McpError::internal_error(
+                    format!("backend call timed out after {secs}s"),
+                    None,
+                ))
+            }
         }
     }
 
@@ -589,10 +594,26 @@ impl ServerHandler for HubProxy {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
 
+        let t0 = std::time::Instant::now();
         let result = self
-            .with_call_timeout(backend.call_tool(original.to_string(), request.arguments))
+            .with_call_timeout(&request.name, backend.call_tool(original.to_string(), request.arguments))
             .await?
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    namespace = %ns,
+                    tool = %request.name,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    error = %format!("{e:#}"),
+                    "proxied tool call failed"
+                );
+                McpError::internal_error(format!("{e:#}"), None)
+            })?;
+        tracing::debug!(
+            namespace = %ns,
+            tool = %request.name,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "proxied tool call done"
+        );
         self.check_response_size(&result)?;
         Ok(result)
     }
@@ -666,10 +687,26 @@ impl ServerHandler for HubProxy {
             .ok_or_else(|| {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
+        let t0 = std::time::Instant::now();
         let result = self
-            .with_call_timeout(backend.read_resource(original.to_string()))
+            .with_call_timeout(&request.uri, backend.read_resource(original.to_string()))
             .await?
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    namespace = %ns,
+                    uri = %request.uri,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    error = %format!("{e:#}"),
+                    "proxied read_resource failed"
+                );
+                McpError::internal_error(format!("{e:#}"), None)
+            })?;
+        tracing::debug!(
+            namespace = %ns,
+            uri = %request.uri,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "proxied read_resource done"
+        );
         self.check_response_size(&result)?;
         Ok(result)
     }
@@ -716,10 +753,26 @@ impl ServerHandler for HubProxy {
             .ok_or_else(|| {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
+        let t0 = std::time::Instant::now();
         let result = self
-            .with_call_timeout(backend.get_prompt(original.to_string(), request.arguments))
+            .with_call_timeout(&request.name, backend.get_prompt(original.to_string(), request.arguments))
             .await?
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    namespace = %ns,
+                    prompt = %request.name,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    error = %format!("{e:#}"),
+                    "proxied get_prompt failed"
+                );
+                McpError::internal_error(format!("{e:#}"), None)
+            })?;
+        tracing::debug!(
+            namespace = %ns,
+            prompt = %request.name,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "proxied get_prompt done"
+        );
         self.check_response_size(&result)?;
         Ok(result)
     }

@@ -30,6 +30,11 @@ struct EchoArgs {
     msg: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SleepArgs {
+    ms: u64,
+}
+
 #[tool_router]
 impl Mock {
     fn new() -> Self {
@@ -45,6 +50,12 @@ impl Mock {
             "{prefix}{}",
             args.msg
         ))]))
+    }
+
+    #[tool(description = "Sleep for `ms` milliseconds before replying (used to test call timeouts)")]
+    async fn sleep(&self, Parameters(args): Parameters<SleepArgs>) -> Result<CallToolResult, McpError> {
+        tokio::time::sleep(std::time::Duration::from_millis(args.ms)).await;
+        Ok(CallToolResult::success(vec![Content::text("slept")]))
     }
 }
 

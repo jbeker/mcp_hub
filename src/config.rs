@@ -84,6 +84,7 @@ pub struct Limits {
     pub backend_idle_secs: u64,
     /// Per-call wall-clock cap for a proxied backend RPC (`HUB_BACKEND_CALL_TIMEOUT_SECS`);
     /// 0 = no timeout. Stops one wedged backend from hanging a client forever.
+    /// Defaults to 90s; set the env var to `0` to opt back into unbounded calls.
     pub backend_call_timeout_secs: u64,
     /// Cap on a single backend response's serialized size in megabytes
     /// (`HUB_MAX_RESPONSE_MB`); 0 = uncapped. Bounds memory blow-up from a
@@ -97,7 +98,7 @@ impl Default for Limits {
             max_backends_per_user: 16,
             max_backends_global: 128,
             backend_idle_secs: 300,
-            backend_call_timeout_secs: 0,
+            backend_call_timeout_secs: 90,
             max_response_mb: 0,
         }
     }
