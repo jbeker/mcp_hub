@@ -701,6 +701,49 @@ pub fn render_command(command: &Option<String>, args: &[String]) -> String {
     shlex::try_join(parts.iter().map(String::as_str)).unwrap_or_else(|_| parts.join(" "))
 }
 
+/// Stored-secret names that are referenced as `${VAR}` on the command line
+/// (`command` + `args`), where their value lands in the child's argv and is
+/// readable by any process via `/proc/<pid>/cmdline`. Env-var values, by
+/// contrast, sit in `/proc/<pid>/environ`, which is UID-locked. The UI uses this
+/// to nudge a user to move such a secret out of argv and into the environment.
+/// Order-preserving and de-duplicated by first occurrence.
+pub fn secret_refs_in_argv(
+    command: &Option<String>,
+    args: &[String],
+    secret_names: &[String],
+) -> Vec<String> {
+    let secrets: std::collections::HashSet<&str> =
+        secret_names.iter().map(String::as_str).collect();
+    let mut found = Vec::new();
+    let scan = |text: &str, found: &mut Vec<String>| {
+        // Mirror `util::expand_vars`: only the braced `${NAME}` form is a
+        // reference. An unterminated `${` ends the scan for that token.
+        let mut rest = text;
+        while let Some(pos) = rest.find("${") {
+            let after = &rest[pos + 2..];
+            match after.find('}') {
+                Some(end) => {
+                    let name = &after[..end];
+                    if secrets.contains(name)
+                        && !found.iter().any(|f: &String| f == name)
+                    {
+                        found.push(name.to_string());
+                    }
+                    rest = &after[end + 1..];
+                }
+                None => break,
+            }
+        }
+    };
+    if let Some(c) = command {
+        scan(c, &mut found);
+    }
+    for a in args {
+        scan(a, &mut found);
+    }
+    found
+}
+
 /// Names of secret keys that have a stored value (never returns the values).
 pub async fn secret_names(pool: &SqlitePool, instance_id: &str) -> Result<Vec<String>> {
     let rows: Vec<(String,)> =
@@ -879,6 +922,37 @@ mod tests {
         // A literal private IP is blocked only when the guard is on.
         assert!(check_backend_host("https://10.0.0.5/mcp", false).is_ok());
         assert!(check_backend_host("https://10.0.0.5/mcp", true).is_err());
+    }
+
+    #[test]
+    fn flags_secrets_referenced_in_argv_only() {
+        use super::secret_refs_in_argv;
+        let secrets = vec!["GITHUB_TOKEN".to_string(), "API_KEY".to_string()];
+
+        // A secret referenced on the command line is flagged.
+        let got = secret_refs_in_argv(
+            &Some("mcp-remote".into()),
+            &["--header".into(), "Authorization: Bearer ${GITHUB_TOKEN}".into()],
+            &secrets,
+        );
+        assert_eq!(got, vec!["GITHUB_TOKEN".to_string()]);
+
+        // Flagged in the command token too, and de-duplicated across argv.
+        let got = secret_refs_in_argv(
+            &Some("${API_KEY}-runner".into()),
+            &["--key=${API_KEY}".into()],
+            &secrets,
+        );
+        assert_eq!(got, vec!["API_KEY".to_string()]);
+
+        // A non-secret `${VAR}` and a malformed reference are ignored; a secret
+        // that never appears in argv (only in env) produces nothing.
+        let got = secret_refs_in_argv(
+            &Some("${TOOL_HOME}/bin/server".into()),
+            &["--cfg=${NOT_A_SECRET}".into(), "${API_KEY".into()],
+            &secrets,
+        );
+        assert!(got.is_empty(), "got {got:?}");
     }
 
     /// The snapshot must survive a JSON round-trip (it is cached in SQLite),

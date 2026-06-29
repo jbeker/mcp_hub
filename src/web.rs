@@ -411,6 +411,14 @@ pub async fn server_detail(
         .flatten()
         .unwrap_or_default();
 
+    // Flag any stored secret that is referenced on the command line (where it
+    // leaks via /proc) rather than passed through the environment.
+    let secret_names = instances::secret_names(&state.db, &inst.id)
+        .await
+        .unwrap_or_default();
+    let argv_warning =
+        argv_secret_banner(&instances::secret_refs_in_argv(&def.command, &def.args, &secret_names));
+
     let fields = server_fields(
         &def.transport,
         false,
@@ -467,6 +475,7 @@ pub async fn server_detail(
 <p class="muted">Namespace <code>{ns}</code> · {transport} · {status}</p>
 {tabs}
 {runtime}
+{argv_warning}
 {command}
 <form method="post" action="/servers/{id}/config">
   {csrf}
@@ -487,6 +496,7 @@ pub async fn server_detail(
         status = if inst.enabled { "enabled" } else { "disabled" },
         tabs = server_tabs(&inst.id, "config"),
         runtime = runtime_banner(&inst),
+        argv_warning = argv_warning,
         command = command_line(&state, &inst, &def),
         id = esc(&inst.id),
         csrf = csrf,
@@ -544,6 +554,26 @@ fn server_tabs(id: &str, active: &str) -> String {
 }
 
 /// Render the backend's last connection outcome as a coloured banner.
+/// Warn when a stored secret is referenced as `${VAR}` on the command line: its
+/// value then lands in the child's argv (`/proc/<pid>/cmdline`, world-readable)
+/// rather than its environment (`/proc/<pid>/environ`, UID-locked). Empty string
+/// when there is nothing to flag.
+fn argv_secret_banner(refs: &[String]) -> String {
+    if refs.is_empty() {
+        return String::new();
+    }
+    let names = refs
+        .iter()
+        .map(|n| format!("<code>{}</code>", esc(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"<div class="status status-warn">{names} {verb} referenced on the command line, where the value is visible to other processes via <code>/proc</code>. Pass it to the server as an environment variable instead.</div>"#,
+        names = names,
+        verb = if refs.len() == 1 { "is a stored secret" } else { "are stored secrets" },
+    )
+}
+
 fn runtime_banner(inst: &instances::Instance) -> String {
     let when = inst
         .runtime_checked_at

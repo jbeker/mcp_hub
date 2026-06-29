@@ -52,6 +52,13 @@ Registration is **invite-only**: every account after the first must redeem a sin
 
 > The runtime image bundles **Node.js** (`npx`) and **uv** (`uvx`) because stdio backends run as child processes inside the container.
 
+> **Optional runtime hardening.** The entrypoint can hide other users' `/proc` entries (`hidepid=2`) and firewall sandbox-UID network egress, but each needs a Linux capability the container isn't granted by default. To enable, add them to your compose service (the hub still starts without them, logging that each was skipped):
+> ```yaml
+>     cap_add:
+>       - SYS_ADMIN   # HUB_HIDEPID: remount /proc hidepid=2
+>       - NET_ADMIN   # HUB_EGRESS_HARDENING: sandbox-UID egress firewall
+> ```
+
 ## Configuration
 
 All configuration is via environment variables:
@@ -67,6 +74,8 @@ All configuration is via environment variables:
 | `HUB_DB_PATH` | no | `/data/hub.db` | SQLite database path. |
 | `HUB_ENV_DIR` | no | `/data/envs` | Where prebuilt virtualenvs for git-sourced servers live (keep on the data volume). |
 | `HUB_LISTEN` | no | `0.0.0.0:8080` | Bind address. |
+| `HUB_HIDEPID` | no | `1` (in image) | Remount `/proc` with `hidepid=2` so a sandbox UID can't read another user's process `cmdline`/`environ`. Needs `CAP_SYS_ADMIN`; skipped (logged) without it. `0` disables. |
+| `HUB_EGRESS_HARDENING` | no | `1` (in image) | Install nftables rules dropping sandbox-UID egress to link-local/cloud-metadata and the hub's own loopback port (RFC1918 stays allowed). Needs `CAP_NET_ADMIN`; skipped (logged) without it. `0` disables. |
 | `HUB_MAX_BACKENDS_PER_USER` | no | `16` | Max backends per client session. |
 | `HUB_MAX_BACKENDS_GLOBAL` | no | `128` | Max concurrent backends across all users. |
 | `HUB_BACKEND_IDLE_SECS` | no | `300` | Backend idle reclamation window. |

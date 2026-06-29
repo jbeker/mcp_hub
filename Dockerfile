@@ -26,8 +26,10 @@ RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 
+# `nftables` is used by the entrypoint to restrict sandbox-UID network egress;
+# `mount` (util-linux) is already present and is used to remount /proc hidepid.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl xz-utils libssl3 git \
+        ca-certificates curl xz-utils libssl3 git nftables \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js (provides npx) — pinned major version.
@@ -53,15 +55,27 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 COPY --from=build /app/target/release/mcp_hub /usr/local/bin/mcp_hub
 # Static web assets are read at runtime from the working directory.
 COPY static /app/static
+# Entrypoint applies best-effort runtime hardening (proc hidepid + egress) then
+# execs the hub. See the script for the capabilities it needs.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # The hub runs as root *on purpose*: it drops each user's stdio subprocesses to
 # an unprivileged per-user UID (HUB_SANDBOX_UID_BASE + the user's slot) so they
 # cannot read the master key or the secrets DB. Set the base to 0 to disable.
+#
+# The entrypoint additionally hardens the runtime when the matching capability is
+# present (both are best-effort and skipped with a log line otherwise):
+#   HUB_HIDEPID=1           remount /proc hidepid=2     (needs CAP_SYS_ADMIN)
+#   HUB_EGRESS_HARDENING=1  sandbox-UID egress firewall (needs CAP_NET_ADMIN)
+# Set either to 0 to opt out.
 ENV HUB_DB_PATH=/data/hub.db \
     HUB_ENV_DIR=/data/envs \
     HUB_LISTEN=0.0.0.0:8080 \
-    HUB_SANDBOX_UID_BASE=20000
+    HUB_SANDBOX_UID_BASE=20000 \
+    HUB_HIDEPID=1 \
+    HUB_EGRESS_HARDENING=1
 VOLUME ["/data"]
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/mcp_hub"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
