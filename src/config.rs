@@ -43,6 +43,12 @@ pub struct Config {
     /// container's own network. Off by default (home/LAN deployments often
     /// point at private IPs on purpose).
     pub block_private_backend_ips: bool,
+    /// Allowed `Host` header authorities for the `/mcp` Streamable HTTP endpoint,
+    /// enforced by rmcp as an anti-DNS-rebinding measure. Derived from
+    /// `HUB_BASE_URL`'s authority plus any comma-separated `HUB_ALLOWED_HOSTS`
+    /// (needed when the reverse proxy forwards a Host other than the base URL's).
+    /// Empty → rmcp keeps its default loopback-only allowlist (dev/test).
+    pub allowed_hosts: Vec<String>,
 }
 
 /// `setrlimit` caps applied to every stdio backend subprocess, as a last line
@@ -164,6 +170,18 @@ impl Config {
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
+        // Host allowlist for the /mcp endpoint (rmcp DNS-rebinding guard): the
+        // base URL's own authority, plus any operator-supplied extras for setups
+        // where the reverse proxy forwards a different Host.
+        let mut allowed_hosts: Vec<String> = Vec::new();
+        if let Some(authority) = authority_of(&base_url) {
+            allowed_hosts.push(authority);
+        }
+        if let Some(extra) = opt("HUB_ALLOWED_HOSTS") {
+            allowed_hosts.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        }
+        allowed_hosts.dedup();
+
         Ok(Self {
             base_url,
             rp_id,
@@ -177,6 +195,7 @@ impl Config {
             limits,
             child_limits,
             block_private_backend_ips,
+            allowed_hosts,
         })
     }
 
@@ -235,6 +254,18 @@ fn host_of(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+/// Extract the authority (`host` or `host:port`) of a URL — what a client sends
+/// in the `Host` header. Unlike [`host_of`], the port is retained.
+fn authority_of(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_string())
     }
 }
 

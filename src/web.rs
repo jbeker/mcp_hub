@@ -2483,10 +2483,9 @@ mod tests {
         server.server_info.name = "demo <server>".into();
         server.server_info.version = "1.2.3".into();
         server.instructions = Some("Use the tools wisely.".into());
-        server.capabilities = rmcp::model::ServerCapabilities {
-            tools: Some(rmcp::model::ToolsCapability { list_changed: None }),
-            ..Default::default()
-        };
+        server.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
         let mut schema = serde_json::Map::new();
         schema.insert("type".into(), serde_json::Value::String("object".into()));
         let tool = rmcp::model::Tool::new(

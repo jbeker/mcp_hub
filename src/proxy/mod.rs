@@ -51,7 +51,14 @@ pub fn mcp_router(state: AppState) -> Router {
     // Use the shared session manager held in AppState so the admin stats page
     // can observe the same live session count this router maintains.
     let session_manager = state.session_manager.clone();
-    let config = StreamableHttpServerConfig::default();
+    // rmcp defaults to a loopback-only Host allowlist (its DNS-rebinding guard).
+    // The hub is reached at HUB_BASE_URL behind a reverse proxy, so replace the
+    // default with the configured authorities. Empty → keep rmcp's loopback
+    // default (dev/test, where clients hit 127.0.0.1 directly).
+    let mut config = StreamableHttpServerConfig::default();
+    if !state.config.allowed_hosts.is_empty() {
+        config = config.with_allowed_hosts(state.config.allowed_hosts.clone());
+    }
 
     let factory_state = state.clone();
     let service = StreamableHttpService::new(

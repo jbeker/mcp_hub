@@ -7,10 +7,9 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, CallToolResult, Content, GetPromptRequestParam, GetPromptResult,
-    ListPromptsResult, ListResourcesResult, PaginatedRequestParam, Prompt, PromptMessage,
-    PromptMessageRole, RawResource, ReadResourceRequestParam, ReadResourceResult, ResourceContents,
-    ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
+    ListResourcesResult, PaginatedRequestParams, Prompt, PromptMessage, ReadResourceRequestParams,
+    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -22,6 +21,7 @@ const RES_URI: &str = "mock://greeting";
 
 #[derive(Clone)]
 struct Mock {
+    #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
     tool_router: ToolRouter<Self>,
 }
 
@@ -46,7 +46,7 @@ impl Mock {
     #[tool(description = "Echo a message back, optionally prefixed by MOCK_PREFIX")]
     async fn echo(&self, Parameters(args): Parameters<EchoArgs>) -> Result<CallToolResult, McpError> {
         let prefix = std::env::var("MOCK_PREFIX").unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{prefix}{}",
             args.msg
         ))]))
@@ -55,73 +55,75 @@ impl Mock {
     #[tool(description = "Sleep for `ms` milliseconds before replying (used to test call timeouts)")]
     async fn sleep(&self, Parameters(args): Parameters<SleepArgs>) -> Result<CallToolResult, McpError> {
         tokio::time::sleep(std::time::Duration::from_millis(args.ms)).await;
-        Ok(CallToolResult::success(vec![Content::text("slept")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("slept")]))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for Mock {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .enable_prompts()
-                .build(),
-            ..Default::default()
-        }
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_prompts()
+            .build();
+        info
     }
 
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         Ok(ListResourcesResult {
-            resources: vec![RawResource::new(RES_URI, "greeting").no_annotation()],
+            resources: vec![Resource::new(RES_URI, "greeting")],
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn read_resource(
         &self,
-        request: ReadResourceRequestParam,
+        request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         if request.uri != RES_URI {
             return Err(McpError::resource_not_found("no such resource", None));
         }
-        Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text("hello from mock", RES_URI)],
-        })
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            "hello from mock",
+            RES_URI,
+        )]))
     }
 
     async fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
         Ok(ListPromptsResult {
             prompts: vec![Prompt::new("hello", Some("A greeting prompt"), None)],
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn get_prompt(
         &self,
-        request: GetPromptRequestParam,
+        request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
         if request.name != "hello" {
             return Err(McpError::invalid_params("no such prompt", None));
         }
-        Ok(GetPromptResult {
-            description: Some("A greeting prompt".into()),
-            messages: vec![PromptMessage::new_text(
-                PromptMessageRole::User,
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(
+                Role::User,
                 "Say hello to the user.",
-            )],
-        })
+            )])
+            .with_description("A greeting prompt"),
+        )
     }
 }
 

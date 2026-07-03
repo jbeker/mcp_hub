@@ -50,7 +50,7 @@ jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "jwk"] }
 
 # Model Context Protocol SDK (proxy server + backend clients)
-rmcp = { version = "0.9", features = [
+rmcp = { version = "2", features = [
     "server",
     "client",
     "macros",
@@ -81,7 +81,7 @@ uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 cookie = { version = "0.18", features = ["signed"] }
 schemars = "1"
-rmcp = { version = "0.9", features = [
+rmcp = { version = "2", features = [
     "server",
     "client",
     "macros",

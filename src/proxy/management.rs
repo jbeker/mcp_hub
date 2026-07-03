@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use std::collections::BTreeMap;
 
-use rmcp::model::{CallToolResult, Content, JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
@@ -1006,26 +1006,18 @@ fn schema(properties: Value, required: &[&str]) -> Arc<JsonObject> {
 }
 
 fn tool(name: &'static str, description: &'static str, input_schema: Arc<JsonObject>) -> Tool {
-    Tool {
-        name: name.into(),
-        title: None,
-        description: Some(description.into()),
-        input_schema,
-        output_schema: None,
-        annotations: None,
-        icons: None,
-        meta: None,
-    }
+    // Tool is #[non_exhaustive] in rmcp 2.x; build via the constructor.
+    // `annotations` are applied separately in `tools()`.
+    Tool::new(name, description, input_schema)
 }
 
 fn ok(value: Value) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    Ok(CallToolResult {
-        content: vec![Content::text(text)],
-        structured_content: Some(value),
-        is_error: Some(false),
-        meta: None,
-    })
+    // CallToolResult is #[non_exhaustive] in rmcp 2.x; start from `success`
+    // (keeps the pretty-printed text mirror) and attach the structured payload.
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(value);
+    Ok(result)
 }
 
 fn internal(e: anyhow::Error) -> McpError {

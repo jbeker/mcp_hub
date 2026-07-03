@@ -3,9 +3,9 @@
 //! enabled backends, namespacing everything as `<server>__<tool>`.
 
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult, Icon,
+    CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Icon,
     Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
     ReadResourceResult, ServerCapabilities, ServerInfo,
 };
 use std::collections::{HashMap, HashSet};
@@ -464,39 +464,39 @@ impl HubProxy {
 
 impl ServerHandler for HubProxy {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .enable_resources()
-                .enable_resources_list_changed()
-                .enable_prompts()
-                .enable_prompts_list_changed()
-                .build(),
-            server_info: Implementation {
-                name: "mcp-hub".into(),
-                title: Some("MCP Hub".into()),
-                version: env!("CARGO_PKG_VERSION").into(),
-                icons: Some(vec![Icon {
-                    src: HUB_ICON_DATA_URI.clone(),
-                    mime_type: Some("image/png".into()),
-                    sizes: Some(vec!["96x96".into()]),
-                }]),
-                website_url: None,
-            },
-            instructions: Some(
-                "Aggregating MCP proxy. Tools and prompts are namespaced as \
-                 <server>__<name>, and resource URIs as hub://<server>/<uri>. \
-                 Use the hub__ tools to manage your configured servers."
-                    .into(),
-            ),
-        }
+        // ServerInfo / Implementation / Icon are #[non_exhaustive] in rmcp 2.x,
+        // so build from constructors + public-field assignment rather than a
+        // struct literal.
+        let icon = Icon::new(HUB_ICON_DATA_URI.clone())
+            .with_mime_type("image/png")
+            .with_sizes(vec!["96x96".into()]);
+        let mut server_info = Implementation::new("mcp-hub", env!("CARGO_PKG_VERSION"));
+        server_info.title = Some("MCP Hub".into());
+        server_info.icons = Some(vec![icon]);
+
+        let mut info = ServerInfo::default();
+        info.protocol_version = ProtocolVersion::default();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .enable_resources()
+            .enable_resources_list_changed()
+            .enable_prompts()
+            .enable_prompts_list_changed()
+            .build();
+        info.server_info = server_info;
+        info.instructions = Some(
+            "Aggregating MCP proxy. Tools and prompts are namespaced as \
+             <server>__<name>, and resource URIs as hub://<server>/<uri>. \
+             Use the hub__ tools to manage your configured servers."
+                .into(),
+        );
+        info
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let t0 = std::time::Instant::now();
@@ -541,12 +541,13 @@ impl ServerHandler for HubProxy {
         Ok(ListToolsResult {
             tools,
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.ensure_bound(&context).await?;
@@ -620,7 +621,7 @@ impl ServerHandler for HubProxy {
 
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         self.ensure_bound(&context).await?;
@@ -639,12 +640,13 @@ impl ServerHandler for HubProxy {
         Ok(ListResourcesResult {
             resources,
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn list_resource_templates(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         self.ensure_bound(&context).await?;
@@ -661,12 +663,13 @@ impl ServerHandler for HubProxy {
         Ok(ListResourceTemplatesResult {
             resource_templates,
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn read_resource(
         &self,
-        request: ReadResourceRequestParam,
+        request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         self.ensure_bound(&context).await?;
@@ -713,7 +716,7 @@ impl ServerHandler for HubProxy {
 
     async fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
         self.ensure_bound(&context).await?;
@@ -730,12 +733,13 @@ impl ServerHandler for HubProxy {
         Ok(ListPromptsResult {
             prompts,
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn get_prompt(
         &self,
-        request: GetPromptRequestParam,
+        request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
         self.ensure_bound(&context).await?;

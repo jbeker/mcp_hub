@@ -5,12 +5,4 @@
 # verifies exclusively with ES256 (p256) and never performs RSA private-key
 # operations, so it is not exploitable here. Re-evaluate if a patched rsa ships
 # or if we ever enable an RSA JWT algorithm.
-#
-# RUSTSEC-2026-0189 (rmcp Streamable HTTP server DNS-rebinding, no Host-header
-# validation) is fixed only in rmcp >= 1.4.0 — a breaking major upgrade tracked
-# as the next task. TEMPORARY ignore: the hub's /mcp transport sits behind a
-# mandatory OAuth bearer-token layer (src/proxy/mod.rs `require_bearer`) that
-# 401s before any request reaches the vulnerable transport, so a token-less
-# browser DNS-rebinding attacker cannot invoke tools. Remove this entry when the
-# rmcp 1.x upgrade lands.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0189"]
+ignore = ["RUSTSEC-2023-0071"]

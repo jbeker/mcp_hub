@@ -23,6 +23,7 @@ fn test_config() -> Config {
         child_limits: Default::default(),
 
         block_private_backend_ips: false,
+        allowed_hosts: Vec::new(),
     }
 }
 
@@ -211,6 +212,11 @@ async fn mcp_with_unknown_session_is_404_not_401() {
                 .header("authorization", format!("Bearer {token}"))
                 .header("content-type", "application/json")
                 .header("accept", "application/json, text/event-stream")
+                // rmcp 2.x validates the Host header (DNS-rebinding guard); with
+                // an empty allowlist it keeps the loopback default, so a request
+                // that reaches the service must carry an allowed Host. A raw
+                // `oneshot` request has none, so set one explicitly.
+                .header("host", "localhost")
                 .header("mcp-session-id", "stale-session-that-no-longer-exists")
                 .body(Body::from(
                     r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,

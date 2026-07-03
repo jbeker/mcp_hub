@@ -6,7 +6,7 @@ use mcp_hub::instances::ServerDef;
 use mcp_hub::config::{Config, Limits};
 use mcp_hub::oauth::store;
 use mcp_hub::{build_router, db, instances, users, AppState};
-use rmcp::model::{CallToolRequestParam, GetPromptRequestParam, ReadResourceRequestParam};
+use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
 use rmcp::service::{serve_client, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -48,6 +48,7 @@ async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
         child_limits: Default::default(),
 
         block_private_backend_ips: false,
+        allowed_hosts: Vec::new(),
     };
     let state = AppState::new(config, pool).await.unwrap();
 
@@ -123,10 +124,7 @@ async fn unbuilt_git_backend_is_skipped() {
 
     // ...and it is reported as unbuilt so the user knows to run hub__update_server.
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_my_servers".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -180,29 +178,20 @@ async fn proxy_aggregates_a_stdio_backend() {
     assert!(names.contains(&"hub__whoami".to_string()));
 
     let result = client
-        .call_tool(CallToolRequestParam {
-            name: "mock__echo".into(),
-            arguments: args(serde_json::json!({ "msg": "hello" })),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hello" })); __p })
         .await
         .unwrap();
     let rendered = serde_json::to_string(&result.content).unwrap();
     assert!(rendered.contains("PFX:hello"), "got {rendered}");
 
     let bad = client
-        .call_tool(CallToolRequestParam {
-            name: "nope__tool".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("nope__tool"); __p.arguments = None; __p })
         .await;
     assert!(bad.is_err());
 
     // The exact launch command is reported for stdio backends.
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_my_servers".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -256,10 +245,7 @@ async fn slow_backend_call_times_out() {
 
     // A 5s sleep under a 1s cap must come back as an error to the client.
     let result = client
-        .call_tool(CallToolRequestParam {
-            name: "mock__sleep".into(),
-            arguments: args(serde_json::json!({ "ms": 5000 })),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("mock__sleep"); __p.arguments = args(serde_json::json!({ "ms": 5000 })); __p })
         .await;
     assert!(result.is_err(), "slow call should time out, got {result:?}");
     assert!(
@@ -269,10 +255,7 @@ async fn slow_backend_call_times_out() {
 
     // A fast call on the same backend still succeeds (the cap is per-call).
     let ok = client
-        .call_tool(CallToolRequestParam {
-            name: "mock__sleep".into(),
-            arguments: args(serde_json::json!({ "ms": 0 })),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("mock__sleep"); __p.arguments = args(serde_json::json!({ "ms": 0 })); __p })
         .await
         .unwrap();
     assert!(serde_json::to_string(&ok.content).unwrap().contains("slept"));
@@ -324,10 +307,7 @@ async fn restart_reloads_backend_config_in_a_live_session() {
 
     async fn echo(client: &RunningService<RoleClient, ()>) -> String {
         let result = client
-            .call_tool(CallToolRequestParam {
-                name: "mock__echo".into(),
-                arguments: args(serde_json::json!({ "msg": "hi" })),
-            })
+            .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hi" })); __p })
             .await
             .unwrap();
         serde_json::to_string(&result.content).unwrap()
@@ -396,10 +376,7 @@ async fn failed_backend_reports_error_status() {
 
     // ...and its failure is reported so the user can diagnose it.
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_my_servers".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -451,9 +428,7 @@ async fn proxy_aggregates_resources_and_prompts() {
 
     // Reading the wrapped URI routes back to the mock and returns its content.
     let read = client
-        .read_resource(ReadResourceRequestParam {
-            uri: wrapped_uri.to_string(),
-        })
+        .read_resource(ReadResourceRequestParams::new(wrapped_uri.to_string()))
         .await
         .unwrap();
     let read_json = serde_json::to_string(&read.contents).unwrap();
@@ -463,9 +438,7 @@ async fn proxy_aggregates_resources_and_prompts() {
 
     // An unknown namespace is rejected, not silently routed.
     let bad = client
-        .read_resource(ReadResourceRequestParam {
-            uri: "hub://nope/x".to_string(),
-        })
+        .read_resource(ReadResourceRequestParams::new("hub://nope/x".to_string()))
         .await;
     assert!(bad.is_err());
 
@@ -478,10 +451,7 @@ async fn proxy_aggregates_resources_and_prompts() {
     );
 
     let got = client
-        .get_prompt(GetPromptRequestParam {
-            name: "mock__hello".into(),
-            arguments: None,
-        })
+        .get_prompt({ let mut __p = GetPromptRequestParams::new("mock__hello"); __p.arguments = None; __p })
         .await
         .unwrap();
     let got_json = serde_json::to_string(&got.messages).unwrap();
@@ -516,33 +486,24 @@ async fn management_tools_over_mcp() {
 
     // whoami returns the structured identity.
     let who = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__whoami".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__whoami"); __p.arguments = None; __p })
         .await
         .unwrap();
     assert_eq!(who.structured_content.unwrap()["handle"], "alice");
 
     // Add a user-defined stdio server, set its env, then list it back.
     let added = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({
                 "namespace": "zbx", "transport": "stdio",
                 "command": "uvx zabbix-mcp-server", "display_name": "My Zabbix",
                 "env": {"ZABBIX_TOKEN": "s3cr3t"}
-            })),
-        })
+            })); __p })
         .await
         .unwrap();
     assert_eq!(added.structured_content.unwrap()["added"], true);
 
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_my_servers".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -553,17 +514,11 @@ async fn management_tools_over_mcp() {
 
     // Replacing the env keeps only the new keys.
     client
-        .call_tool(CallToolRequestParam {
-            name: "hub__set_env".into(),
-            arguments: args(serde_json::json!({"namespace": "zbx", "env": {"ZABBIX_URL": "https://z/api"}})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__set_env"); __p.arguments = args(serde_json::json!({"namespace": "zbx", "env": {"ZABBIX_URL": "https://z/api"}})); __p })
         .await
         .unwrap();
     let relisted = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_my_servers".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
     let relisted_json = serde_json::to_string(&relisted.structured_content).unwrap();
@@ -572,10 +527,7 @@ async fn management_tools_over_mcp() {
 
     // Reserved namespace cannot be claimed via the management interface.
     let reserved = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({"namespace": "hub", "transport": "stdio", "command": "x"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({"namespace": "hub", "transport": "stdio", "command": "x"})); __p })
         .await;
     let rejected = match reserved {
         Err(_) => true,
@@ -600,10 +552,7 @@ async fn admin_invite_tools_round_trip() {
 
     // Generate an invite; the plaintext code is returned exactly once.
     let created = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__create_invite".into(),
-            arguments: args(serde_json::json!({"note": "for bob"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_invite"); __p.arguments = args(serde_json::json!({"note": "for bob"})); __p })
         .await
         .unwrap();
     let created = created.structured_content.unwrap();
@@ -616,10 +565,7 @@ async fn admin_invite_tools_round_trip() {
         .await
         .unwrap());
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_invites".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_invites"); __p.arguments = None; __p })
         .await
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -630,10 +576,7 @@ async fn admin_invite_tools_round_trip() {
 
     // Revoke it; afterwards it is no longer redeemable.
     client
-        .call_tool(CallToolRequestParam {
-            name: "hub__revoke_invite".into(),
-            arguments: args(serde_json::json!({"id": id})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__revoke_invite"); __p.arguments = args(serde_json::json!({"id": id})); __p })
         .await
         .unwrap();
     assert!(!mcp_hub::invites::is_redeemable(&state.db, &code)
@@ -660,10 +603,7 @@ async fn personal_access_token_tools_round_trip() {
         .await
         .unwrap();
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_tokens".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_tokens"); __p.arguments = None; __p })
         .await
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -674,10 +614,7 @@ async fn personal_access_token_tools_round_trip() {
 
     // Revoke it over MCP; afterwards it no longer authenticates.
     let revoked = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__revoke_token".into(),
-            arguments: args(serde_json::json!({"token_id": pat.id})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__revoke_token"); __p.arguments = args(serde_json::json!({"token_id": pat.id})); __p })
         .await
         .unwrap();
     assert_eq!(revoked.structured_content.unwrap()["revoked"], true);
@@ -740,10 +677,7 @@ async fn client_can_label_only_itself() {
     // get_my_client returns client-a's own (empty) label + its registered name,
     // and never leaks client-b's label.
     let got = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__get_my_client".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__get_my_client"); __p.arguments = None; __p })
         .await
         .unwrap();
     let g = got.structured_content.unwrap();
@@ -754,10 +688,7 @@ async fn client_can_label_only_itself() {
 
     // set_my_client updates only client-a.
     let set = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__set_my_client".into(),
-            arguments: args(serde_json::json!({"name": "My Laptop", "note": "personal"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__set_my_client"); __p.arguments = args(serde_json::json!({"name": "My Laptop", "note": "personal"})); __p })
         .await
         .unwrap();
     assert_eq!(set.structured_content.unwrap()["name"], "My Laptop");
@@ -789,10 +720,7 @@ async fn self_service_client_tools_reject_personal_access_tokens() {
     let client = connect(&base, secret).await;
 
     let res = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__set_my_client".into(),
-            arguments: args(serde_json::json!({"name": "x"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__set_my_client"); __p.arguments = args(serde_json::json!({"name": "x"})); __p })
         .await;
     let rejected = match res {
         Err(_) => true,
@@ -868,10 +796,7 @@ async fn denied_backend_is_hidden_from_oauth_client() {
 
     // And a direct call is refused.
     let blocked = client
-        .call_tool(CallToolRequestParam {
-            name: "mock__echo".into(),
-            arguments: args(serde_json::json!({ "msg": "hi" })),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hi" })); __p })
         .await;
     assert!(blocked.is_err(), "denied backend call should fail");
 
@@ -941,10 +866,7 @@ async fn admin_can_disable_and_delete_users() {
 
     // The admin cannot disable themselves (last admin + self guard).
     let self_disable = admin_client
-        .call_tool(CallToolRequestParam {
-            name: "hub__disable_user".into(),
-            arguments: args(serde_json::json!({"handle": "alice"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable_user"); __p.arguments = args(serde_json::json!({"handle": "alice"})); __p })
         .await;
     let blocked = match self_disable {
         Err(_) => true,
@@ -954,10 +876,7 @@ async fn admin_can_disable_and_delete_users() {
 
     // Disabling Bob revokes his proxy access immediately.
     admin_client
-        .call_tool(CallToolRequestParam {
-            name: "hub__disable_user".into(),
-            arguments: args(serde_json::json!({"handle": "bob"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable_user"); __p.arguments = args(serde_json::json!({"handle": "bob"})); __p })
         .await
         .unwrap();
     assert!(
@@ -967,20 +886,14 @@ async fn admin_can_disable_and_delete_users() {
 
     // Re-enabling restores access.
     admin_client
-        .call_tool(CallToolRequestParam {
-            name: "hub__enable_user".into(),
-            arguments: args(serde_json::json!({"handle": "bob"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__enable_user"); __p.arguments = args(serde_json::json!({"handle": "bob"})); __p })
         .await
         .unwrap();
     assert!(try_connect(&base, bob_token).await.is_ok());
 
     // Deleting Bob removes the account.
     admin_client
-        .call_tool(CallToolRequestParam {
-            name: "hub__delete_user".into(),
-            arguments: args(serde_json::json!({"handle": "bob"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__delete_user"); __p.arguments = args(serde_json::json!({"handle": "bob"})); __p })
         .await
         .unwrap();
     assert!(users::find_by_handle(&state.db, "bob")
@@ -1005,39 +918,27 @@ async fn http_server_add_and_edit() {
 
     // Add an http server with its own URL — a bad URL is rejected.
     let bad = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({"namespace": "mem", "transport": "http", "url": "not-a-url"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({"namespace": "mem", "transport": "http", "url": "not-a-url"})); __p })
         .await;
     assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
 
     client
-        .call_tool(CallToolRequestParam {
-            name: "hub__add_server".into(),
-            arguments: args(serde_json::json!({
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({
                 "namespace": "mem", "transport": "http",
                 "url": "https://memory.example.net/mcp",
                 "env": {"AUTHORIZATION": "Bearer t"}
-            })),
-        })
+            })); __p })
         .await
         .unwrap();
 
     // Edit the URL.
     client
-        .call_tool(CallToolRequestParam {
-            name: "hub__edit_server".into(),
-            arguments: args(serde_json::json!({"namespace": "mem", "url": "https://other.example.net/mcp"})),
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__edit_server"); __p.arguments = args(serde_json::json!({"namespace": "mem", "url": "https://other.example.net/mcp"})); __p })
         .await
         .unwrap();
 
     let listed = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_my_servers".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -1071,10 +972,7 @@ async fn non_admin_cannot_use_admin_tools() {
 
     // And invoking one directly is refused.
     let res = client
-        .call_tool(CallToolRequestParam {
-            name: "hub__list_users".into(),
-            arguments: None,
-        })
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_users"); __p.arguments = None; __p })
         .await;
     let refused = match res {
         Err(_) => true,

@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult, Prompt,
-    ReadResourceRequestParam, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Prompt,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
     Tool,
 };
 use rmcp::service::{serve_client, RunningService};
@@ -193,7 +193,7 @@ impl Backend {
     pub async fn read_resource(&self, original_uri: String) -> Result<ReadResourceResult> {
         let mut result = self
             .peer
-            .read_resource(ReadResourceRequestParam { uri: original_uri })
+            .read_resource(ReadResourceRequestParams::new(original_uri))
             .await
             .with_context(|| format!("reading resource on '{}'", self.namespace))?;
         for c in &mut result.contents {
@@ -203,6 +203,9 @@ impl Backend {
                     let wrapped = wrap_uri(&self.namespace, uri);
                     *uri = wrapped;
                 }
+                // ResourceContents is #[non_exhaustive] in rmcp 2.x; any future
+                // variant without a URI to re-wrap passes through unchanged.
+                _ => {}
             }
         }
         Ok(result)
@@ -226,11 +229,12 @@ impl Backend {
         original_name: String,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<GetPromptResult> {
+        let mut params = GetPromptRequestParams::new(original_name);
+        if let Some(arguments) = arguments {
+            params = params.with_arguments(arguments);
+        }
         self.peer
-            .get_prompt(GetPromptRequestParam {
-                name: original_name,
-                arguments,
-            })
+            .get_prompt(params)
             .await
             .with_context(|| format!("getting prompt on '{}'", self.namespace))
     }
@@ -241,11 +245,12 @@ impl Backend {
         original_name: String,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult> {
+        let mut params = CallToolRequestParams::new(original_name);
+        if let Some(arguments) = arguments {
+            params = params.with_arguments(arguments);
+        }
         self.peer
-            .call_tool(CallToolRequestParam {
-                name: original_name.into(),
-                arguments,
-            })
+            .call_tool(params)
             .await
             .with_context(|| format!("calling tool on '{}'", self.namespace))
     }
@@ -264,7 +269,7 @@ impl Backend {
 async fn capture_snapshot(
     peer: &RunningService<RoleClient, ()>,
 ) -> crate::instances::CapabilitiesSnapshot {
-    let server = peer.peer_info().cloned().unwrap_or_default();
+    let server = peer.peer_info().as_deref().cloned().unwrap_or_default();
     let caps = server.capabilities.clone();
     let tools = if caps.tools.is_some() {
         peer.list_all_tools().await.unwrap_or_else(|e| {

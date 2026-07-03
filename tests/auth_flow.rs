@@ -28,6 +28,7 @@ fn test_config() -> Config {
         child_limits: Default::default(),
 
         block_private_backend_ips: false,
+        allowed_hosts: Vec::new(),
     }
 }
 
