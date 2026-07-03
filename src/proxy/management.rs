@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use std::collections::BTreeMap;
 
-use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
+use rmcp::model::{CallToolResult, Content, JsonObject, Tool, ToolAnnotations};
 use rmcp::ErrorData as McpError;
 use serde_json::{json, Value};
 
@@ -212,7 +212,39 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             schema(json!({"handle": {"type": "string"}}), &["handle"]),
         ));
     }
+    for tool in &mut t {
+        tool.annotations = Some(annotations_for(&tool.name));
+    }
     t
+}
+
+/// Behavioral-hint annotations for each management tool, keyed by full
+/// `hub__`-prefixed name. New tools fall through to the "idempotent,
+/// non-destructive update" default — recategorize here if that is wrong.
+fn annotations_for(name: &str) -> ToolAnnotations {
+    let a = ToolAnnotations::new();
+    match name {
+        "hub__whoami" | "hub__list_my_servers" | "hub__list_tokens"
+        | "hub__get_my_client" | "hub__runtime_stats" | "hub__list_users"
+        | "hub__list_invites" => {
+            a.read_only(true).destructive(false).idempotent(true).open_world(false)
+        }
+        // Build from external git repos → open world.
+        "hub__add_server" | "hub__update_server" => {
+            a.read_only(false).destructive(false).idempotent(false).open_world(true)
+        }
+        // Each returns a fresh one-time code → not idempotent.
+        "hub__create_invite" | "hub__create_recovery" => {
+            a.read_only(false).destructive(false).idempotent(false).open_world(false)
+        }
+        "hub__remove" | "hub__revoke_token" | "hub__revoke_invite"
+        | "hub__delete_user" | "hub__disable_user" => {
+            a.read_only(false).destructive(true).idempotent(true).open_world(false)
+        }
+        // edit_server, set_env, set_config_file, enable, disable,
+        // set_my_client, enable_user — and any future tool.
+        _ => a.read_only(false).destructive(false).idempotent(true).open_world(false),
+    }
 }
 
 /// Whether a (full, `hub__`-prefixed) tool name is a management tool.
@@ -1018,4 +1050,41 @@ fn opt_str(args: &JsonObject, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tools;
+
+    /// Every management tool carries behavioral-hint annotations, and the
+    /// representative tools land in the right categories.
+    #[test]
+    fn management_tools_are_annotated() {
+        let t = tools(true);
+        let find = |name: &str| {
+            t.iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.annotations.clone())
+                .unwrap_or_else(|| panic!("{name} missing annotations"))
+        };
+
+        // Every tool is annotated.
+        assert!(t.iter().all(|tool| tool.annotations.is_some()));
+
+        // Reads are read-only.
+        assert_eq!(find("hub__whoami").read_only_hint, Some(true));
+
+        // Destructive tools are flagged destructive and idempotent.
+        let remove = find("hub__remove");
+        assert_eq!(remove.destructive_hint, Some(true));
+        assert_eq!(remove.idempotent_hint, Some(true));
+
+        // Git-sourced builds reach the open world.
+        assert_eq!(find("hub__update_server").open_world_hint, Some(true));
+
+        // Plain updates are idempotent and non-destructive.
+        let enable = find("hub__enable");
+        assert_eq!(enable.idempotent_hint, Some(true));
+        assert_eq!(enable.destructive_hint, Some(false));
+    }
 }
