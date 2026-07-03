@@ -78,6 +78,10 @@ a { color: var(--accent); text-decoration: none; }
   font-size: 12px;
   font-weight: 600;
 }
+/* Tool annotation hint chips (readOnlyHint, destructiveHint, ...). */
+.badge.ann-safe    { background: rgba(63, 185, 80, 0.18);   color: #6ee787; }
+.badge.ann-warn    { background: rgba(255, 107, 107, 0.18); color: var(--error); }
+.badge.ann-neutral { background: rgba(139, 145, 160, 0.20); color: var(--muted); }
 code {
   background: #11141a;
   border: 1px solid var(--border);

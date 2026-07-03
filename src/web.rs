@@ -1013,6 +1013,42 @@ fn schema_block(label: &str, schema: &serde_json::Map<String, serde_json::Value>
 }
 
 /// Render a cached [`instances::CapabilitiesSnapshot`] as the body of the
+/// Render MCP `ToolAnnotations` behavioral hints as color-coded chips. Only
+/// hints the server actually set (`Some`) produce a chip. Labels are fixed
+/// literals, so no escaping is needed.
+fn annotation_chips(ann: &rmcp::model::ToolAnnotations) -> String {
+    let mut chips = String::new();
+    let mut chip = |cls: &str, label: &str| {
+        chips.push_str(&format!(
+            r#"<span class="badge ann-{cls}">{label}</span> "#,
+            cls = cls,
+            label = label,
+        ));
+    };
+    match ann.read_only_hint {
+        Some(true) => chip("safe", "read-only"),
+        Some(false) => chip("warn", "read-write"),
+        None => {}
+    }
+    // destructiveHint is meaningful only when the tool is not read-only.
+    if ann.read_only_hint != Some(true) {
+        match ann.destructive_hint {
+            Some(true) => chip("warn", "destructive"),
+            Some(false) => chip("safe", "non-destructive"),
+            None => {}
+        }
+    }
+    if ann.idempotent_hint == Some(true) {
+        chip("neutral", "idempotent");
+    }
+    match ann.open_world_hint {
+        Some(true) => chip("neutral", "open world"),
+        Some(false) => chip("neutral", "closed world"),
+        None => {}
+    }
+    chips
+}
+
 /// Capabilities tab: server summary, instructions, then tools / prompts /
 /// resources with `<details>` expanders.
 fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> String {
@@ -1103,6 +1139,16 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
             if let Some(title) = tool.title.as_deref().filter(|t| !t.is_empty()) {
                 body.push_str(&format!("<p><strong>{}</strong></p>", esc(title)));
             }
+            // ToolAnnotations may carry a distinct display title; surface it too
+            // unless it just repeats the tool's own title.
+            if let Some(ann_title) = tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.title.as_deref())
+                .filter(|t| !t.is_empty() && Some(*t) != tool.title.as_deref())
+            {
+                body.push_str(&format!("<p><strong>{}</strong></p>", esc(ann_title)));
+            }
             if !desc.is_empty() {
                 body.push_str(&format!("<p>{}</p>", esc(desc)));
             }
@@ -1110,10 +1156,16 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
             if let Some(output) = &tool.output_schema {
                 body.push_str(&schema_block("Output schema", output));
             }
+            let chips = tool
+                .annotations
+                .as_ref()
+                .map(annotation_chips)
+                .unwrap_or_default();
             out.push_str(&format!(
-                r#"<details class="tool"><summary><code>{name}</code> <span class="muted">{summary}</span></summary>{body}</details>"#,
+                r#"<details class="tool"><summary><code>{name}</code> <span class="muted">{summary}</span> {chips}</summary>{body}</details>"#,
                 name = esc(&tool.name),
                 summary = esc(&truncate_chars(desc, 120)),
+                chips = chips,
                 body = body,
             ));
         }
@@ -2437,14 +2489,21 @@ mod tests {
         };
         let mut schema = serde_json::Map::new();
         schema.insert("type".into(), serde_json::Value::String("object".into()));
+        let tool = rmcp::model::Tool::new(
+            "search",
+            "Find <things> fast",
+            std::sync::Arc::new(schema),
+        )
+        .annotate(
+            rmcp::model::ToolAnnotations::new()
+                .read_only(true)
+                .idempotent(true)
+                .open_world(false),
+        );
         let snap = CapabilitiesSnapshot {
             fetched_at: 0,
             server,
-            tools: vec![rmcp::model::Tool::new(
-                "search",
-                "Find <things> fast",
-                std::sync::Arc::new(schema),
-            )],
+            tools: vec![tool],
             prompts: Vec::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
@@ -2459,6 +2518,10 @@ mod tests {
         assert!(html.contains("Find &lt;things&gt; fast"));
         assert!(html.contains("&quot;type&quot;: &quot;object&quot;"), "schema rendered: {html}");
         assert!(html.contains("<code>demo__&lt;name&gt;</code>"), "namespacing note present");
+        // Annotation hints render as color-coded chips in the tool summary.
+        assert!(html.contains(r#"<span class="badge ann-safe">read-only</span>"#), "read-only chip: {html}");
+        assert!(html.contains(r#"<span class="badge ann-neutral">idempotent</span>"#), "idempotent chip: {html}");
+        assert!(html.contains(r#"<span class="badge ann-neutral">closed world</span>"#), "closed-world chip: {html}");
         // Prompts/resources capabilities are absent → marked unsupported.
         assert!(html.contains("Prompts (0)"));
         assert!(html.contains("Not supported by this server."));
