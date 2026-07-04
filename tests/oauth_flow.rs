@@ -26,6 +26,8 @@ fn test_config() -> Config {
 
         block_private_backend_ips: false,
         allowed_hosts: Vec::new(),
+        session_idle_ttl_secs: 1800,
+        session_absolute_ttl_secs: 43200,
     }
 }
 
@@ -302,7 +304,7 @@ async fn full_consent_flow_issues_and_exchanges_code() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let sid = session::create(&state.db, &user.id, &Default::default()).await.unwrap();
+    let sid = session::create(&state.db, &user.id, &Default::default(), state.config.session_idle_ttl_secs).await.unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,
@@ -460,7 +462,7 @@ async fn consent_without_csrf_is_rejected() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let sid = session::create(&state.db, &user.id, &Default::default()).await.unwrap();
+    let sid = session::create(&state.db, &user.id, &Default::default(), state.config.session_idle_ttl_secs).await.unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,

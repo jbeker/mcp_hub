@@ -49,6 +49,14 @@ pub struct Config {
     /// (needed when the reverse proxy forwards a Host other than the base URL's).
     /// Empty → rmcp keeps its default loopback-only allowlist (dev/test).
     pub allowed_hosts: Vec<String>,
+    /// Browser-session idle timeout in seconds (`HUB_SESSION_IDLE_SECS`). A
+    /// session expires this long after its last request; each request slides the
+    /// deadline forward. Default 1800 (30 min).
+    pub session_idle_ttl_secs: i64,
+    /// Browser-session absolute cap in seconds (`HUB_SESSION_ABSOLUTE_SECS`).
+    /// A session cannot outlive this from login, regardless of activity.
+    /// Default 43200 (12 h). Never less than `session_idle_ttl_secs`.
+    pub session_absolute_ttl_secs: i64,
 }
 
 /// `setrlimit` caps applied to every stdio backend subprocess, as a last line
@@ -182,6 +190,17 @@ impl Config {
         }
         allowed_hosts.dedup();
 
+        // Browser-session timeouts. Absolute is clamped to be at least the idle
+        // window, so a misconfigured pair can't make the absolute cap the tighter
+        // (and confusing) of the two.
+        let session_idle_ttl_secs = opt_parse::<i64>("HUB_SESSION_IDLE_SECS")?
+            .filter(|&v| v > 0)
+            .unwrap_or(1800);
+        let session_absolute_ttl_secs = opt_parse::<i64>("HUB_SESSION_ABSOLUTE_SECS")?
+            .filter(|&v| v > 0)
+            .unwrap_or(43200)
+            .max(session_idle_ttl_secs);
+
         Ok(Self {
             base_url,
             rp_id,
@@ -196,6 +215,8 @@ impl Config {
             child_limits,
             block_private_backend_ips,
             allowed_hosts,
+            session_idle_ttl_secs,
+            session_absolute_ttl_secs,
         })
     }
 

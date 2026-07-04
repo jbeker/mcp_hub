@@ -69,6 +69,8 @@ All configuration is via environment variables:
 | `HUB_MASTER_KEY` | yes | — | base64-encoded 32-byte key. Encrypts secrets at rest and signs cookies. |
 | `HUB_RP_ID` | no | host of base URL | WebAuthn relying-party id (registrable domain). |
 | `HUB_ALLOWED_HOSTS` | no | host of base URL | Comma-separated extra `Host` authorities accepted on `/mcp` (anti-DNS-rebinding). The base URL's own host is always allowed; set this only if your reverse proxy forwards a different `Host` (e.g. `hub.internal,hub.example.com:8443`). |
+| `HUB_SESSION_IDLE_SECS` | no | `1800` (30 min) | Browser-session idle timeout: a login expires this long after its last request (each request slides it forward). Sessions also end on browser close. |
+| `HUB_SESSION_ABSOLUTE_SECS` | no | `43200` (12 h) | Absolute cap on a browser session from login, regardless of activity. Clamped to be ≥ `HUB_SESSION_IDLE_SECS`. |
 | `HUB_BOOTSTRAP_ADMIN` | no | — | If set, the first registration must use this handle (and becomes admin). |
 | `HUB_ALLOW_OPEN_REGISTRATION` | no | `false` | Escape hatch: when `true`, anyone may self-register **without an invite**. Leave `false` to keep registration invite-only. |
 | `HUB_SANDBOX_UID_BASE` | no | `20000` (in image) | Base UID for the per-user stdio sandbox; each user runs as `base + slot`. Requires the container to run as root (it does). `0`/unset disables it. |

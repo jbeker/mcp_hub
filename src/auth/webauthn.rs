@@ -465,7 +465,7 @@ pub async fn register_finish(
         .await
         .map_err(ApiError::from)?;
 
-    let sid = session::create(&state.db, &user_id, &info)
+    let sid = session::create(&state.db, &user_id, &info, state.config.session_idle_ttl_secs)
         .await
         .map_err(ApiError::from)?;
     let secure = state.config.cookie_secure();
@@ -584,8 +584,13 @@ pub async fn login_finish(
     )
     .await;
 
-    let sid = session::create(&state.db, &ceremony.user_id, &info)
-        .await
+    let sid = session::create(
+        &state.db,
+        &ceremony.user_id,
+        &info,
+        state.config.session_idle_ttl_secs,
+    )
+    .await
         .map_err(ApiError::from)?;
     let handle = users::find_by_id(&state.db, &ceremony.user_id)
         .await

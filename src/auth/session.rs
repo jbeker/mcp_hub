@@ -18,8 +18,9 @@ use crate::AppState;
 pub const SESSION_COOKIE: &str = "hub_session";
 /// Cookie carrying a post-login redirect target (e.g. an in-flight /authorize).
 pub const NEXT_COOKIE: &str = "hub_next";
-/// Session lifetime in seconds (30 days).
-const SESSION_TTL_SECS: i64 = 60 * 60 * 24 * 30;
+/// Minimum seconds a session's idle deadline must advance before we write it
+/// back — throttles the per-request slide to one DB update per minute of use.
+const SESSION_TOUCH_THROTTLE_SECS: i64 = 60;
 
 /// Validate that a redirect target is a safe same-origin path.
 ///
@@ -117,7 +118,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Create a session row for a user and return its id. The request's IP and
 /// User-Agent are stored as the session's origin (shown on the Account page).
-pub async fn create(pool: &SqlitePool, user_id: &str, info: &super::RequestInfo) -> Result<String> {
+/// `expires_at` is the initial idle deadline (`now + idle_ttl_secs`); it slides
+/// forward on activity in [`load_and_touch`], bounded by the absolute cap.
+pub async fn create(
+    pool: &SqlitePool,
+    user_id: &str,
+    info: &super::RequestInfo,
+    idle_ttl_secs: i64,
+) -> Result<String> {
     let id = new_id();
     let now = now_unix();
     sqlx::query(
@@ -127,7 +135,7 @@ pub async fn create(pool: &SqlitePool, user_id: &str, info: &super::RequestInfo)
     .bind(&id)
     .bind(user_id)
     .bind(now)
-    .bind(now + SESSION_TTL_SECS)
+    .bind(now + idle_ttl_secs)
     .bind(info.ip.as_deref())
     .bind(info.user_agent.as_deref())
     .execute(pool)
@@ -207,6 +215,8 @@ pub fn current_session_id(jar: &SignedCookieJar) -> Option<String> {
 }
 
 /// Load the user behind a session id, if the session exists and is unexpired.
+/// Validation only (no slide) — used off the request-serving path (e.g. logout
+/// audit). The request extractors use [`load_and_touch`] instead.
 pub async fn user_for_session(pool: &SqlitePool, session_id: &str) -> Result<Option<User>> {
     let row: Option<(String, i64)> =
         sqlx::query_as("SELECT user_id, expires_at FROM web_sessions WHERE id = ?")
@@ -223,14 +233,69 @@ pub async fn user_for_session(pool: &SqlitePool, session_id: &str) -> Result<Opt
     users::find_by_id(pool, &user_id).await
 }
 
-/// Build the session cookie for a freshly created session id.
+/// Load the user behind a session id and slide its idle deadline forward. This
+/// is the request-path variant: it enforces both the idle timeout and the
+/// absolute cap, and refreshes `expires_at` so an active session stays alive.
+///
+/// `expires_at` is the idle deadline; the absolute cap is `created_at +
+/// absolute_ttl`. A session is valid only while **both** are in the future, so a
+/// pre-existing long-lived session (huge `expires_at`, old `created_at`) is
+/// rejected immediately by the absolute check rather than getting a one-request
+/// grace. On each valid request the idle deadline slides to `min(now + idle_ttl,
+/// created_at + absolute_ttl)`; the write is throttled (and also fires when the
+/// stored deadline sits *above* the target, capping any legacy long session down).
+pub async fn load_and_touch(
+    pool: &SqlitePool,
+    session_id: &str,
+    idle_ttl_secs: i64,
+    absolute_ttl_secs: i64,
+) -> Result<Option<User>> {
+    let row: Option<(String, i64, i64)> =
+        sqlx::query_as("SELECT user_id, created_at, expires_at FROM web_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((user_id, created_at, expires_at)) = row else {
+        return Ok(None);
+    };
+    let now = now_unix();
+    let absolute_deadline = created_at + absolute_ttl_secs;
+    if expires_at <= now || absolute_deadline <= now {
+        let _ = delete(pool, session_id).await;
+        return Ok(None);
+    }
+    let target = (now + idle_ttl_secs).min(absolute_deadline);
+    if expires_at > target || target - expires_at > SESSION_TOUCH_THROTTLE_SECS {
+        let _ = sqlx::query("UPDATE web_sessions SET expires_at = ? WHERE id = ?")
+            .bind(target)
+            .bind(session_id)
+            .execute(pool)
+            .await;
+    }
+    users::find_by_id(pool, &user_id).await
+}
+
+/// Delete every session whose idle deadline has passed. Called periodically by
+/// the background sweeper; expired rows never authenticate, so this is only
+/// housekeeping to keep the table from accumulating dead rows.
+pub async fn delete_expired(pool: &SqlitePool) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM web_sessions WHERE expires_at < ?")
+        .bind(now_unix())
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Build the session cookie for a freshly created session id. Deliberately a
+/// *session cookie* (no `Max-Age`): the browser drops it on close, and the
+/// server-side idle/absolute deadlines are the real timeout. The cookie only
+/// carries the (secret) session id.
 pub fn session_cookie(session_id: String, secure: bool) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE, session_id);
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax);
     cookie.set_secure(secure);
     cookie.set_path("/");
-    cookie.set_max_age(TimeDuration::seconds(SESSION_TTL_SECS));
     cookie
 }
 
@@ -270,7 +335,14 @@ impl FromRequestParts<AppState> for AuthUser {
         let Some(sid) = session_id_from_parts(parts, state) else {
             return Err(LoginRedirect);
         };
-        match user_for_session(&state.db, &sid).await {
+        match load_and_touch(
+            &state.db,
+            &sid,
+            state.config.session_idle_ttl_secs,
+            state.config.session_absolute_ttl_secs,
+        )
+        .await
+        {
             Ok(Some(user)) => Ok(AuthUser(user)),
             _ => Err(LoginRedirect),
         }
@@ -288,7 +360,15 @@ impl FromRequestParts<AppState> for MaybeUser {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let user = match session_id_from_parts(parts, state) {
-            Some(sid) => user_for_session(&state.db, &sid).await.ok().flatten(),
+            Some(sid) => load_and_touch(
+                &state.db,
+                &sid,
+                state.config.session_idle_ttl_secs,
+                state.config.session_absolute_ttl_secs,
+            )
+            .await
+            .ok()
+            .flatten(),
             None => None,
         };
         Ok(MaybeUser(user))

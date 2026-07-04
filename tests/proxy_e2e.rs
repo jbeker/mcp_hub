@@ -49,6 +49,8 @@ async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
 
         block_private_backend_ips: false,
         allowed_hosts: Vec::new(),
+        session_idle_ttl_secs: 1800,
+        session_absolute_ttl_secs: 43200,
     };
     let state = AppState::new(config, pool).await.unwrap();
 

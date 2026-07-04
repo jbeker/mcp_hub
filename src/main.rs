@@ -15,6 +15,8 @@ async fn main() -> Result<()> {
     let listen = config.listen;
     let state = AppState::new(config, db).await?;
 
+    spawn_session_sweeper(state.db.clone());
+
     let app = build_router(state, "static");
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -22,6 +24,23 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Periodically sweep expired browser sessions from the database. Expired rows
+/// never authenticate, so this is only housekeeping to stop the table growing
+/// with dead sessions from one-off logins.
+fn spawn_session_sweeper(db: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            ticker.tick().await;
+            match mcp_hub::auth::session::delete_expired(&db).await {
+                Ok(n) if n > 0 => tracing::debug!(swept = n, "expired sessions removed"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "session sweep failed"),
+            }
+        }
+    });
 }
 
 fn init_tracing() {
