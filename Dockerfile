@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage --------------------------------------------------------
-FROM rust:1.90-slim-bookworm AS build
+FROM rust:1.96-slim-trixie AS build
 WORKDIR /app
 
 # Native build dependencies (reqwest -> openssl-sys needs OpenSSL headers).
@@ -23,7 +23,7 @@ RUN touch src/main.rs && cargo build --release
 # ---- runtime stage ------------------------------------------------------
 # The runtime image bundles node (npx) and uv (uvx) because stdio backend
 # MCP servers are launched as child processes inside this container.
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 WORKDIR /app
 
 # `nftables` is used by the entrypoint to restrict sandbox-UID network egress;
@@ -32,8 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils libssl3 git nftables \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js (provides npx) — pinned major version.
-ENV NODE_VERSION=22.11.0
+# Node.js (provides npx) — pinned to the current Active LTS line.
+ENV NODE_VERSION=24.18.0
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -41,15 +41,20 @@ RUN set -eux; \
       arm64) node_arch="arm64" ;; \
       *) echo "unsupported arch $arch" && exit 1 ;; \
     esac; \
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
-      -o /tmp/node.tar.xz; \
+    tarball="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${tarball}" -o /tmp/node.tar.xz; \
+    # Verify the download against the release's signed SHASUMS before extracting.
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o /tmp/SHASUMS256.txt; \
+    grep " ${tarball}\$" /tmp/SHASUMS256.txt | sed 's#[^ ]*$#/tmp/node.tar.xz#' | sha256sum -c -; \
     tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
       --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
-    rm /tmp/node.tar.xz; \
+    rm /tmp/node.tar.xz /tmp/SHASUMS256.txt; \
     node --version; npx --version
 
-# uv (provides uv / uvx for Python-based MCP servers), via the official installer.
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+# uv (provides uv / uvx for Python-based MCP servers), via the official installer,
+# pinned to a specific version for reproducible builds.
+ENV UV_VERSION=0.11.26
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin sh \
     && uv --version && uvx --version
 
 COPY --from=build /app/target/release/mcp_hub /usr/local/bin/mcp_hub
