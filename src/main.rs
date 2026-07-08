@@ -56,16 +56,22 @@ fn spawn_backend_warmer(state: AppState) {
     }
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-        let mut first = true;
+        // Log the startup pass at info and later passes only when the counts
+        // moved (a backend appeared/disappeared) — a steady-state tick is pure
+        // no-op housekeeping and logs at trace so the default `mcp_hub=debug`
+        // filter stays quiet. The pool itself already logs any actual respawn.
+        let mut last: Option<(usize, usize)> = None;
         loop {
             ticker.tick().await;
             let (users, backends) = mcp_hub::proxy::pool::warm_all(&state).await;
-            if first {
-                tracing::info!(users, backends, "warmed user backends");
-                first = false;
-            } else {
-                tracing::debug!(users, backends, "re-warmed user backends");
+            match last {
+                None => tracing::info!(users, backends, "warmed user backends"),
+                Some(prev) if prev != (users, backends) => {
+                    tracing::debug!(users, backends, "re-warmed user backends")
+                }
+                _ => tracing::trace!(users, backends, "re-warmed user backends"),
             }
+            last = Some((users, backends));
         }
     });
 }
