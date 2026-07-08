@@ -290,6 +290,10 @@ pub async fn create_server(
     if let Err(e) = apply_config_file(&state, &inst.id, &form.config_file).await {
         return error_page(&e.to_string());
     }
+    // Pooled backends outlive sessions, so the server-set change must be
+    // pushed at them rather than waiting for a reconnect.
+    state.backend_pool.mark_dirty(&user.id);
+    state.notify_tools_changed(&user.id);
     audit_ok("server.add", &user, &headers, form.namespace.trim());
     Redirect::to(&format!("/servers/{}", inst.id)).into_response()
 }
@@ -656,6 +660,10 @@ async fn set_enabled_and_redirect(
         return error_page("server not found");
     };
     let _ = instances::set_enabled(&state.db, id, enabled).await;
+    // Converge live pooled backends on the change (spawn / tear down) and let
+    // connected clients know their tool list moved.
+    state.backend_pool.mark_dirty(&user.id);
+    state.notify_tools_changed(&user.id);
     let action = if enabled { "server.enable" } else { "server.disable" };
     audit_ok(action, user, headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
@@ -739,6 +747,9 @@ pub async fn delete_server(
     crate::gitsrc::remove_env(&state.config.env_dir, &id);
     crate::proxy::backend::remove_workdir(&state.config.env_dir, &id);
     crate::proxy::backend::remove_home(&state.config.env_dir, &id);
+    // Tear the pooled backend down now, not at the next reconnect.
+    state.backend_pool.mark_dirty(&user.id);
+    state.notify_tools_changed(&user.id);
     audit_ok("server.remove", &user, &headers, &inst.namespace);
     Redirect::to("/").into_response()
 }
@@ -900,6 +911,7 @@ async fn probe_instance(
         &inst.id,
         config_file.as_deref(),
         state.config.child_limits,
+        state.config.limits.backend_connect_timeout_secs,
     )
     .await
     {
@@ -2170,6 +2182,15 @@ pub async fn users_page(
 /// `/stats` — admin view: live backend-slot usage, active session count,
 /// configured limits, and each backend's last-known runtime status. The slot
 /// gauge and session count are live; the instance table is a snapshot.
+/// Render a seconds value for the limits table, with `zero` naming what 0 means.
+fn secs_or(secs: u64, zero: &str) -> String {
+    if secs == 0 {
+        zero.to_string()
+    } else {
+        format!("{secs}s")
+    }
+}
+
 pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser) -> Response {
     if !admin.is_admin {
         return admin_forbidden();
@@ -2177,8 +2198,8 @@ pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser
     let s = crate::stats::gather(&state).await;
 
     // Headline: how close the global backend pool is to its ceiling, and how
-    // many MCP sessions are live (the signal behind "global backend capacity
-    // reached" — each session holds its own copy of a user's backends).
+    // many MCP sessions are live. Backends are pooled per user and shared
+    // across sessions, so sessions can (healthily) exceed pooled users.
     let pct = (s.slots.used * 100).checked_div(s.slots.total).unwrap_or(0);
     let slots_class = match pct {
         p if p >= 90 => "danger",
@@ -2189,12 +2210,15 @@ pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser
         r#"<div class="row">
   <div class="status status-{slots_class}">Backend slots: <strong>{used} / {total}</strong> ({pct}% in use)</div>
   <div class="status status-ok">Active sessions: <strong>{sessions}</strong></div>
+  <div class="status status-ok">Pooled backends: <strong>{pool_backends}</strong> across <strong>{pool_users}</strong> user(s)</div>
 </div>"#,
         slots_class = slots_class,
         used = s.slots.used,
         total = s.slots.total,
         pct = pct,
         sessions = s.active_sessions,
+        pool_backends = s.pool.backends,
+        pool_users = s.pool.users,
     );
 
     // Configured ceilings, with their env-var names so the admin knows the knob.
@@ -2202,18 +2226,22 @@ pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser
         r#"<table class="invites"><thead><tr><th>Limit</th><th>Value</th><th>Env var</th></tr></thead><tbody>
 <tr><td>Max backends (global)</td><td>{global}</td><td><code>HUB_MAX_BACKENDS_GLOBAL</code></td></tr>
 <tr><td>Max backends per user</td><td>{per_user}</td><td><code>HUB_MAX_BACKENDS_PER_USER</code></td></tr>
-<tr><td>Backend idle timeout</td><td>{idle}s</td><td><code>HUB_BACKEND_IDLE_SECS</code></td></tr>
+<tr><td>Backend idle timeout</td><td>{idle}</td><td><code>HUB_BACKEND_IDLE_SECS</code></td></tr>
 <tr><td>Per-call timeout</td><td>{call}</td><td><code>HUB_BACKEND_CALL_TIMEOUT_SECS</code></td></tr>
+<tr><td>Connect timeout</td><td>{connect}</td><td><code>HUB_BACKEND_CONNECT_TIMEOUT_SECS</code></td></tr>
+<tr><td>List timeout</td><td>{list}</td><td><code>HUB_BACKEND_LIST_TIMEOUT_SECS</code></td></tr>
+<tr><td>Bind budget</td><td>{budget}</td><td><code>HUB_BIND_BUDGET_SECS</code></td></tr>
+<tr><td>Keep warm</td><td>{warm}</td><td><code>HUB_KEEP_WARM</code></td></tr>
 <tr><td>Max response size</td><td>{resp}</td><td><code>HUB_MAX_RESPONSE_MB</code></td></tr>
 </tbody></table>"#,
         global = s.limits.max_backends_global,
         per_user = s.limits.max_backends_per_user,
-        idle = s.limits.backend_idle_secs,
-        call = if s.limits.backend_call_timeout_secs == 0 {
-            "off".to_string()
-        } else {
-            format!("{}s", s.limits.backend_call_timeout_secs)
-        },
+        idle = secs_or(s.limits.backend_idle_secs, "off"),
+        call = secs_or(s.limits.backend_call_timeout_secs, "off"),
+        connect = secs_or(s.limits.backend_connect_timeout_secs, "off"),
+        list = secs_or(s.limits.backend_list_timeout_secs, "off"),
+        budget = secs_or(s.limits.bind_budget_secs, "wait for all"),
+        warm = if state.config.keep_warm { "on" } else { "off" },
         resp = if s.limits.max_response_mb == 0 {
             "uncapped".to_string()
         } else {

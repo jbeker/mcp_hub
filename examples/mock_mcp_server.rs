@@ -1,15 +1,20 @@
 //! A minimal stdio MCP server used by the proxy integration tests.
 //!
-//! Exposes one tool, `echo`, which returns its `msg` argument. It also reads an
-//! optional `MOCK_PREFIX` environment variable so tests can verify that the hub
-//! injects per-instance configuration/secrets into the spawned process.
+//! Exposes an `echo` tool (returns its `msg` argument), a `sleep` tool (for
+//! call-timeout tests), and a `pid` tool (for backend-pooling tests). Reads
+//! optional environment variables so tests can shape its behavior:
+//! `MOCK_PREFIX` prefixes echo output (verifies per-instance config injection),
+//! `MOCK_INIT_DELAY_MS` stalls startup before serving `initialize` (connect
+//! timeout / bind budget tests), and `MOCK_LIST_DELAY_MS` stalls `tools/list`
+//! (list timeout tests).
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-    ListResourcesResult, PaginatedRequestParams, Prompt, PromptMessage, ReadResourceRequestParams,
-    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, Role,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -19,9 +24,16 @@ use serde::Deserialize;
 
 const RES_URI: &str = "mock://greeting";
 
+/// Sleep for the number of milliseconds named by `var`, if set and non-zero.
+async fn env_delay(var: &str) {
+    let ms = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 #[derive(Clone)]
 struct Mock {
-    #[expect(dead_code, reason = "tool_handler macro accesses this router field")]
     tool_router: ToolRouter<Self>,
 }
 
@@ -57,10 +69,32 @@ impl Mock {
         tokio::time::sleep(std::time::Duration::from_millis(args.ms)).await;
         Ok(CallToolResult::success(vec![ContentBlock::text("slept")]))
     }
+
+    #[tool(description = "Report this server process's PID (used to test backend pooling)")]
+    async fn pid(&self) -> Result<CallToolResult, McpError> {
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            std::process::id().to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for Mock {
+    // Defined by hand (the macro skips it) so `MOCK_LIST_DELAY_MS` can stall
+    // the reply — exercising the hub's per-backend list timeout.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        env_delay("MOCK_LIST_DELAY_MS").await;
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder()
@@ -129,6 +163,9 @@ impl ServerHandler for Mock {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Stall before answering `initialize`, so tests can simulate a backend
+    // with a slow (or hung) startup handshake.
+    env_delay("MOCK_INIT_DELAY_MS").await;
     let service = Mock::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

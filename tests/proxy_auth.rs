@@ -19,6 +19,7 @@ fn test_config() -> Config {
         bootstrap_admin: None,
         allow_open_registration: false,
         sandbox_uid_base: None,
+        keep_warm: false,
         limits: Limits::default(),
         child_limits: Default::default(),
 

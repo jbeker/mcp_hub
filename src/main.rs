@@ -16,6 +16,8 @@ async fn main() -> Result<()> {
     let state = AppState::new(config, db).await?;
 
     spawn_session_sweeper(state.db.clone());
+    spawn_backend_reaper(state.clone());
+    spawn_backend_warmer(state.clone());
 
     let app = build_router(state, "static");
 
@@ -38,6 +40,54 @@ fn spawn_session_sweeper(db: sqlx::SqlitePool) {
                 Ok(n) if n > 0 => tracing::debug!(swept = n, "expired sessions removed"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "session sweep failed"),
+            }
+        }
+    });
+}
+
+/// Keep every enabled user's pooled backends hot (`HUB_KEEP_WARM`, default
+/// on): bind them all at startup and re-touch each minute so a new connection
+/// never pays a cold start and a crashed backend is respawned without waiting
+/// for a request. The touch counts as use, so warmed pools are never idle
+/// enough for [`spawn_backend_reaper`] to retire.
+fn spawn_backend_warmer(state: AppState) {
+    if !state.config.keep_warm {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut first = true;
+        loop {
+            ticker.tick().await;
+            let (users, backends) = mcp_hub::proxy::pool::warm_all(&state).await;
+            if first {
+                tracing::info!(users, backends, "warmed user backends");
+                first = false;
+            } else {
+                tracing::debug!(users, backends, "re-warmed user backends");
+            }
+        }
+    });
+}
+
+/// Periodically retire pooled backends whose owner has made no MCP request for
+/// `HUB_BACKEND_IDLE_SECS` (0 disables reaping — backends then live until the
+/// hub restarts). This is what frees global backend slots between sessions.
+fn spawn_backend_reaper(state: AppState) {
+    let idle_secs = state.config.limits.backend_idle_secs;
+    if idle_secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let period = (idle_secs / 4).clamp(30, 300);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period));
+        loop {
+            ticker.tick().await;
+            let (users, backends) = state
+                .backend_pool
+                .reap_idle(std::time::Duration::from_secs(idle_secs));
+            if users > 0 {
+                tracing::info!(users, backends, idle_secs, "reaped idle backends");
             }
         }
     });

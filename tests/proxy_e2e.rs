@@ -44,6 +44,9 @@ async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
         bootstrap_admin: None,
         allow_open_registration: false,
         sandbox_uid_base: None,
+        // Tests drive warming explicitly via `pool::warm_all` (the warmer task
+        // only runs in the real binary anyway).
+        keep_warm: false,
         limits,
         child_limits: Default::default(),
 
@@ -946,6 +949,325 @@ async fn http_server_add_and_edit() {
     let json = serde_json::to_string(&listed.structured_content).unwrap();
     assert!(json.contains("other.example.net"), "got {json}");
     assert!(json.contains("\"transport\":\"http\""), "got {json}");
+
+    let _ = client.cancel().await;
+}
+
+/// The mock backend as a plain stdio ServerDef.
+fn mock_def() -> ServerDef {
+    ServerDef {
+        name: "Mock".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some(mock_server_path()),
+        args: vec![],
+        url: None,
+        runtime: "binary".into(),
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    }
+}
+
+/// Call the mock's `pid` tool: the OS process id of the backend serving this
+/// client, which is what proves (non-)reuse across sessions.
+async fn mock_pid(client: &RunningService<RoleClient, ()>, tool: &str) -> String {
+    let result = client
+        .call_tool({ let mut __p = CallToolRequestParams::new(tool.to_string()); __p.arguments = None; __p })
+        .await
+        .unwrap();
+    serde_json::to_string(&result.content).unwrap()
+}
+
+/// Backends are pooled per user: a second session (after the first is gone)
+/// reuses the same live subprocess instead of paying a fresh cold start.
+#[tokio::test]
+async fn backend_pool_is_shared_across_sessions() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+
+    let token = |n: &str| {
+        state
+            .signer
+            .issue_access_token(&user_id, n, &format!("{base}/mcp"), "mcp", false, 3600)
+            .unwrap()
+            .0
+    };
+    let a = connect(&base, token("client-a")).await;
+    let pid_a = mock_pid(&a, "mock__pid").await;
+    let _ = a.cancel().await;
+
+    let b = connect(&base, token("client-b")).await;
+    let pid_b = mock_pid(&b, "mock__pid").await;
+    assert_eq!(pid_a, pid_b, "second session should reuse the pooled backend");
+    let _ = b.cancel().await;
+}
+
+/// Two sessions binding at the same time must not double-spawn: the bind lock
+/// serializes them onto one backend.
+#[tokio::test]
+async fn concurrent_sessions_share_one_backend() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+
+    let token = |n: &str| {
+        state
+            .signer
+            .issue_access_token(&user_id, n, &format!("{base}/mcp"), "mcp", false, 3600)
+            .unwrap()
+            .0
+    };
+    let (a, b) = tokio::join!(connect(&base, token("c-a")), connect(&base, token("c-b")));
+    let (pid_a, pid_b) = tokio::join!(mock_pid(&a, "mock__pid"), mock_pid(&b, "mock__pid"));
+    assert_eq!(pid_a, pid_b, "concurrent sessions should share one backend");
+    let _ = a.cancel().await;
+    let _ = b.cancel().await;
+}
+
+/// A backend that hangs during its `initialize` handshake is cut off by
+/// `HUB_BACKEND_CONNECT_TIMEOUT_SECS` and skipped — the session still gets its
+/// other tools promptly, and the failure is reported on the instance.
+#[tokio::test]
+async fn hung_initialize_is_timed_out_and_skipped() {
+    let limits = Limits {
+        backend_connect_timeout_secs: 1,
+        ..Limits::default()
+    };
+    let (base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let inst = instances::create(&state.db, &user.id, None, Some(&mock_def()), "hang", "Hang")
+        .await
+        .unwrap();
+    instances::set_config_value(&state.db, &inst.id, "MOCK_INIT_DELAY_MS", "30000")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("hang__")), "got {names:?}");
+    assert!(names.contains(&"hub__whoami".to_string()));
+
+    let listed = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(json.contains("timed out"), "timeout not reported: {json}");
+
+    let _ = client.cancel().await;
+}
+
+/// A backend that hangs answering `tools/list` is skipped from the aggregate
+/// (after `HUB_BACKEND_LIST_TIMEOUT_SECS`) instead of stalling the client.
+#[tokio::test]
+async fn hung_tools_list_is_skipped_not_fatal() {
+    let limits = Limits {
+        backend_list_timeout_secs: 1,
+        ..Limits::default()
+    };
+    let (base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let inst = instances::create(&state.db, &user.id, None, Some(&mock_def()), "slowlist", "SlowList")
+        .await
+        .unwrap();
+    instances::set_config_value(&state.db, &inst.id, "MOCK_LIST_DELAY_MS", "30000")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    let t0 = std::time::Instant::now();
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("slowlist__")), "got {names:?}");
+    assert!(names.contains(&"hub__whoami".to_string()));
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(10),
+        "list should be cut off by the list timeout, took {:?}",
+        t0.elapsed()
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// The idle reaper retires a user's pooled backends; the next request simply
+/// rebinds fresh ones (a new subprocess).
+#[tokio::test]
+async fn idle_reap_retires_backends_and_next_request_rebinds() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    let pid_before = mock_pid(&client, "mock__pid").await;
+    let (users, backends) = state.backend_pool.reap_idle(std::time::Duration::ZERO);
+    assert_eq!((users, backends), (1, 1), "one pooled user with one backend");
+
+    // Same live session: the next request rebinds against a fresh subprocess.
+    let pid_after = mock_pid(&client, "mock__pid").await;
+    assert_ne!(pid_before, pid_after, "reap should have retired the old process");
+
+    let _ = client.cancel().await;
+}
+
+/// Disabling a server tears its pooled backend down for live sessions on their
+/// next request (no reconnect needed), and re-enabling brings it back.
+#[tokio::test]
+async fn disable_and_enable_converge_in_live_sessions() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    async fn list(client: &RunningService<RoleClient, ()>) -> Vec<String> {
+        client
+            .list_all_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+    assert!(list(&client).await.contains(&"mock__echo".to_string()));
+
+    client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable"); __p.arguments = args(serde_json::json!({"namespace": "mock"})); __p })
+        .await
+        .unwrap();
+    let names = list(&client).await;
+    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+
+    client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__enable"); __p.arguments = args(serde_json::json!({"namespace": "mock"})); __p })
+        .await
+        .unwrap();
+    let names = list(&client).await;
+    assert!(names.contains(&"mock__echo".to_string()), "not back: {names:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// Keep-warm binds backends before any client connects, so the first
+/// connection finds hot tools — and re-warming never respawns a healthy one.
+#[tokio::test]
+async fn warm_all_prewarms_backends_before_any_connection() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    // A second user with no servers must not be warmed into an empty entry.
+    users::create(&state.db, "u2", "bob", "Bob", false).await.unwrap();
+
+    let (users, backends) = mcp_hub::proxy::pool::warm_all(&state).await;
+    assert_eq!((users, backends), (1, 1), "one user with one enabled server");
+    assert_eq!(state.backend_pool.counts(), (1, 1), "backend live before any client");
+
+    // The pre-warmed subprocess is exactly what a new connection is handed…
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+    let pid_before = mock_pid(&client, "mock__pid").await;
+
+    // …and a re-warm pass leaves the healthy backend untouched.
+    let _ = mcp_hub::proxy::pool::warm_all(&state).await;
+    let pid_after = mock_pid(&client, "mock__pid").await;
+    assert_eq!(pid_before, pid_after, "re-warm must not respawn a healthy backend");
+
+    let _ = client.cancel().await;
+}
+
+/// A bind budget answers the first `tools/list` with whatever connected in
+/// time; a slow-starting backend keeps connecting in the background and shows
+/// up on a later list, instead of stalling the first one past the client's
+/// patience.
+#[tokio::test]
+async fn bind_budget_serves_partial_then_adds_late_backend() {
+    let limits = Limits {
+        bind_budget_secs: 1,
+        ..Limits::default()
+    };
+    let (base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    instances::create(&state.db, &user.id, None, Some(&mock_def()), "fast", "Fast")
+        .await
+        .unwrap();
+    let slow = instances::create(&state.db, &user.id, None, Some(&mock_def()), "slow", "Slow")
+        .await
+        .unwrap();
+    instances::set_config_value(&state.db, &slow.id, "MOCK_INIT_DELAY_MS", "3000")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    // The first list respects the budget: fast is in, slow is still pending.
+    let t0 = std::time::Instant::now();
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(3),
+        "first list should return within the budget, took {:?}",
+        t0.elapsed()
+    );
+    assert!(names.contains(&"fast__echo".to_string()), "got {names:?}");
+    assert!(!names.contains(&"slow__echo".to_string()), "got {names:?}");
+
+    // The slow backend finishes connecting in the background and appears.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let names: Vec<String> = client
+            .list_all_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        if names.contains(&"slow__echo".to_string()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "slow backend never arrived: {names:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
 
     let _ = client.cancel().await;
 }

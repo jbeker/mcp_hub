@@ -626,6 +626,9 @@ async fn add_server(
             .await
             .map_err(internal)?;
     }
+    // Pooled backends outlive sessions; push the server-set change at them.
+    state.backend_pool.mark_dirty(user_id);
+    state.notify_tools_changed(user_id);
     ok(json!({ "added": true, "namespace": inst.namespace }))
 }
 
@@ -749,6 +752,9 @@ async fn set_enabled(
     instances::set_enabled(&state.db, &inst.id, enabled)
         .await
         .map_err(internal)?;
+    // Converge live pooled backends (spawn / tear down) on the change.
+    state.backend_pool.mark_dirty(user_id);
+    state.notify_tools_changed(user_id);
     ok(json!({ "namespace": namespace, "enabled": enabled }))
 }
 
@@ -768,6 +774,9 @@ async fn remove(
     crate::gitsrc::remove_env(&state.config.env_dir, &inst.id);
     crate::proxy::backend::remove_workdir(&state.config.env_dir, &inst.id);
     crate::proxy::backend::remove_home(&state.config.env_dir, &inst.id);
+    // Tear the pooled backend down now, not at the next reconnect.
+    state.backend_pool.mark_dirty(user_id);
+    state.notify_tools_changed(user_id);
     ok(json!({ "removed": true, "namespace": namespace }))
 }
 

@@ -32,6 +32,9 @@ impl Backend {
     /// Establish a connection for `def`, injecting `env` (decrypted secrets +
     /// non-secret config). The `permit` (a global backend slot) is held for the
     /// life of the connection. The backend is initialized and ready on success.
+    /// `connect_timeout_secs` caps the spawn + `initialize` handshake (0 =
+    /// unbounded); on expiry the half-started transport is dropped, killing a
+    /// stdio child.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         def: &ServerDef,
@@ -44,6 +47,7 @@ impl Backend {
         env_dir: &str,
         config_file: Option<&str>,
         child_limits: crate::config::ChildLimits,
+        connect_timeout_secs: u64,
     ) -> Result<Backend> {
         let peer = match def.transport.as_str() {
             "stdio" => {
@@ -59,7 +63,7 @@ impl Backend {
                 .with_context(|| format!("backend '{namespace}'"))?;
                 let transport = TokioChildProcess::new(cmd)
                     .with_context(|| format!("spawning backend '{namespace}'"))?;
-                serve_client((), transport)
+                init_with_timeout(transport, connect_timeout_secs)
                     .await
                     .with_context(|| format!("initializing stdio backend '{namespace}'"))?
             }
@@ -67,7 +71,7 @@ impl Backend {
                 let config =
                     http_config(def, env).with_context(|| format!("backend '{namespace}'"))?;
                 let transport = StreamableHttpClientTransport::from_config(config);
-                serve_client((), transport)
+                init_with_timeout(transport, connect_timeout_secs)
                     .await
                     .with_context(|| format!("connecting http backend '{namespace}'"))?
             }
@@ -93,6 +97,7 @@ impl Backend {
     /// connection.
     ///
     /// [`CapabilitiesSnapshot`]: crate::instances::CapabilitiesSnapshot
+    #[allow(clippy::too_many_arguments)]
     pub async fn probe(
         def: &ServerDef,
         env: &BTreeMap<String, String>,
@@ -101,6 +106,7 @@ impl Backend {
         instance_id: &str,
         config_file: Option<&str>,
         child_limits: crate::config::ChildLimits,
+        connect_timeout_secs: u64,
     ) -> Result<crate::instances::CapabilitiesSnapshot> {
         match def.transport.as_str() {
             "stdio" => {
@@ -112,7 +118,7 @@ impl Backend {
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .context("spawning backend")?;
-                match serve_client((), transport).await {
+                match init_with_timeout(transport, connect_timeout_secs).await {
                     Ok(peer) => {
                         let snap = capture_snapshot(&peer).await;
                         let _ = peer.cancel().await;
@@ -124,16 +130,16 @@ impl Backend {
                             None => String::new(),
                         };
                         if tail.is_empty() {
-                            Err(anyhow::Error::new(e).context("initializing backend"))
+                            Err(e.context("initializing backend"))
                         } else {
-                            Err(anyhow!("{e}\n--- server stderr ---\n{tail}"))
+                            Err(anyhow!("{e:#}\n--- server stderr ---\n{tail}"))
                         }
                     }
                 }
             }
             "http" => {
                 let transport = StreamableHttpClientTransport::from_config(http_config(def, env)?);
-                let peer = serve_client((), transport)
+                let peer = init_with_timeout(transport, connect_timeout_secs)
                     .await
                     .context("connecting http backend")?;
                 let snap = capture_snapshot(&peer).await;
@@ -255,9 +261,37 @@ impl Backend {
             .with_context(|| format!("calling tool on '{}'", self.namespace))
     }
 
+    /// Whether the connection's transport has closed underneath us (the stdio
+    /// child died, the http stream dropped). A closed backend serves nothing
+    /// and should be respawned.
+    pub fn is_closed(&self) -> bool {
+        self.peer.is_transport_closed()
+    }
+
     /// Cleanly shut down the backend connection.
     pub async fn shutdown(self) {
         let _ = self.peer.cancel().await;
+    }
+}
+
+/// Run rmcp's client `initialize` handshake under a wall-clock cap (0 = no
+/// cap). On expiry the half-built connection is dropped — for stdio that kills
+/// the child via its cleanup guard — and a plain "timed out" error is returned.
+async fn init_with_timeout<T, E, A>(
+    transport: T,
+    secs: u64,
+) -> Result<RunningService<RoleClient, ()>>
+where
+    T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let fut = serve_client((), transport);
+    if secs == 0 {
+        return Ok(fut.await?);
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(anyhow!("initialize timed out after {secs}s")),
     }
 }
 
@@ -621,6 +655,7 @@ mod tests {
             "probe-test",
             None,
             Default::default(),
+            20,
         )
         .await
         .expect_err("a backend that exits should fail to probe");
@@ -654,6 +689,7 @@ mod tests {
             "cfg-inst",
             Some("FILECONTENT"),
             Default::default(),
+            20,
         )
         .await
         .expect_err("the probe command always exits 1");
@@ -700,6 +736,7 @@ mod tests {
             "envexp-inst",
             Some("CREDS"),
             Default::default(),
+            20,
         )
         .await
         .expect_err("the probe command always exits 1");
@@ -734,6 +771,7 @@ mod tests {
             "rlimit-inst",
             None,
             limits,
+            20,
         )
         .await
         .expect_err("the probe command always exits 1");
@@ -761,13 +799,13 @@ mod tests {
         let ed = env_dir.to_str().unwrap();
         let a = format!(
             "{:#}",
-            Backend::probe(&def, &env, None, ed, "inst-a", None, Default::default())
+            Backend::probe(&def, &env, None, ed, "inst-a", None, Default::default(), 20)
                 .await
                 .expect_err("probe always exits 1")
         );
         let b = format!(
             "{:#}",
-            Backend::probe(&def, &env, None, ed, "inst-b", None, Default::default())
+            Backend::probe(&def, &env, None, ed, "inst-b", None, Default::default(), 20)
                 .await
                 .expect_err("probe always exits 1")
         );

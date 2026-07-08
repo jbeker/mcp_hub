@@ -33,6 +33,12 @@ pub struct Config {
     /// and the hub runs as root, each user's stdio subprocesses run as
     /// `base + the user's slot`. Unset → no sandbox (dev/test).
     pub sandbox_uid_base: Option<u32>,
+    /// Keep every enabled user's pooled backends warm (`HUB_KEEP_WARM`, default
+    /// on): a background task binds them at startup and re-touches them every
+    /// minute, so a new connection always finds hot tools and a crashed backend
+    /// is respawned without waiting for a request. While on, the warmer's touch
+    /// counts as use, so `HUB_BACKEND_IDLE_SECS` never fires for warmed users.
+    pub keep_warm: bool,
     /// Backend lifecycle limits.
     pub limits: Limits,
     /// Per-child OS resource limits applied to stdio backend subprocesses.
@@ -95,11 +101,27 @@ impl ChildLimits {
 pub struct Limits {
     pub max_backends_per_user: usize,
     pub max_backends_global: usize,
+    /// How long a user's pooled backends outlive their last request
+    /// (`HUB_BACKEND_IDLE_SECS`); 0 = never reaped. Backends are shared across
+    /// that user's MCP sessions, so this is the only thing that shuts them down.
     pub backend_idle_secs: u64,
     /// Per-call wall-clock cap for a proxied backend RPC (`HUB_BACKEND_CALL_TIMEOUT_SECS`);
     /// 0 = no timeout. Stops one wedged backend from hanging a client forever.
     /// Defaults to 90s; set the env var to `0` to opt back into unbounded calls.
     pub backend_call_timeout_secs: u64,
+    /// Wall-clock cap on spawning + `initialize`-ing one backend
+    /// (`HUB_BACKEND_CONNECT_TIMEOUT_SECS`); 0 = unbounded. A backend that hangs
+    /// during its handshake is marked failed instead of stalling the bind.
+    pub backend_connect_timeout_secs: u64,
+    /// Wall-clock cap on one backend's tools/resources/prompts list call
+    /// (`HUB_BACKEND_LIST_TIMEOUT_SECS`); 0 = unbounded. A backend that hangs
+    /// mid-list is skipped (partial aggregate) instead of stalling the client.
+    pub backend_list_timeout_secs: u64,
+    /// How long a bind/reconcile waits for backends to connect before answering
+    /// with whatever is ready (`HUB_BIND_BUDGET_SECS`); 0 = wait for all.
+    /// Backends that miss the budget keep connecting in the background and
+    /// announce themselves via `tools/list_changed` when they arrive.
+    pub bind_budget_secs: u64,
     /// Cap on a single backend response's serialized size in megabytes
     /// (`HUB_MAX_RESPONSE_MB`); 0 = uncapped. Bounds memory blow-up from a
     /// backend returning a huge payload.
@@ -111,8 +133,11 @@ impl Default for Limits {
         Self {
             max_backends_per_user: 16,
             max_backends_global: 128,
-            backend_idle_secs: 300,
+            backend_idle_secs: 900,
             backend_call_timeout_secs: 90,
+            backend_connect_timeout_secs: 20,
+            backend_list_timeout_secs: 10,
+            bind_budget_secs: 5,
             max_response_mb: 0,
         }
     }
@@ -148,6 +173,11 @@ impl Config {
         // A base of 0 (or unset) disables sandboxing — never run children as root.
         let sandbox_uid_base = opt_parse::<u32>("HUB_SANDBOX_UID_BASE")?.filter(|&b| b > 0);
 
+        // On unless explicitly turned off.
+        let keep_warm = opt("HUB_KEEP_WARM")
+            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
         let mut limits = Limits::default();
         if let Some(v) = opt_parse("HUB_MAX_BACKENDS_PER_USER")? {
             limits.max_backends_per_user = v;
@@ -160,6 +190,15 @@ impl Config {
         }
         if let Some(v) = opt_parse("HUB_BACKEND_CALL_TIMEOUT_SECS")? {
             limits.backend_call_timeout_secs = v;
+        }
+        if let Some(v) = opt_parse("HUB_BACKEND_CONNECT_TIMEOUT_SECS")? {
+            limits.backend_connect_timeout_secs = v;
+        }
+        if let Some(v) = opt_parse("HUB_BACKEND_LIST_TIMEOUT_SECS")? {
+            limits.backend_list_timeout_secs = v;
+        }
+        if let Some(v) = opt_parse("HUB_BIND_BUDGET_SECS")? {
+            limits.bind_budget_secs = v;
         }
         if let Some(v) = opt_parse("HUB_MAX_RESPONSE_MB")? {
             limits.max_response_mb = v;
@@ -211,6 +250,7 @@ impl Config {
             bootstrap_admin,
             allow_open_registration,
             sandbox_uid_base,
+            keep_warm,
             limits,
             child_limits,
             block_private_backend_ips,

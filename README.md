@@ -79,9 +79,15 @@ All configuration is via environment variables:
 | `HUB_LISTEN` | no | `0.0.0.0:8080` | Bind address. |
 | `HUB_HIDEPID` | no | `1` (in image) | Remount `/proc` with `hidepid=2` so a sandbox UID can't read another user's process `cmdline`/`environ`. Needs `CAP_SYS_ADMIN`; skipped (logged) without it. `0` disables. |
 | `HUB_EGRESS_HARDENING` | no | `1` (in image) | Install nftables rules dropping sandbox-UID egress to link-local/cloud-metadata and the hub's own loopback port (RFC1918 stays allowed). Needs `CAP_NET_ADMIN`; skipped (logged) without it. `0` disables. |
-| `HUB_MAX_BACKENDS_PER_USER` | no | `16` | Max backends per client session. |
+| `HUB_MAX_BACKENDS_PER_USER` | no | `16` | Max live backends per user (shared across that user's sessions). |
 | `HUB_MAX_BACKENDS_GLOBAL` | no | `128` | Max concurrent backends across all users. |
-| `HUB_BACKEND_IDLE_SECS` | no | `300` | Backend idle reclamation window. |
+| `HUB_KEEP_WARM` | no | `true` | Keep every enabled user's backends pre-spawned: bound at startup and re-touched each minute, so a new connection always finds hot tools and crashed backends respawn on their own. `0`/`false`/`no` disables. |
+| `HUB_BACKEND_IDLE_SECS` | no | `900` | A user's pooled backends are shut down after this long without an MCP request from them. `0` = never. Effectively inert while `HUB_KEEP_WARM` is on (the warmer's touch counts as use). |
+| `HUB_BACKEND_CALL_TIMEOUT_SECS` | no | `90` | Wall-clock cap on one proxied tool call / resource read / prompt get. `0` = unbounded. |
+| `HUB_BACKEND_CONNECT_TIMEOUT_SECS` | no | `20` | Wall-clock cap on spawning + `initialize`-ing one backend; a hung handshake is marked failed instead of stalling the bind. `0` = unbounded. |
+| `HUB_BACKEND_LIST_TIMEOUT_SECS` | no | `10` | Wall-clock cap on one backend's tools/resources/prompts list call; a hung backend is skipped from the aggregate. `0` = unbounded. |
+| `HUB_BIND_BUDGET_SECS` | no | `5` | How long a bind waits for backends before answering with whatever is ready; late backends keep connecting and announce via `tools/list_changed`. `0` = wait for all. |
+| `HUB_MAX_RESPONSE_MB` | no | `0` (uncapped) | Cap on a single backend response's serialized size. |
 
 ## Connecting a client
 

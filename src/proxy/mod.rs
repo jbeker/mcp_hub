@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod management;
+pub mod pool;
 pub mod server;
 
 use axum::extract::{Request, State};

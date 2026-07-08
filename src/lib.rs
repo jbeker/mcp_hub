@@ -50,6 +50,10 @@ pub struct AppState {
     pub cookie_key: Key,
     /// Caps the total number of concurrently running backend connections.
     pub backend_slots: Arc<Semaphore>,
+    /// The per-user pool of live backend connections, shared across each
+    /// user's MCP sessions and retired by the idle reaper
+    /// (`HUB_BACKEND_IDLE_SECS`).
+    pub backend_pool: Arc<crate::proxy::pool::BackendPool>,
     /// Serializes git-source builds (they are slow and disk-bound).
     pub build_lock: Arc<tokio::sync::Mutex<()>>,
     /// The `/mcp` endpoint's session store. Shared with the proxy router so the
@@ -98,6 +102,7 @@ impl AppState {
             auth_states: Arc::new(Mutex::new(HashMap::new())),
             cookie_key,
             backend_slots,
+            backend_pool: Arc::new(crate::proxy::pool::BackendPool::default()),
             build_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_manager: Arc::new(LocalSessionManager::default()),
             reload_epochs: Arc::new(Mutex::new(HashMap::new())),

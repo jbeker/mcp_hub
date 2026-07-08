@@ -18,6 +18,9 @@ pub struct RuntimeStats {
     pub slots: SlotUsage,
     /// Live count of active `/mcp` Streamable-HTTP sessions.
     pub active_sessions: usize,
+    /// Live pooled-backend usage (backends are shared across a user's
+    /// sessions, so `active_sessions` can exceed `pool.users`).
+    pub pool: PoolUsage,
     /// Configured ceilings.
     pub limits: Limits,
     /// Aggregate counts over all instances (from the last-known status).
@@ -34,6 +37,13 @@ pub struct SlotUsage {
     pub total: usize,
 }
 
+/// Users with live pooled backends, and the backend total across them.
+#[derive(Serialize)]
+pub struct PoolUsage {
+    pub users: usize,
+    pub backends: usize,
+}
+
 /// The configured limits, surfaced alongside their environment-variable names.
 #[derive(Serialize)]
 pub struct Limits {
@@ -41,6 +51,9 @@ pub struct Limits {
     pub max_backends_global: usize,
     pub backend_idle_secs: u64,
     pub backend_call_timeout_secs: u64,
+    pub backend_connect_timeout_secs: u64,
+    pub backend_list_timeout_secs: u64,
+    pub bind_budget_secs: u64,
     pub max_response_mb: u64,
 }
 
@@ -78,6 +91,7 @@ pub async fn gather(state: &AppState) -> RuntimeStats {
     // available_permits() never exceeds total, but saturate defensively.
     let used = total.saturating_sub(state.backend_slots.available_permits());
     let active_sessions = state.session_manager.sessions.read().await.len();
+    let (pool_users, pool_backends) = state.backend_pool.counts();
 
     let users = users::list(&state.db).await.unwrap_or_default();
     let handle_by_id: HashMap<String, String> = users
@@ -120,11 +134,18 @@ pub async fn gather(state: &AppState) -> RuntimeStats {
     RuntimeStats {
         slots: SlotUsage { used, total },
         active_sessions,
+        pool: PoolUsage {
+            users: pool_users,
+            backends: pool_backends,
+        },
         limits: Limits {
             max_backends_per_user: state.config.limits.max_backends_per_user,
             max_backends_global: state.config.limits.max_backends_global,
             backend_idle_secs: state.config.limits.backend_idle_secs,
             backend_call_timeout_secs: state.config.limits.backend_call_timeout_secs,
+            backend_connect_timeout_secs: state.config.limits.backend_connect_timeout_secs,
+            backend_list_timeout_secs: state.config.limits.backend_list_timeout_secs,
+            bind_budget_secs: state.config.limits.bind_budget_secs,
             max_response_mb: state.config.limits.max_response_mb,
         },
         totals,
