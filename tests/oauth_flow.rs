@@ -22,6 +22,7 @@ fn test_config() -> Config {
         allow_open_registration: false,
         sandbox_uid_base: None,
         keep_warm: false,
+        keep_warm_interval_secs: 0,
         limits: Limits::default(),
         child_limits: Default::default(),
 

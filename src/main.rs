@@ -49,7 +49,10 @@ fn spawn_session_sweeper(db: sqlx::SqlitePool) {
 /// on): bind them all at startup and re-touch each minute so a new connection
 /// never pays a cold start and a crashed backend is respawned without waiting
 /// for a request. The touch counts as use, so warmed pools are never idle
-/// enough for [`spawn_backend_reaper`] to retire.
+/// enough for [`spawn_backend_reaper`] to retire. Every `HUB_KEEP_WARM_SECS`
+/// the pass also exercises each backend with a real `tools/list`
+/// ([`pool::exercise_all`]) — a process can be alive but paged out or wedged,
+/// and only real traffic keeps it answering fast.
 fn spawn_backend_warmer(state: AppState) {
     if !state.config.keep_warm {
         return;
@@ -61,6 +64,8 @@ fn spawn_backend_warmer(state: AppState) {
         // no-op housekeeping and logs at trace so the default `mcp_hub=debug`
         // filter stays quiet. The pool itself already logs any actual respawn.
         let mut last: Option<(usize, usize)> = None;
+        let deep_every = state.config.keep_warm_interval_secs;
+        let mut last_deep: Option<std::time::Instant> = None;
         loop {
             ticker.tick().await;
             let (users, backends) = mcp_hub::proxy::pool::warm_all(&state).await;
@@ -72,6 +77,20 @@ fn spawn_backend_warmer(state: AppState) {
                 _ => tracing::trace!(users, backends, "re-warmed user backends"),
             }
             last = Some((users, backends));
+            if deep_every > 0
+                && last_deep.is_none_or(|t| t.elapsed().as_secs() >= deep_every)
+            {
+                last_deep = Some(std::time::Instant::now());
+                let (ok, failed) = mcp_hub::proxy::pool::exercise_all(&state).await;
+                // Quiet like the touch above: exercise_all already warns per
+                // failing backend, so the pass summary only surfaces (at
+                // debug) when something failed.
+                if failed > 0 {
+                    tracing::debug!(ok, failed, "backend heartbeat pass");
+                } else {
+                    tracing::trace!(ok, failed, "backend heartbeat pass");
+                }
+            }
         }
     });
 }

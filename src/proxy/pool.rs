@@ -60,6 +60,9 @@ struct Inner {
     connecting: HashSet<String>,
     /// Last spawn attempt per instance, for [`RESPAWN_BACKOFF`].
     last_attempt: HashMap<String, Instant>,
+    /// Consecutive failed heartbeats per instance (see [`exercise_all`]);
+    /// cleared on a passing heartbeat and on respawn.
+    heartbeat_failures: HashMap<String, u32>,
     /// Slides forward on every borrow; the idle reaper compares against it.
     last_used: Instant,
 }
@@ -73,6 +76,7 @@ impl Inner {
             applied_epochs: HashMap::new(),
             connecting: HashSet::new(),
             last_attempt: HashMap::new(),
+            heartbeat_failures: HashMap::new(),
             last_used: Instant::now(),
         }
     }
@@ -259,6 +263,9 @@ impl UserBackends {
             inner
                 .applied_epochs
                 .retain(|id, _| enabled_ids.contains(id.as_str()));
+            inner
+                .heartbeat_failures
+                .retain(|id, _| enabled_ids.contains(id.as_str()));
             for inst in &enabled {
                 if inner.connecting.contains(&inst.id) {
                     continue;
@@ -302,6 +309,7 @@ impl UserBackends {
                 }
                 inner.applied_epochs.insert(inst.id.clone(), cur);
                 inner.last_attempt.insert(inst.id.clone(), Instant::now());
+                inner.heartbeat_failures.remove(&inst.id);
                 inner.connecting.insert(inst.id.clone());
                 to_spawn.push((inst.clone(), permit));
             }
@@ -534,6 +542,86 @@ pub async fn warm_all(state: &AppState) -> (usize, usize) {
         warmed += 1;
     }
     (warmed, backends)
+}
+
+/// How many consecutive failed heartbeats a backend may accumulate before
+/// [`exercise_all`] drops it from the pool for respawn. One or two misses are
+/// forgiven — a busy host can make a healthy child slow — but a genuinely
+/// wedged child never recovers on its own.
+const HEARTBEAT_MAX_STRIKES: u32 = 3;
+
+/// Send one real `tools/list` to every pooled backend (the deep half of the
+/// keep-warm loop, on the `HUB_KEEP_WARM_SECS` cadence). [`warm_all`] only
+/// proves the child *exists*; this proves it *answers* — and the request
+/// itself keeps the child's pages resident, so the first client request after
+/// hours of idle doesn't stall on paging the process back in under host
+/// memory/IO pressure. A backend that fails [`HEARTBEAT_MAX_STRIKES`]
+/// heartbeats in a row is dropped from the pool; the next reconcile respawns
+/// it (its last spawn attempt is long past [`RESPAWN_BACKOFF`]). Returns
+/// `(ok, failed)` backend counts.
+pub async fn exercise_all(state: &AppState) -> (usize, usize) {
+    let users: Vec<Arc<UserBackends>> = state
+        .backend_pool
+        .users
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    let secs = state.config.limits.backend_list_timeout_secs;
+    let (mut ok, mut failed) = (0, 0);
+    for ub in users {
+        let backends = ub.inner.lock().unwrap().backends.clone();
+        let results = futures::future::join_all(backends.iter().map(|b| async move {
+            let fut = b.list_namespaced_tools();
+            if secs == 0 {
+                fut.await.map(|_| ())
+            } else {
+                match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+                    Ok(r) => r.map(|_| ()),
+                    Err(_) => Err(anyhow::anyhow!("heartbeat timed out after {secs}s")),
+                }
+            }
+        }))
+        .await;
+        let mut inner = ub.inner.lock().unwrap();
+        for (b, r) in backends.iter().zip(results) {
+            match r {
+                Ok(()) => {
+                    ok += 1;
+                    inner.heartbeat_failures.remove(&b.instance_id);
+                }
+                Err(e) => {
+                    failed += 1;
+                    let strikes = inner
+                        .heartbeat_failures
+                        .entry(b.instance_id.clone())
+                        .and_modify(|s| *s += 1)
+                        .or_insert(1);
+                    let strikes = *strikes;
+                    tracing::warn!(
+                        namespace = %b.namespace,
+                        error = %format!("{e:#}"),
+                        strikes,
+                        "backend heartbeat failed"
+                    );
+                    if strikes >= HEARTBEAT_MAX_STRIKES {
+                        inner.heartbeat_failures.remove(&b.instance_id);
+                        // Drop exactly the Arc we heartbeated — never a fresh
+                        // respawn that raced in while we were listing.
+                        if let Some(p) = inner.backends.iter().position(|x| Arc::ptr_eq(x, b)) {
+                            inner.backends.remove(p);
+                            tracing::info!(
+                                namespace = %b.namespace,
+                                "dropping wedged backend for respawn"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (ok, failed)
 }
 
 /// Persist a backend's connection outcome so the UI / hub__ tools can show

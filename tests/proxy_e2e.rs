@@ -47,6 +47,7 @@ async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
         // Tests drive warming explicitly via `pool::warm_all` (the warmer task
         // only runs in the real binary anyway).
         keep_warm: false,
+        keep_warm_interval_secs: 0,
         limits,
         child_limits: Default::default(),
 
@@ -1270,6 +1271,48 @@ async fn bind_budget_serves_partial_then_adds_late_backend() {
     }
 
     let _ = client.cancel().await;
+}
+
+/// The deep keep-warm heartbeat (`exercise_all`) sends a real `tools/list` to
+/// every pooled backend: healthy ones pass, and one that fails three
+/// consecutive heartbeats is dropped from the pool so the reconcile path can
+/// respawn it.
+#[tokio::test]
+async fn heartbeat_drops_wedged_backend_after_three_strikes() {
+    let limits = Limits {
+        backend_list_timeout_secs: 1,
+        ..Limits::default()
+    };
+    let (_base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    instances::create(&state.db, &user.id, None, Some(&mock_def()), "healthy", "Healthy")
+        .await
+        .unwrap();
+    let wedged = instances::create(&state.db, &user.id, None, Some(&mock_def()), "wedged", "Wedged")
+        .await
+        .unwrap();
+    // Initializes fine, but never answers tools/list inside the 1s cap.
+    instances::set_config_value(&state.db, &wedged.id, "MOCK_LIST_DELAY_MS", "30000")
+        .await
+        .unwrap();
+
+    // Bind the pool without any client (the warmer's cheap touch).
+    mcp_hub::proxy::pool::warm_all(&state).await;
+    assert_eq!(state.backend_pool.counts(), (1, 2), "both backends bound");
+
+    // Two failed heartbeats are forgiven — the wedged backend stays pooled.
+    for strike in 1..=2 {
+        let (ok, failed) = mcp_hub::proxy::pool::exercise_all(&state).await;
+        assert_eq!((ok, failed), (1, 1), "strike {strike}");
+        assert_eq!(state.backend_pool.counts(), (1, 2), "strike {strike}");
+    }
+
+    // The third strike drops it; the healthy backend is untouched.
+    let (ok, failed) = mcp_hub::proxy::pool::exercise_all(&state).await;
+    assert_eq!((ok, failed), (1, 1));
+    assert_eq!(state.backend_pool.counts(), (1, 1), "wedged backend dropped");
 }
 
 #[tokio::test]

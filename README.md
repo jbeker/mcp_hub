@@ -82,6 +82,7 @@ All configuration is via environment variables:
 | `HUB_MAX_BACKENDS_PER_USER` | no | `16` | Max live backends per user (shared across that user's sessions). |
 | `HUB_MAX_BACKENDS_GLOBAL` | no | `128` | Max concurrent backends across all users. |
 | `HUB_KEEP_WARM` | no | `true` | Keep every enabled user's backends pre-spawned: bound at startup and re-touched each minute, so a new connection always finds hot tools and crashed backends respawn on their own. `0`/`false`/`no` disables. |
+| `HUB_KEEP_WARM_SECS` | no | `300` | How often the warmer exercises each backend with a real `tools/list`, keeping the child responsive (not just alive) and respawning one that fails 3 heartbeats in a row. `0` disables the deep heartbeat. |
 | `HUB_BACKEND_IDLE_SECS` | no | `900` | A user's pooled backends are shut down after this long without an MCP request from them. `0` = never. Effectively inert while `HUB_KEEP_WARM` is on (the warmer's touch counts as use). |
 | `HUB_BACKEND_CALL_TIMEOUT_SECS` | no | `90` | Wall-clock cap on one proxied tool call / resource read / prompt get. `0` = unbounded. |
 | `HUB_BACKEND_CONNECT_TIMEOUT_SECS` | no | `20` | Wall-clock cap on spawning + `initialize`-ing one backend; a hung handshake is marked failed instead of stalling the bind. `0` = unbounded. |

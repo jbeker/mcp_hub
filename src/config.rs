@@ -39,6 +39,13 @@ pub struct Config {
     /// is respawned without waiting for a request. While on, the warmer's touch
     /// counts as use, so `HUB_BACKEND_IDLE_SECS` never fires for warmed users.
     pub keep_warm: bool,
+    /// How often the warmer exercises each pooled backend with a real
+    /// `tools/list` (`HUB_KEEP_WARM_SECS`, default 300; 0 = never). The cheap
+    /// per-minute touch above only checks the process is alive; this deeper
+    /// heartbeat keeps the child actually responsive (its pages resident under
+    /// host memory/IO pressure) and detects a wedged backend so it can be
+    /// respawned.
+    pub keep_warm_interval_secs: u64,
     /// Backend lifecycle limits.
     pub limits: Limits,
     /// Per-child OS resource limits applied to stdio backend subprocesses.
@@ -177,6 +184,7 @@ impl Config {
         let keep_warm = opt("HUB_KEEP_WARM")
             .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
+        let keep_warm_interval_secs = opt_parse::<u64>("HUB_KEEP_WARM_SECS")?.unwrap_or(300);
 
         let mut limits = Limits::default();
         if let Some(v) = opt_parse("HUB_MAX_BACKENDS_PER_USER")? {
@@ -251,6 +259,7 @@ impl Config {
             allow_open_registration,
             sandbox_uid_base,
             keep_warm,
+            keep_warm_interval_secs,
             limits,
             child_limits,
             block_private_backend_ips,
