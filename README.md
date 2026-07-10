@@ -8,8 +8,8 @@ Run one hub, let your users sign in with **passkeys**, add their own MCP servers
 
 - **User-defined servers**: every user adds their own MCP servers — pick a transport (stdio or http) and fill in the details. No central catalog.
 - **Per-user config**, encrypted at rest: a stdio server is a command line + an environment-variables block; an http server is a URL + env.
-- **One proxy endpoint** (`/mcp`, Streamable HTTP) that aggregates every enabled backend, exposing their **tools and prompts** namespaced as `<server>__<name>` and their **resources** as `hub://<server>/<uri>`.
-- **Built-in management interface**: a reserved `hub__` toolset on the same endpoint, so servers can be added/edited programmatically from any MCP client.
+- **Connector groups**: each user defines named groups of their servers, and every group is its own Streamable HTTP endpoint at `/mcp/<slug>` exposing its members' **tools and prompts** namespaced as `<server>__<name>` and their **resources** as `hub://<server>/<uri>`. Splitting the catalog across endpoints keeps every connector under client-side tool caps (claude.ai truncates a connector's registry at 256 tools).
+- **Built-in management interface**: the base `/mcp` endpoint serves the reserved `hub__` toolset (and nothing else), so servers and groups can be managed programmatically from any MCP client.
 - **Standards-based auth**: passkeys (WebAuthn) authenticate humans; the hub is its own OAuth 2.1 Authorization Server (PKCE, Dynamic Client Registration, ES256 JWTs, JWKS) for MCP clients.
 - **Sandboxed stdio**: each user's stdio subprocesses run as a distinct unprivileged UID, so a user's command cannot read the master key or other users' secrets.
 
@@ -26,7 +26,8 @@ A **stdio** server runs a command (`uvx …`, `npx …`) as a subprocess; it may
  ┌──────────────── MCP Hub (one binary) ─────────────────┐
  │ Web UI (passkey login, add/edit your own servers)     │
  │ OAuth 2.1 AS: /.well-known/* /authorize /token JWKS   │
- │ MCP proxy /mcp: token → user → backend fan-out        │
+ │ MCP proxy /mcp (hub__ tools) + /mcp/<group>:          │
+ │   token → user → group's backend fan-out              │
  └───────────┬───────────────────────────┬───────────────┘
              ▼ stdio subprocess           ▼ remote HTTP
         zabbix, homeassistant, …      memory, …
@@ -92,19 +93,40 @@ All configuration is via environment variables:
 
 ## Connecting a client
 
-Point any MCP client at `https://hub.example.com/mcp`. The client will discover the
-authorization server (RFC 9728 / RFC 8414), register itself (RFC 7591), and run the
-OAuth flow — you'll log in with your passkey and approve access in the browser.
+Backend tools are served on **connector group** endpoints. Create a group on the
+dashboard (or with `hub__create_group`), tick its member servers, and point your
+MCP client at the group's URL, e.g. `https://hub.example.com/mcp/monitoring`.
+The client discovers the authorization server (RFC 9728 / RFC 8414), registers
+itself (RFC 7591), and runs the OAuth flow — you log in with your passkey and
+approve access in the browser. Each group you add to a client is its own
+connector with its own OAuth grant.
+
+Why groups? claude.ai silently truncates a connector's tool registry at **256
+tools** — alphabetically, so a large backend's tail simply disappears. Keeping
+each group's total under 256 (the dashboard shows a per-group count and warns
+past the cap) makes every tool reachable. Other clients (e.g. Claude Code) have
+no such cap, so a single "everything" group works fine there.
+
+The base endpoint `https://hub.example.com/mcp` serves **only** the `hub__*`
+management tools — add it as a connector too if you want to manage the hub from
+inside a client.
 
 Claude Code, for example:
 
 ```bash
-claude mcp add --transport http hub https://hub.example.com/mcp
+claude mcp add --transport http hub https://hub.example.com/mcp          # management
+claude mcp add --transport http hub-all https://hub.example.com/mcp/all  # an "everything" group
 ```
 
-Once connected, your servers' tools and prompts appear namespaced (`zabbix__host_get`, …),
-their resources as `hub://zabbix/…`, and the
-`hub__*` tools let you manage your configuration from inside the client.
+Once connected, a group's tools and prompts appear namespaced
+(`zabbix__host_get`, …) and its resources as `hub://zabbix/…`.
+
+> **Upgrading from the single-endpoint model:** existing connectors pointed at
+> `/mcp` keep authenticating but now see only the `hub__*` tools. Create groups
+> and re-add each `/mcp/<slug>` URL as a fresh connector. Personal access
+> tokens are endpoint-independent (no audience) and work on every endpoint;
+> re-point PAT-based scripts at a group URL. OAuth access tokens are
+> audience-bound to the exact endpoint they were minted for.
 
 ### Management tools (`hub__`)
 
@@ -117,6 +139,8 @@ their resources as `hub://zabbix/…`, and the
 | `hub__set_env` | user | Replace a server's environment variables |
 | `hub__update_server` | user | (Re)build a git-sourced server from its repo |
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage your servers |
+| `hub__list_groups` | user | Your connector groups: endpoint URLs, members, tool counts vs the 256 cap |
+| `hub__create_group` / `hub__update_group` / `hub__delete_group` | user | Manage connector groups (slugs are immutable — delete and recreate) |
 | `hub__list_users` | admin | List users (with admin/disabled status) |
 | `hub__disable_user` / `hub__enable_user` / `hub__delete_user` | admin | Suspend or remove an account |
 | `hub__create_invite` / `hub__list_invites` / `hub__revoke_invite` | admin | Manage invite codes |
@@ -242,7 +266,7 @@ the 15-minute token lifetime.
   subprocess environment. Network and non-secret filesystem reads are *not* restricted, so keep
   the hub invite-only and trust your users. The container runs as **root on purpose** so it can
   drop children to those UIDs.
-- Access tokens are short-lived (15 min) ES256 JWTs bound to the `/mcp` resource (audience) and
+- Access tokens are short-lived (15 min) ES256 JWTs bound to the exact endpoint they were requested for — `/mcp` or one `/mcp/<group>` — as the resource (audience) and
   pinned to the active key id; refresh tokens are stored hashed and **rotated with reuse
   detection** — replaying a rotated token revokes the whole session.
 - OAuth uses PKCE (S256, mandatory), exact-match `redirect_uri`, and a per-session **CSRF token**

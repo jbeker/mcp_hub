@@ -30,7 +30,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio::sync::Mutex;
 
 use crate::proxy::backend::{unwrap_uri, Backend};
-use crate::proxy::{management, AuthedUser};
+use crate::proxy::{management, AuthedUser, McpEndpoint};
 use crate::AppState;
 
 /// One aggregating proxy session.
@@ -74,6 +74,17 @@ impl HubProxy {
             .ok_or_else(|| McpError::invalid_request("missing authentication", None))
     }
 
+    /// Pull the resolved endpoint (base `/mcp` vs a group `/mcp/<slug>`) out of
+    /// the forwarded HTTP request parts. Per request, never cached: the session
+    /// manager is shared across endpoint paths, so a session id minted on one
+    /// path could be replayed on another.
+    fn endpoint(ctx: &RequestContext<RoleServer>) -> Result<McpEndpoint, McpError> {
+        ctx.extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|p| p.extensions.get::<McpEndpoint>().cloned())
+            .ok_or_else(|| McpError::invalid_request("missing endpoint context", None))
+    }
+
     /// The instance ids the request's credential (OAuth client or PAT) is denied,
     /// for per-credential backend access control. Empty = full access (the default
     /// and the case for any request without a recognizable credential). Looked up
@@ -90,55 +101,64 @@ impl HubProxy {
         }
     }
 
-    /// Bind this session to the request's user (lazy, once) and return a
-    /// snapshot of that user's live backends from the shared pool — which
-    /// spawns/reconciles them as needed. The snapshot's `Arc`s keep the
-    /// backends alive for the duration of this request even if the pool
-    /// retires them concurrently.
-    async fn ensure_bound(
-        &self,
-        ctx: &RequestContext<RoleServer>,
-    ) -> Result<Vec<Arc<Backend>>, McpError> {
+    /// Bind this session to the request's user (lazy, once). Deliberately does
+    /// NOT touch the backend pool: the base `/mcp` endpoint serves only
+    /// management tools and must never spawn backends.
+    async fn bind(&self, ctx: &RequestContext<RoleServer>) -> Result<AuthedUser, McpError> {
         let authed = Self::authed(ctx)?;
-        let mut bound_handle = None;
-        {
-            let mut guard = self.bound.lock().await;
-            if guard.as_ref().is_none_or(|b| b.user_id != authed.user_id) {
-                // Resolve the handle once so per-call audit events can name the actor.
-                let handle = crate::users::find_by_id(&self.state.db, &authed.user_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|u| u.handle)
-                    .unwrap_or_default();
-                bound_handle = Some(handle.clone());
-                *guard = Some(Bound {
-                    user_id: authed.user_id.clone(),
-                    handle,
-                    admin: authed.admin,
-                });
-                // Register this session's notification peer before touching the
-                // pool, so a backend that finishes connecting after the bind
-                // budget can push tools/list_changed to this client too.
-                self.state
-                    .register_client_peer(self.session_key, &authed.user_id, ctx.peer.clone());
-            }
-        }
-        let backends = self
-            .state
-            .backend_pool
-            .backends_for(&self.state, &authed.user_id)
-            .await;
-        if let Some(handle) = bound_handle {
+        let mut guard = self.bound.lock().await;
+        if guard.as_ref().is_none_or(|b| b.user_id != authed.user_id) {
+            // Resolve the handle once so per-call audit events can name the actor.
+            let handle = crate::users::find_by_id(&self.state.db, &authed.user_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.handle)
+                .unwrap_or_default();
+            *guard = Some(Bound {
+                user_id: authed.user_id.clone(),
+                handle: handle.clone(),
+                admin: authed.admin,
+            });
+            // Register this session's notification peer before touching the
+            // pool, so a backend that finishes connecting after the bind
+            // budget can push tools/list_changed to this client too.
+            self.state
+                .register_client_peer(self.session_key, &authed.user_id, ctx.peer.clone());
             crate::audit::event("mcp.bind")
                 .actor(&handle)
                 .actor_id(&authed.user_id)
                 .client_id(authed.client_id.as_deref())
                 .request(&authed.request)
-                .object(&backends.len().to_string())
                 .ok();
         }
-        Ok(backends)
+        Ok(authed)
+    }
+
+    /// Bind, then return the group's slice of the user's live backends from the
+    /// shared pool — which spawns/reconciles them as needed. The snapshot's
+    /// `Arc`s keep the backends alive for the duration of this request even if
+    /// the pool retires them concurrently. Membership is fetched per request
+    /// (like credential denials) so group edits take effect immediately; a
+    /// lookup failure yields an empty set, failing closed.
+    async fn group_backends(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        group_id: &str,
+    ) -> Result<Vec<Arc<Backend>>, McpError> {
+        let authed = self.bind(ctx).await?;
+        let members = crate::groups::member_instance_ids(&self.state.db, group_id)
+            .await
+            .unwrap_or_default();
+        let backends = self
+            .state
+            .backend_pool
+            .backends_for(&self.state, &authed.user_id)
+            .await;
+        Ok(backends
+            .into_iter()
+            .filter(|b| members.contains(&b.instance_id))
+            .collect())
     }
 
     /// Run one backend's list call (tools/resources/prompts) under the
@@ -232,7 +252,9 @@ impl ServerHandler for HubProxy {
         info.instructions = Some(
             "Aggregating MCP proxy. Tools and prompts are namespaced as \
              <server>__<name>, and resource URIs as hub://<server>/<uri>. \
-             Use the hub__ tools to manage your configured servers."
+             The base /mcp endpoint serves the hub__ management tools; each \
+             connector group you define serves its servers' tools at \
+             /mcp/<group> (see hub__list_groups)."
                 .into(),
         );
         info
@@ -244,11 +266,24 @@ impl ServerHandler for HubProxy {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let t0 = std::time::Instant::now();
-        let backends = self.ensure_bound(&context).await?;
+        // The base endpoint serves only the management tools; group endpoints
+        // serve only their member backends' tools. Keeping the sets disjoint is
+        // what lets every connector stay under client-side tool caps.
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                let authed = self.bind(&context).await?;
+                return Ok(ListToolsResult {
+                    tools: management::tools(authed.admin),
+                    next_cursor: None,
+                    meta: None,
+                });
+            }
+            McpEndpoint::Group { group_id, .. } => group_id,
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
         let denied = self.denied_instances(&context).await;
 
-        // The built-in management tools always come first and are never restricted.
-        let mut tools = management::tools(Self::authed(&context)?.admin);
+        let mut tools = Vec::new();
         // Fan the per-backend tools/list out concurrently so the warm-refresh
         // latency is the slowest single backend, not the sum. Results are
         // collected in backend order, so the aggregate list stays deterministic.
@@ -291,28 +326,46 @@ impl ServerHandler for HubProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let backends = self.ensure_bound(&context).await?;
-
-        // Management tools are handled in-process by the hub itself.
-        if management::is_management_tool(&request.name) {
-            let (user_id, handle, admin) = {
-                let guard = self.bound.lock().await;
-                let bound = guard.as_ref().expect("bound after ensure_bound");
-                (bound.user_id.clone(), bound.handle.clone(), bound.admin)
-            };
-            // The calling client + origin come from the live request token (a
-            // client may only manage its own connection label), not bound state.
-            let authed = Self::authed(&context)?;
-            let caller = management::Caller {
-                user_id: &user_id,
-                handle: &handle,
-                admin,
-                client_id: authed.client_id.as_deref(),
-                request: &authed.request,
-            };
-            let op = request.name.strip_prefix("hub__").unwrap_or_default();
-            return management::dispatch(&self.state, &caller, op, request.arguments).await;
-        }
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                // The base endpoint handles management tools in-process and
+                // nothing else — backend tools live on the group endpoints.
+                if !management::is_management_tool(&request.name) {
+                    return Err(McpError::invalid_params(
+                        "backend tools are served on your connector group endpoints \
+                         (/mcp/<group>), not on /mcp; see hub__list_groups",
+                        None,
+                    ));
+                }
+                let authed = self.bind(&context).await?;
+                let (user_id, handle, admin) = {
+                    let guard = self.bound.lock().await;
+                    let bound = guard.as_ref().expect("bound after bind");
+                    (bound.user_id.clone(), bound.handle.clone(), bound.admin)
+                };
+                // The calling client + origin come from the live request token (a
+                // client may only manage its own connection label), not bound state.
+                let caller = management::Caller {
+                    user_id: &user_id,
+                    handle: &handle,
+                    admin,
+                    client_id: authed.client_id.as_deref(),
+                    request: &authed.request,
+                };
+                let op = request.name.strip_prefix("hub__").unwrap_or_default();
+                return management::dispatch(&self.state, &caller, op, request.arguments).await;
+            }
+            McpEndpoint::Group { group_id, .. } => {
+                if management::is_management_tool(&request.name) {
+                    return Err(McpError::invalid_params(
+                        "hub management tools are only available on the base /mcp endpoint",
+                        None,
+                    ));
+                }
+                group_id
+            }
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
 
         let (ns, original) = request.name.split_once("__").ok_or_else(|| {
             McpError::invalid_params(
@@ -362,7 +415,18 @@ impl ServerHandler for HubProxy {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let backends = self.ensure_bound(&context).await?;
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                self.bind(&context).await?;
+                return Ok(ListResourcesResult {
+                    resources: Vec::new(),
+                    next_cursor: None,
+                    meta: None,
+                });
+            }
+            McpEndpoint::Group { group_id, .. } => group_id,
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
         let denied = self.denied_instances(&context).await;
         let lists = futures::future::join_all(
             backends
@@ -394,7 +458,18 @@ impl ServerHandler for HubProxy {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        let backends = self.ensure_bound(&context).await?;
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                self.bind(&context).await?;
+                return Ok(ListResourceTemplatesResult {
+                    resource_templates: Vec::new(),
+                    next_cursor: None,
+                    meta: None,
+                });
+            }
+            McpEndpoint::Group { group_id, .. } => group_id,
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
         let denied = self.denied_instances(&context).await;
         let lists = futures::future::join_all(
             backends
@@ -427,7 +502,16 @@ impl ServerHandler for HubProxy {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        let backends = self.ensure_bound(&context).await?;
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                return Err(McpError::invalid_params(
+                    "resources are served on your connector group endpoints (/mcp/<group>)",
+                    None,
+                ));
+            }
+            McpEndpoint::Group { group_id, .. } => group_id,
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
         let (ns, original) = unwrap_uri(&request.uri).ok_or_else(|| {
             McpError::invalid_params(
                 "resource URI must be namespaced as hub://<server>/<uri>",
@@ -471,7 +555,18 @@ impl ServerHandler for HubProxy {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        let backends = self.ensure_bound(&context).await?;
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                self.bind(&context).await?;
+                return Ok(ListPromptsResult {
+                    prompts: Vec::new(),
+                    next_cursor: None,
+                    meta: None,
+                });
+            }
+            McpEndpoint::Group { group_id, .. } => group_id,
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
         let denied = self.denied_instances(&context).await;
         let lists = futures::future::join_all(
             backends
@@ -501,7 +596,16 @@ impl ServerHandler for HubProxy {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
-        let backends = self.ensure_bound(&context).await?;
+        let group_id = match Self::endpoint(&context)? {
+            McpEndpoint::Management => {
+                return Err(McpError::invalid_params(
+                    "prompts are served on your connector group endpoints (/mcp/<group>)",
+                    None,
+                ));
+            }
+            McpEndpoint::Group { group_id, .. } => group_id,
+        };
+        let backends = self.group_backends(&context, &group_id).await?;
         let (ns, original) = request.name.split_once("__").ok_or_else(|| {
             McpError::invalid_params("prompt name must be namespaced as <server>__<prompt>", None)
         })?;

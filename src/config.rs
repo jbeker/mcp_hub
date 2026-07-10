@@ -269,9 +269,15 @@ impl Config {
         })
     }
 
-    /// The MCP proxy endpoint URL (also the OAuth resource identifier).
+    /// The base MCP endpoint URL (also its OAuth resource identifier). Serves
+    /// only the hub management tools; backend tools live on group endpoints.
     pub fn mcp_url(&self) -> String {
         format!("{}/mcp", self.base_url)
+    }
+
+    /// A connector group's endpoint URL (also its OAuth resource identifier).
+    pub fn group_mcp_url(&self, slug: &str) -> String {
+        format!("{}/mcp/{}", self.base_url, slug)
     }
 
     /// Whether cookies should carry the `Secure` attribute (true behind HTTPS).

@@ -116,6 +116,8 @@ pub async fn dashboard(
         rows.push_str("</ul>");
     }
 
+    let groups_section = groups_section(&state, &user.id, &instances, &csrf).await;
+
     let body = format!(
         r#"<header class="row">
   <h1>MCP Hub</h1>
@@ -129,12 +131,14 @@ pub async fn dashboard(
   <div class="row"><h2>Your MCP servers</h2><a href="/servers/new">+ Add a server</a></div>
   {rows}
 </section>
+{groups_section}
 {admin_section}
-<p class="muted">Your MCP endpoint: <code>{mcp}</code></p>"#,
+<p class="muted">Management endpoint (hub tools only): <code>{mcp}</code> — backend tools are served on your connector group endpoints above.</p>"#,
         csrf = csrf,
         handle = esc(&user.handle),
         badge = admin_badge,
         rows = rows,
+        groups_section = groups_section,
         admin_section = if user.is_admin {
             r#"<section><div class="row"><h2>Administration</h2><span><a href="/invites">Invites</a> · <a href="/users">Users</a> · <a href="/stats">Stats</a></span></div></section>"#
         } else {
@@ -143,6 +147,100 @@ pub async fn dashboard(
         mcp = esc(&state.config.mcp_url()),
     );
     page_wide("Dashboard", &body).into_response()
+}
+
+/// Render the dashboard's "Connector groups" section: each group's endpoint
+/// URL (the thing to paste into an MCP client), a member-checkbox form, a
+/// probe-time tool-count total with a >256 warning (claude.ai's cap), and a
+/// create form.
+async fn groups_section(
+    state: &AppState,
+    user_id: &str,
+    instances: &[instances::Instance],
+    csrf: &str,
+) -> String {
+    let groups = crate::groups::list_for_user(&state.db, user_id)
+        .await
+        .unwrap_or_default();
+
+    // Per-server tool counts from the cached capability snapshots (None =
+    // never probed, count unknowable).
+    let mut tool_counts: std::collections::HashMap<String, Option<u64>> =
+        std::collections::HashMap::new();
+    for i in instances {
+        let count = instances::get_capabilities_snapshot(&state.db, &i.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.tools.len() as u64);
+        tool_counts.insert(i.id.clone(), count);
+    }
+
+    let mut cards = String::new();
+    for g in &groups {
+        let members = crate::groups::member_instance_ids(&state.db, &g.id)
+            .await
+            .unwrap_or_default();
+        let mut total: Option<u64> = Some(0);
+        let mut boxes = String::new();
+        for i in instances {
+            let is_member = members.contains(&i.id);
+            if is_member {
+                total = match (total, tool_counts.get(&i.id).copied().flatten()) {
+                    (Some(t), Some(c)) => Some(t + c),
+                    _ => None,
+                };
+            }
+            boxes.push_str(&format!(
+                r#"<label class="checkbox"><input type="checkbox" name="member_{id}" value="on"{checked}> <code>{ns}</code></label>"#,
+                id = esc(&i.id),
+                checked = if is_member { " checked" } else { "" },
+                ns = esc(&i.namespace),
+            ));
+        }
+        let count_line = match total {
+            Some(t) if t > 256 => format!(
+                r#"<span class="badge">⚠ ~{t} tools — over claude.ai's 256-tool cap</span>"#
+            ),
+            Some(t) => format!(r#"<span class="muted">~{t} tools</span>"#),
+            None => r#"<span class="muted">tool count unknown (probe servers via "Test connection")</span>"#.to_string(),
+        };
+        let title = if g.name.is_empty() { g.slug.clone() } else { g.name.clone() };
+        cards.push_str(&format!(
+            r#"<li>
+  <div class="row"><strong>{title}</strong> {count_line}
+    <form method="post" action="/groups/{id}/delete" data-confirm="Delete group '{slug}'? Clients connected to its endpoint lose access immediately.">{csrf}<button class="ghost danger">Delete</button></form>
+  </div>
+  <p class="muted">Connector URL: <code>{url}</code></p>
+  <form class="access" method="post" action="/groups/{id}/update">{csrf}<span class="muted">Servers:</span><div class="access-grid">{boxes}</div><button class="ghost" type="submit">Save members</button></form>
+</li>"#,
+            title = esc(&title),
+            count_line = count_line,
+            id = esc(&g.id),
+            slug = esc(&g.slug),
+            csrf = csrf,
+            url = esc(&state.config.group_mcp_url(&g.slug)),
+            boxes = boxes,
+        ));
+    }
+    let list = if groups.is_empty() {
+        r#"<p class="muted">No groups yet. Each group is its own MCP endpoint serving only its servers' tools — that is how every connector stays under client tool caps (claude.ai truncates at 256 tools).</p>"#.to_string()
+    } else {
+        format!("<ul class=\"servers\">{cards}</ul>")
+    };
+    format!(
+        r#"<section>
+  <div class="row"><h2>Connector groups</h2></div>
+  {list}
+  <form class="row" method="post" action="/groups/create">{csrf}
+    <input name="slug" placeholder="slug (e.g. monitoring)" required pattern="[a-z0-9][a-z0-9-]*[a-z0-9]|[a-z0-9]">
+    <input name="name" placeholder="display name (optional)">
+    <button type="submit">Create group</button>
+  </form>
+</section>"#,
+        csrf = csrf,
+        list = list,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,6 +1994,100 @@ pub async fn update_token_access(
         .await;
     audit_ok("token.access", &user, &headers, token_id);
     Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateGroupForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// `POST /groups/create` — create a connector group (empty; members are set
+/// from the group's card on the dashboard).
+pub async fn create_group(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<CreateGroupForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("group.create", &user, &headers, form.slug.trim(), "csrf");
+        return forbidden();
+    }
+    let slug = form.slug.trim().to_string();
+    match crate::groups::create(&state.db, &user.id, &slug, form.name.trim()).await {
+        Ok(_) => {
+            audit_ok("group.create", &user, &headers, &slug);
+            Redirect::to("/").into_response()
+        }
+        Err(e) => error_page(&format!("could not create group: {e}")),
+    }
+}
+
+/// `POST /groups/{id}/update` — replace a group's member set from the
+/// dashboard checkboxes (`member_<instance_id>`).
+pub async fn update_group(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let csrf = form.get("csrf").map(String::as_str).unwrap_or_default();
+    if !session::check_csrf(&jar, &state.config.master_key, csrf) {
+        return forbidden();
+    }
+    let Ok(Some(group)) = crate::groups::find_by_id(&state.db, &user.id, &group_id).await else {
+        return error_page("no such group");
+    };
+    let members: Vec<String> = instances::list_for_user(&state.db, &user.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| form.contains_key(&format!("member_{}", i.id)))
+        .map(|i| i.id)
+        .collect();
+    if let Err(e) = crate::groups::set_members(&state.db, &user.id, &group.id, &members).await {
+        return error_page(&format!("could not update group: {e}"));
+    }
+    // Live sessions on this group's endpoint re-fetch their tool list.
+    state.notify_tools_changed(&user.id);
+    audit_ok("group.update", &user, &headers, &group.slug);
+    Redirect::to("/").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CsrfOnlyForm {
+    #[serde(default)]
+    pub csrf: String,
+}
+
+/// `POST /groups/{id}/delete` — delete a connector group. Its endpoint 404s
+/// (and clients lose access) immediately; member servers are untouched.
+pub async fn delete_group(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    Form(form): Form<CsrfOnlyForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        return forbidden();
+    }
+    let Ok(Some(group)) = crate::groups::find_by_id(&state.db, &user.id, &group_id).await else {
+        return error_page("no such group");
+    };
+    let _ = crate::groups::delete(&state.db, &user.id, &group.id).await;
+    state.notify_tools_changed(&user.id);
+    audit_ok("group.delete", &user, &headers, &group.slug);
+    Redirect::to("/").into_response()
 }
 
 #[derive(Deserialize)]

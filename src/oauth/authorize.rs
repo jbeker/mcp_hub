@@ -62,6 +62,22 @@ fn error_page(msg: &str) -> Response {
 }
 
 /// Append query parameters to a redirect URI and build a redirect response.
+/// Classify an RFC 8707 `resource` value against our endpoints: `Ok(None)` for
+/// the base `/mcp` endpoint, `Ok(Some(slug))` for a syntactically valid group
+/// endpoint `/mcp/<slug>`, `Err(())` for anything else. A trailing slash is
+/// tolerated (some clients normalize URLs that way).
+fn resource_group_slug(resource: &str, config: &crate::config::Config) -> Result<Option<String>, ()> {
+    let resource = resource.trim_end_matches('/');
+    if resource == config.mcp_url() {
+        return Ok(None);
+    }
+    let prefix = format!("{}/", config.mcp_url());
+    match resource.strip_prefix(&prefix) {
+        Some(slug) if crate::groups::valid_slug(slug) => Ok(Some(slug.to_string())),
+        _ => Err(()),
+    }
+}
+
 fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> Response {
     match url::Url::parse(redirect_uri) {
         Ok(mut url) => {
@@ -124,15 +140,21 @@ pub async fn authorize(
             ],
         );
     }
-    // Bind the token to our resource; reject a mismatched explicit resource.
-    if let Some(res) = &q.resource {
-        if res != &state.config.mcp_url() {
-            return redirect_with(
-                &q.redirect_uri,
-                &[("error", "invalid_target"), ("state", st)],
-            );
-        }
-    }
+    // Bind the token to one of our resources: the base /mcp endpoint or a
+    // connector-group endpoint /mcp/<slug>. Reject anything else outright;
+    // whether the slug actually exists for this user is checked post-login.
+    let group_slug = match &q.resource {
+        None => None,
+        Some(res) => match resource_group_slug(res, &state.config) {
+            Ok(slug) => slug,
+            Err(()) => {
+                return redirect_with(
+                    &q.redirect_uri,
+                    &[("error", "invalid_target"), ("state", st)],
+                );
+            }
+        },
+    };
 
     // Require an authenticated human; otherwise send them to log in and return.
     let Some(user) = user else {
@@ -143,6 +165,20 @@ pub async fn authorize(
         let login = format!("/login?next={}", urlencode(&next));
         return Redirect::to(&login).into_response();
     };
+
+    // A group resource must name one of *this user's* groups. Failing here —
+    // at consent time — beats minting a token that 404s on first use.
+    if let Some(slug) = &group_slug {
+        match crate::groups::find_by_slug(&state.db, &user.id, slug).await {
+            Ok(Some(_)) => {}
+            _ => {
+                return redirect_with(
+                    &q.redirect_uri,
+                    &[("error", "invalid_target"), ("state", st)],
+                );
+            }
+        }
+    }
 
     let pending = PendingAuth {
         client_id: q.client_id.clone(),

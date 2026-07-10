@@ -140,6 +140,50 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             schema(json!({}), &[]),
         ),
         tool(
+            "hub__list_groups",
+            "List your connector groups: each is its own MCP endpoint at \
+             /mcp/<slug> serving only its member servers' tools. Shows every \
+             group's connector URL, member servers with tool counts (from the \
+             last capability probe; may be stale), and whether the total fits \
+             under claude.ai's 256-tool cap.",
+            schema(json!({}), &[]),
+        ),
+        tool(
+            "hub__create_group",
+            "Create a connector group. Its endpoint becomes \
+             <base>/mcp/<slug> — add that URL to your MCP client as a new \
+             connector. 'servers' is a list of your server namespaces.",
+            schema(
+                json!({
+                    "slug": {"type": "string", "description": "URL path segment: 1-64 lowercase letters/digits/hyphens"},
+                    "name": {"type": "string", "description": "Optional display name"},
+                    "servers": {"type": "array", "items": {"type": "string"}, "description": "Member server namespaces"}
+                }),
+                &["slug"],
+            ),
+        ),
+        tool(
+            "hub__update_group",
+            "Update a connector group's display name and/or replace its full \
+             member set. The slug itself is immutable (it is baked into the \
+             connector URL and issued tokens) — delete and recreate to change it.",
+            schema(
+                json!({
+                    "slug": {"type": "string"},
+                    "name": {"type": "string", "description": "New display name"},
+                    "servers": {"type": "array", "items": {"type": "string"}, "description": "Full replacement set of member namespaces"}
+                }),
+                &["slug"],
+            ),
+        ),
+        tool(
+            "hub__delete_group",
+            "Delete a connector group. Clients connected to its /mcp/<slug> \
+             endpoint lose access immediately; the member servers themselves \
+             are untouched.",
+            schema(json!({"slug": {"type": "string"}}), &["slug"]),
+        ),
+        tool(
             "hub__set_my_client",
             "Set the custom name and/or note for THIS MCP client only (the one \
              making the call). You cannot change any other client, even your own \
@@ -226,7 +270,7 @@ fn annotations_for(name: &str) -> ToolAnnotations {
     match name {
         "hub__whoami" | "hub__list_my_servers" | "hub__list_tokens"
         | "hub__get_my_client" | "hub__runtime_stats" | "hub__list_users"
-        | "hub__list_invites" => {
+        | "hub__list_invites" | "hub__list_groups" => {
             a.read_only(true).destructive(false).idempotent(true).open_world(false)
         }
         // Build from external git repos → open world.
@@ -238,7 +282,7 @@ fn annotations_for(name: &str) -> ToolAnnotations {
             a.read_only(false).destructive(false).idempotent(false).open_world(false)
         }
         "hub__remove" | "hub__revoke_token" | "hub__revoke_invite"
-        | "hub__delete_user" | "hub__disable_user" => {
+        | "hub__delete_user" | "hub__disable_user" | "hub__delete_group" => {
             a.read_only(false).destructive(true).idempotent(true).open_world(false)
         }
         // edit_server, set_env, set_config_file, enable, disable,
@@ -310,6 +354,10 @@ async fn run(
         "remove" => remove(state, user_id, args).await,
         "list_tokens" => list_tokens(state, user_id).await,
         "revoke_token" => revoke_token(state, user_id, args).await,
+        "list_groups" => list_groups(state, user_id).await,
+        "create_group" => create_group(state, user_id, args).await,
+        "update_group" => update_group(state, user_id, args).await,
+        "delete_group" => delete_group(state, user_id, args).await,
         "runtime_stats" => {
             require_admin(admin)?;
             runtime_stats(state).await
@@ -366,6 +414,9 @@ fn action_for(op: &str) -> Option<&'static str> {
         "disable" => "server.disable",
         "remove" => "server.remove",
         "revoke_token" => "token.revoke",
+        "create_group" => "group.create",
+        "update_group" => "group.update",
+        "delete_group" => "group.delete",
         "set_my_client" => "client.label",
         "create_invite" => "invite.create",
         "revoke_invite" => "invite.revoke",
@@ -381,7 +432,7 @@ fn action_for(op: &str) -> Option<&'static str> {
 /// Best-effort identifier of the object a management call acted on, pulled from
 /// the common argument keys.
 fn audit_object(args: &JsonObject) -> String {
-    for key in ["namespace", "handle", "token_id", "id"] {
+    for key in ["namespace", "handle", "token_id", "slug", "id"] {
         if let Some(v) = args.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             return v.to_string();
         }
@@ -971,6 +1022,164 @@ async fn create_recovery(
         "redeem_at": format!("{}/recover", state.config.base_url),
         "advice": "single-use; shown only once. The user enrolls a new passkey with their handle and this code.",
     }))
+}
+
+/// Render one group as JSON: connector URL, members with per-server tool
+/// counts from the cached capability snapshots (probe-time data — `null` for a
+/// never-probed server), and whether the sum fits claude.ai's 256-tool cap.
+/// Group endpoints serve no `hub__` tools, so the member sum is the whole list.
+async fn group_json(
+    state: &AppState,
+    group: &crate::groups::Group,
+    instances_by_id: &std::collections::HashMap<String, &instances::Instance>,
+) -> Result<Value, McpError> {
+    let member_ids = crate::groups::member_instance_ids(&state.db, &group.id)
+        .await
+        .map_err(internal)?;
+    let mut members = Vec::new();
+    let mut total: Option<u64> = Some(0);
+    for (id, inst) in instances_by_id {
+        if !member_ids.contains(id) {
+            continue;
+        }
+        let count = instances::get_capabilities_snapshot(&state.db, id)
+            .await
+            .map_err(internal)?
+            .map(|s| s.tools.len() as u64);
+        // An unprobed member makes the total unknowable.
+        total = match (total, count) {
+            (Some(t), Some(c)) => Some(t + c),
+            _ => None,
+        };
+        members.push(json!({ "namespace": inst.namespace, "tool_count": count }));
+    }
+    members.sort_by(|a, b| a["namespace"].as_str().cmp(&b["namespace"].as_str()));
+    Ok(json!({
+        "slug": group.slug,
+        "name": group.name,
+        "connector_url": state.config.group_mcp_url(&group.slug),
+        "servers": members,
+        "total_tool_count": total,
+        "fits_claude_ai": total.map(|t| t <= 256),
+        "note": "tool counts come from each server's last capability probe and may be stale",
+    }))
+}
+
+async fn list_groups(state: &AppState, user_id: &str) -> Result<CallToolResult, McpError> {
+    let groups = crate::groups::list_for_user(&state.db, user_id)
+        .await
+        .map_err(internal)?;
+    let instances = instances::list_for_user(&state.db, user_id)
+        .await
+        .map_err(internal)?;
+    let by_id: std::collections::HashMap<String, &instances::Instance> =
+        instances.iter().map(|i| (i.id.clone(), i)).collect();
+    let mut out = Vec::new();
+    for g in &groups {
+        out.push(group_json(state, g, &by_id).await?);
+    }
+    ok(json!({
+        "groups": out,
+        "usage": "add a group's connector_url to your MCP client as its own connector; \
+                  the base /mcp endpoint serves only these hub__ management tools",
+    }))
+}
+
+/// Resolve a `servers` argument (array of namespaces) to owned instance ids.
+/// An unknown namespace is an error, not a silent drop.
+async fn instance_ids_from_args(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<Option<Vec<String>>, McpError> {
+    let Some(v) = args.get("servers") else {
+        return Ok(None);
+    };
+    let list = v
+        .as_array()
+        .ok_or_else(|| McpError::invalid_params("'servers' must be an array of namespaces", None))?;
+    let mut ids = Vec::new();
+    for entry in list {
+        let ns = entry
+            .as_str()
+            .ok_or_else(|| McpError::invalid_params("'servers' entries must be strings", None))?;
+        ids.push(find_instance(state, user_id, ns).await?.id);
+    }
+    Ok(Some(ids))
+}
+
+async fn create_group(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let slug = req_str(args, "slug")?;
+    let name = opt_str(args, "name").unwrap_or_default();
+    let ids = instance_ids_from_args(state, user_id, args).await?;
+    let group = crate::groups::create(&state.db, user_id, &slug, &name)
+        .await
+        .map_err(bad_request)?;
+    if let Some(ids) = ids {
+        crate::groups::set_members(&state.db, user_id, &group.id, &ids)
+            .await
+            .map_err(internal)?;
+    }
+    state.notify_tools_changed(user_id);
+    ok(json!({
+        "created": true,
+        "slug": group.slug,
+        "connector_url": state.config.group_mcp_url(&group.slug),
+        "next_step": "add the connector_url to your MCP client as a new connector and authenticate",
+    }))
+}
+
+async fn update_group(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let slug = req_str(args, "slug")?;
+    let group = crate::groups::find_by_slug(&state.db, user_id, &slug)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| McpError::invalid_params(format!("no group with slug '{slug}'"), None))?;
+    let ids = instance_ids_from_args(state, user_id, args).await?;
+    let name = opt_str(args, "name");
+    if ids.is_none() && name.is_none() {
+        return Err(McpError::invalid_params(
+            "provide 'name' and/or 'servers' to update",
+            None,
+        ));
+    }
+    if let Some(name) = name {
+        crate::groups::rename(&state.db, user_id, &group.id, &name)
+            .await
+            .map_err(internal)?;
+    }
+    if let Some(ids) = ids {
+        crate::groups::set_members(&state.db, user_id, &group.id, &ids)
+            .await
+            .map_err(internal)?;
+    }
+    state.notify_tools_changed(user_id);
+    ok(json!({ "updated": true, "slug": slug }))
+}
+
+async fn delete_group(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let slug = req_str(args, "slug")?;
+    let group = crate::groups::find_by_slug(&state.db, user_id, &slug)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| McpError::invalid_params(format!("no group with slug '{slug}'"), None))?;
+    crate::groups::delete(&state.db, user_id, &group.id)
+        .await
+        .map_err(internal)?;
+    state.notify_tools_changed(user_id);
+    ok(json!({ "deleted": true, "slug": slug }))
 }
 
 // ---------------------------------------------------------------------------

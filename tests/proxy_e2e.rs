@@ -1,6 +1,11 @@
 //! End-to-end proxy tests: a real MCP client connects to the hub over Streamable
 //! HTTP with an OAuth bearer token. Covers backend aggregation and the built-in
 //! `hub__` management interface.
+//!
+//! Endpoint model: the base `/mcp` endpoint serves only the `hub__*` management
+//! tools; backend tools/prompts/resources are served on connector-group
+//! endpoints at `/mcp/<slug>`. Tests that exercise backends create a group
+//! (slug "g" by convention) and connect there with a matching-audience token.
 
 use mcp_hub::instances::ServerDef;
 use mcp_hub::config::{Config, Limits};
@@ -65,22 +70,57 @@ async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
     (base, state)
 }
 
-/// Try to connect an MCP client; returns the error instead of panicking so
-/// tests can assert that authentication is rejected.
+/// Try to connect an MCP client to an endpoint path (`/mcp` or `/mcp/<slug>`);
+/// returns the error instead of panicking so tests can assert rejection.
+async fn try_connect_at(
+    base: &str,
+    path: &str,
+    token: String,
+) -> Result<RunningService<RoleClient, ()>, Box<dyn std::error::Error>> {
+    let config =
+        StreamableHttpClientTransportConfig::with_uri(format!("{base}{path}")).auth_header(token);
+    Ok(serve_client((), StreamableHttpClientTransport::from_config(config)).await?)
+}
+
+/// As [`try_connect_at`] for the base `/mcp` endpoint.
 async fn try_connect(
     base: &str,
     token: String,
 ) -> Result<RunningService<RoleClient, ()>, Box<dyn std::error::Error>> {
-    let config =
-        StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp")).auth_header(token);
-    Ok(serve_client((), StreamableHttpClientTransport::from_config(config)).await?)
+    try_connect_at(base, "/mcp", token).await
 }
 
-/// Connect an MCP client to the hub's `/mcp` endpoint with a bearer token.
+/// Connect an MCP client to the hub's base `/mcp` (management) endpoint.
 async fn connect(base: &str, token: String) -> RunningService<RoleClient, ()> {
     try_connect(base, token)
         .await
         .expect("MCP client should initialize through the proxy")
+}
+
+/// Connect an MCP client to a connector-group endpoint.
+async fn connect_at(base: &str, path: &str, token: String) -> RunningService<RoleClient, ()> {
+    try_connect_at(base, path, token)
+        .await
+        .expect("MCP client should initialize through the proxy")
+}
+
+/// Create a connector group with the given member instance ids.
+async fn make_group(state: &AppState, user_id: &str, slug: &str, instance_ids: &[String]) {
+    let g = mcp_hub::groups::create(&state.db, user_id, slug, slug)
+        .await
+        .unwrap();
+    mcp_hub::groups::set_members(&state.db, user_id, &g.id, instance_ids)
+        .await
+        .unwrap();
+}
+
+/// Issue an OAuth access token whose audience is the group endpoint `/mcp/g`.
+fn group_token(state: &AppState, base: &str, user_id: &str, client: &str) -> String {
+    state
+        .signer
+        .issue_access_token(user_id, client, &format!("{base}/mcp/g"), "mcp", false, 3600)
+        .unwrap()
+        .0
 }
 
 fn args(v: serde_json::Value) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -107,18 +147,14 @@ async fn unbuilt_git_backend_is_skipped() {
         entry: None,
         module: None,
     };
-    instances::create(&state.db, &user.id, None, Some(&def), "git", "Git Server")
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "git", "Git Server")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
-
-    // The unbuilt backend contributes no tools (it is skipped, not fatal).
-    let names: Vec<String> = client
+    // The unbuilt backend contributes no tools to its group (skipped, not fatal).
+    let gclient = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
+    let names: Vec<String> = gclient
         .list_all_tools()
         .await
         .unwrap()
@@ -126,9 +162,14 @@ async fn unbuilt_git_backend_is_skipped() {
         .map(|t| t.name.to_string())
         .collect();
     assert!(!names.iter().any(|n| n.starts_with("git__")), "got {names:?}");
-    assert!(names.contains(&"hub__whoami".to_string()));
 
-    // ...and it is reported as unbuilt so the user knows to run hub__update_server.
+    // ...and it is reported as unbuilt (on the management endpoint) so the user
+    // knows to run hub__update_server.
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
     let listed = client
         .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
@@ -136,6 +177,7 @@ async fn unbuilt_git_backend_is_skipped() {
     let json = serde_json::to_string(&listed.structured_content).unwrap();
     assert!(json.contains("\"build_status\":\"unbuilt\""), "got {json}");
 
+    let _ = gclient.cancel().await;
     let _ = client.cancel().await;
 }
 
@@ -170,18 +212,15 @@ async fn proxy_aggregates_a_stdio_backend() {
     instances::set_config_value(&state.db, &inst.id, "MOCK_PREFIX", "PFX:")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
 
     let tools = client.list_all_tools().await.unwrap();
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
-    // Management tools are always present.
-    assert!(names.contains(&"hub__whoami".to_string()));
+    // Management tools live on the base endpoint, not on groups.
+    assert!(!names.iter().any(|n| n.starts_with("hub__")), "got {names:?}");
 
     let result = client
         .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hello" })); __p })
@@ -195,8 +234,13 @@ async fn proxy_aggregates_a_stdio_backend() {
         .await;
     assert!(bad.is_err());
 
-    // The exact launch command is reported for stdio backends.
-    let listed = client
+    // The exact launch command is reported for stdio backends (management endpoint).
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let mclient = connect(&base, token).await;
+    let listed = mclient
         .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
@@ -205,6 +249,7 @@ async fn proxy_aggregates_a_stdio_backend() {
     assert!(json.contains("mock_mcp_server"), "got {json}");
 
     let _ = client.cancel().await;
+    let _ = mclient.cancel().await;
 }
 
 /// A proxied tool call that outruns `backend_call_timeout_secs` is aborted by
@@ -239,15 +284,12 @@ async fn slow_backend_call_times_out() {
         entry: None,
         module: None,
     };
-    instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
 
     // A 5s sleep under a 1s cap must come back as an error to the client.
     let result = client
@@ -304,12 +346,9 @@ async fn restart_reloads_backend_config_in_a_live_session() {
     instances::set_config_value(&state.db, &inst.id, "MOCK_PREFIX", "PFX:")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", std::slice::from_ref(&inst.id)).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
 
     async fn echo(client: &RunningService<RoleClient, ()>) -> String {
         let result = client
@@ -360,17 +399,13 @@ async fn failed_backend_reports_error_status() {
         entry: None,
         module: None,
     };
-    instances::create(&state.db, &user.id, None, Some(&def), "broken", "Broken")
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "broken", "Broken")
         .await
         .unwrap();
-
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
     // The broken backend contributes no tools but does not fail the session.
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
     let names: Vec<String> = client
         .list_all_tools()
         .await
@@ -381,7 +416,12 @@ async fn failed_backend_reports_error_status() {
     assert!(!names.iter().any(|n| n.starts_with("broken__")));
 
     // ...and its failure is reported so the user can diagnose it.
-    let listed = client
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let mclient = connect(&base, token).await;
+    let listed = mclient
         .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
@@ -389,6 +429,7 @@ async fn failed_backend_reports_error_status() {
     assert!(json.contains("\"runtime_status\":\"error\""), "got {json}");
 
     let _ = client.cancel().await;
+    let _ = mclient.cancel().await;
 }
 
 #[tokio::test]
@@ -413,15 +454,12 @@ async fn proxy_aggregates_resources_and_prompts() {
         entry: None,
         module: None,
     };
-    instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
 
     // Resources are aggregated with namespaced URIs (hub://<ns>/<original>).
     let resources = client.list_all_resources().await.unwrap();
@@ -737,8 +775,8 @@ async fn self_service_client_tools_reject_personal_access_tokens() {
     let _ = client.cancel().await;
 }
 
-/// Create a user with the mock stdio backend under namespace "mock"; returns
-/// (base, state, user_id, instance_id).
+/// Create a user with the mock stdio backend under namespace "mock", in a
+/// connector group with slug "g"; returns (base, state, user_id, instance_id).
 async fn hub_with_mock_backend() -> (String, AppState, String, String) {
     let exe = mock_server_path();
     assert!(std::path::Path::new(&exe).exists(), "build the mock example first");
@@ -762,17 +800,19 @@ async fn hub_with_mock_backend() -> (String, AppState, String, String) {
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", std::slice::from_ref(&inst.id)).await;
     (base, state, user.id, inst.id)
 }
 
 #[tokio::test]
 async fn denied_backend_is_hidden_from_oauth_client() {
     let (base, state, user_id, inst_id) = hub_with_mock_backend().await;
-    let (token, _) = state
+    let token = state
         .signer
-        .issue_access_token(&user_id, "client-x", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+        .issue_access_token(&user_id, "client-x", &format!("{base}/mcp/g"), "mcp", false, 3600)
+        .unwrap()
+        .0;
+    let client = connect_at(&base, "/mcp/g", token).await;
 
     // Full access by default.
     let names: Vec<String> = client
@@ -789,7 +829,8 @@ async fn denied_backend_is_hidden_from_oauth_client() {
         .await
         .unwrap();
 
-    // The backend's tool is now gone, but hub__ management stays.
+    // The backend's tool is now gone even though it is still a group member
+    // (denials compose with group scoping).
     let names: Vec<String> = client
         .list_all_tools()
         .await
@@ -798,7 +839,6 @@ async fn denied_backend_is_hidden_from_oauth_client() {
         .map(|t| t.name.to_string())
         .collect();
     assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
-    assert!(names.contains(&"hub__whoami".to_string()));
 
     // And a direct call is refused.
     let blocked = client
@@ -815,7 +855,8 @@ async fn denied_backend_is_hidden_from_pat() {
     let (pat, secret) = mcp_hub::tokens::create(&state.db, &user_id, "laptop", 3600)
         .await
         .unwrap();
-    let client = connect(&base, secret).await;
+    // PATs carry no audience, so one works on a group endpoint directly.
+    let client = connect_at(&base, "/mcp/g", secret).await;
 
     let names: Vec<String> = client
         .list_all_tools()
@@ -839,7 +880,6 @@ async fn denied_backend_is_hidden_from_pat() {
         .map(|t| t.name.to_string())
         .collect();
     assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
-    assert!(names.contains(&"hub__whoami".to_string()));
 
     let _ = client.cancel().await;
 }
@@ -987,18 +1027,12 @@ async fn mock_pid(client: &RunningService<RoleClient, ()>, tool: &str) -> String
 async fn backend_pool_is_shared_across_sessions() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
 
-    let token = |n: &str| {
-        state
-            .signer
-            .issue_access_token(&user_id, n, &format!("{base}/mcp"), "mcp", false, 3600)
-            .unwrap()
-            .0
-    };
-    let a = connect(&base, token("client-a")).await;
+    let token = |n: &str| group_token(&state, &base, &user_id, n);
+    let a = connect_at(&base, "/mcp/g", token("client-a")).await;
     let pid_a = mock_pid(&a, "mock__pid").await;
     let _ = a.cancel().await;
 
-    let b = connect(&base, token("client-b")).await;
+    let b = connect_at(&base, "/mcp/g", token("client-b")).await;
     let pid_b = mock_pid(&b, "mock__pid").await;
     assert_eq!(pid_a, pid_b, "second session should reuse the pooled backend");
     let _ = b.cancel().await;
@@ -1010,14 +1044,11 @@ async fn backend_pool_is_shared_across_sessions() {
 async fn concurrent_sessions_share_one_backend() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
 
-    let token = |n: &str| {
-        state
-            .signer
-            .issue_access_token(&user_id, n, &format!("{base}/mcp"), "mcp", false, 3600)
-            .unwrap()
-            .0
-    };
-    let (a, b) = tokio::join!(connect(&base, token("c-a")), connect(&base, token("c-b")));
+    let token = |n: &str| group_token(&state, &base, &user_id, n);
+    let (a, b) = tokio::join!(
+        connect_at(&base, "/mcp/g", token("c-a")),
+        connect_at(&base, "/mcp/g", token("c-b"))
+    );
     let (pid_a, pid_b) = tokio::join!(mock_pid(&a, "mock__pid"), mock_pid(&b, "mock__pid"));
     assert_eq!(pid_a, pid_b, "concurrent sessions should share one backend");
     let _ = a.cancel().await;
@@ -1043,13 +1074,9 @@ async fn hung_initialize_is_timed_out_and_skipped() {
     instances::set_config_value(&state.db, &inst.id, "MOCK_INIT_DELAY_MS", "30000")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
-
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
     let names: Vec<String> = client
         .list_all_tools()
         .await
@@ -1058,9 +1085,13 @@ async fn hung_initialize_is_timed_out_and_skipped() {
         .map(|t| t.name.to_string())
         .collect();
     assert!(!names.iter().any(|n| n.starts_with("hang__")), "got {names:?}");
-    assert!(names.contains(&"hub__whoami".to_string()));
 
-    let listed = client
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let mclient = connect(&base, token).await;
+    let listed = mclient
         .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
         .await
         .unwrap();
@@ -1068,6 +1099,7 @@ async fn hung_initialize_is_timed_out_and_skipped() {
     assert!(json.contains("timed out"), "timeout not reported: {json}");
 
     let _ = client.cancel().await;
+    let _ = mclient.cancel().await;
 }
 
 /// A backend that hangs answering `tools/list` is skipped from the aggregate
@@ -1088,12 +1120,9 @@ async fn hung_tools_list_is_skipped_not_fatal() {
     instances::set_config_value(&state.db, &inst.id, "MOCK_LIST_DELAY_MS", "30000")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
 
     let t0 = std::time::Instant::now();
     let names: Vec<String> = client
@@ -1104,7 +1133,6 @@ async fn hung_tools_list_is_skipped_not_fatal() {
         .map(|t| t.name.to_string())
         .collect();
     assert!(!names.iter().any(|n| n.starts_with("slowlist__")), "got {names:?}");
-    assert!(names.contains(&"hub__whoami".to_string()));
     assert!(
         t0.elapsed() < std::time::Duration::from_secs(10),
         "list should be cut off by the list timeout, took {:?}",
@@ -1119,11 +1147,7 @@ async fn hung_tools_list_is_skipped_not_fatal() {
 #[tokio::test]
 async fn idle_reap_retires_backends_and_next_request_rebinds() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
-    let (token, _) = state
-        .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
 
     let pid_before = mock_pid(&client, "mock__pid").await;
     let (users, backends) = state.backend_pool.reap_idle(std::time::Duration::ZERO);
@@ -1141,11 +1165,14 @@ async fn idle_reap_retires_backends_and_next_request_rebinds() {
 #[tokio::test]
 async fn disable_and_enable_converge_in_live_sessions() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    // Backend visibility is observed on the group endpoint; the disable/enable
+    // management calls go through the base endpoint.
+    let gclient = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
     let (token, _) = state
         .signer
         .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
         .unwrap();
-    let client = connect(&base, token).await;
+    let mclient = connect(&base, token).await;
 
     async fn list(client: &RunningService<RoleClient, ()>) -> Vec<String> {
         client
@@ -1156,23 +1183,24 @@ async fn disable_and_enable_converge_in_live_sessions() {
             .map(|t| t.name.to_string())
             .collect()
     }
-    assert!(list(&client).await.contains(&"mock__echo".to_string()));
+    assert!(list(&gclient).await.contains(&"mock__echo".to_string()));
 
-    client
+    mclient
         .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable"); __p.arguments = args(serde_json::json!({"namespace": "mock"})); __p })
         .await
         .unwrap();
-    let names = list(&client).await;
+    let names = list(&gclient).await;
     assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
 
-    client
+    mclient
         .call_tool({ let mut __p = CallToolRequestParams::new("hub__enable"); __p.arguments = args(serde_json::json!({"namespace": "mock"})); __p })
         .await
         .unwrap();
-    let names = list(&client).await;
+    let names = list(&gclient).await;
     assert!(names.contains(&"mock__echo".to_string()), "not back: {names:?}");
 
-    let _ = client.cancel().await;
+    let _ = gclient.cancel().await;
+    let _ = mclient.cancel().await;
 }
 
 /// Keep-warm binds backends before any client connects, so the first
@@ -1188,11 +1216,7 @@ async fn warm_all_prewarms_backends_before_any_connection() {
     assert_eq!(state.backend_pool.counts(), (1, 1), "backend live before any client");
 
     // The pre-warmed subprocess is exactly what a new connection is handed…
-    let (token, _) = state
-        .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
     let pid_before = mock_pid(&client, "mock__pid").await;
 
     // …and a re-warm pass leaves the healthy backend untouched.
@@ -1217,7 +1241,7 @@ async fn bind_budget_serves_partial_then_adds_late_backend() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    instances::create(&state.db, &user.id, None, Some(&mock_def()), "fast", "Fast")
+    let fast = instances::create(&state.db, &user.id, None, Some(&mock_def()), "fast", "Fast")
         .await
         .unwrap();
     let slow = instances::create(&state.db, &user.id, None, Some(&mock_def()), "slow", "Slow")
@@ -1226,12 +1250,9 @@ async fn bind_budget_serves_partial_then_adds_late_backend() {
     instances::set_config_value(&state.db, &slow.id, "MOCK_INIT_DELAY_MS", "3000")
         .await
         .unwrap();
+    make_group(&state, &user.id, "g", &[fast.id, slow.id.clone()]).await;
 
-    let (token, _) = state
-        .signer
-        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
-        .unwrap();
-    let client = connect(&base, token).await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
 
     // The first list respects the budget: fast is in, slow is still pending.
     let t0 = std::time::Instant::now();
@@ -1313,6 +1334,205 @@ async fn heartbeat_drops_wedged_backend_after_three_strikes() {
     let (ok, failed) = mcp_hub::proxy::pool::exercise_all(&state).await;
     assert_eq!((ok, failed), (1, 1));
     assert_eq!(state.backend_pool.counts(), (1, 1), "wedged backend dropped");
+}
+
+/// The base `/mcp` endpoint serves only `hub__*` tools: no backend tools, no
+/// prompts/resources, and backend calls are pointed at the group endpoints.
+#[tokio::test]
+async fn management_endpoint_serves_only_hub_tools() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.iter().all(|n| n.starts_with("hub__")), "got {names:?}");
+    assert!(names.contains(&"hub__list_groups".to_string()));
+
+    assert!(client.list_all_prompts().await.unwrap().is_empty());
+    assert!(client.list_all_resources().await.unwrap().is_empty());
+
+    // A backend tool call on /mcp is refused with a pointer at the groups.
+    let res = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({"msg": "hi"})); __p })
+        .await;
+    assert!(
+        format!("{:?}", res.unwrap_err()).contains("group"),
+        "backend call on /mcp should point at group endpoints"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// Group endpoints serve no `hub__*` tools and refuse them outright.
+#[tokio::test]
+async fn group_endpoint_rejects_hub_tools() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("hub__")), "got {names:?}");
+
+    let res = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__whoami"); __p.arguments = None; __p })
+        .await;
+    assert!(
+        format!("{:?}", res.unwrap_err()).contains("/mcp"),
+        "hub__ call on a group should point at the base endpoint"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// A group scopes its endpoint to member backends only; a non-member backend
+/// of the same user is invisible and uncallable there.
+#[tokio::test]
+async fn group_endpoint_scopes_to_members() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    // A second backend NOT in group "g".
+    let other = instances::create(&state.db, &user_id, None, Some(&mock_def()), "other", "Other")
+        .await
+        .unwrap();
+    make_group(&state, &user_id, "g2", &[other.id]).await;
+
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("other__")), "got {names:?}");
+
+    let blocked = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("other__echo"); __p.arguments = args(serde_json::json!({"msg": "hi"})); __p })
+        .await;
+    assert!(blocked.is_err(), "non-member backend must be uncallable via this group");
+
+    let _ = client.cancel().await;
+}
+
+/// A token minted for one group's endpoint is rejected on siblings and on the
+/// base endpoint (audience isolation), and a slug the user doesn't own 404s.
+#[tokio::test]
+async fn group_tokens_are_audience_isolated() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let g = group_token(&state, &base, &user_id, "client");
+
+    assert!(try_connect_at(&base, "/mcp/g", g.clone()).await.is_ok());
+    assert!(try_connect_at(&base, "/mcp", g.clone()).await.is_err(), "group token on /mcp");
+    // "other" doesn't even exist — but the audience check already rejects it.
+    assert!(try_connect_at(&base, "/mcp/other", g).await.is_err());
+
+    let (m, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    assert!(try_connect_at(&base, "/mcp/g", m.clone()).await.is_err(), "/mcp token on a group");
+
+    // Right audience, but the slug doesn't exist for this user → 404 at bind.
+    let (ghost, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp/ghost"), "mcp", false, 3600)
+        .unwrap();
+    assert!(try_connect_at(&base, "/mcp/ghost", ghost).await.is_err());
+}
+
+/// Full group lifecycle over the management endpoint: create with members,
+/// list (connector URL + counts), connect to the new endpoint, shrink it,
+/// delete it — after which its endpoint is gone.
+#[tokio::test]
+async fn group_crud_round_trip_over_mcp() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+
+    let created = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_group"); __p.arguments = args(serde_json::json!({"slug": "work", "name": "Work", "servers": ["mock"]})); __p })
+        .await
+        .unwrap();
+    let created = created.structured_content.unwrap();
+    assert_eq!(created["created"], true);
+    assert_eq!(created["connector_url"], format!("{base}/mcp/work"));
+
+    // A bad slug and an unknown server namespace are rejected.
+    let bad = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_group"); __p.arguments = args(serde_json::json!({"slug": "Bad Slug"})); __p })
+        .await;
+    assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
+    let bad = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_group"); __p.arguments = args(serde_json::json!({"slug": "x1", "servers": ["nope"]})); __p })
+        .await;
+    assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
+
+    let listed = client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_groups"); __p.arguments = None; __p })
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&listed.structured_content).unwrap();
+    assert!(json.contains("\"slug\":\"work\""), "got {json}");
+    assert!(json.contains("mock"), "got {json}");
+
+    // The new endpoint works with a matching-audience token.
+    let (wt, _) = state
+        .signer
+        .issue_access_token(&user_id, "client", &format!("{base}/mcp/work"), "mcp", false, 3600)
+        .unwrap();
+    let wclient = connect_at(&base, "/mcp/work", wt.clone()).await;
+    let names: Vec<String> = wclient
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
+
+    // Emptying the member set removes the backend from the live endpoint.
+    client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__update_group"); __p.arguments = args(serde_json::json!({"slug": "work", "servers": []})); __p })
+        .await
+        .unwrap();
+    let names: Vec<String> = wclient
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+
+    // Delete: the endpoint 404s for new work afterwards.
+    client
+        .call_tool({ let mut __p = CallToolRequestParams::new("hub__delete_group"); __p.arguments = args(serde_json::json!({"slug": "work"})); __p })
+        .await
+        .unwrap();
+    let _ = wclient.cancel().await;
+    assert!(
+        try_connect_at(&base, "/mcp/work", wt).await.is_err(),
+        "deleted group's endpoint must be gone"
+    );
+
+    let _ = client.cancel().await;
 }
 
 #[tokio::test]

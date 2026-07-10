@@ -232,6 +232,102 @@ async fn mcp_with_unknown_session_is_404_not_401() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// An unauthenticated hit on a group endpoint gets a challenge pointing at
+/// that endpoint's own protected-resource metadata — this is how a client
+/// learns to request the group's `resource` during the OAuth flow.
+#[tokio::test]
+async fn group_endpoint_challenge_names_its_own_metadata() {
+    let resp = app(test_state().await)
+        .oneshot(
+            Request::post("/mcp/zabbix")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let challenge = resp.headers()["www-authenticate"].to_str().unwrap();
+    assert!(
+        challenge.contains("/.well-known/oauth-protected-resource/mcp/zabbix"),
+        "got {challenge}"
+    );
+}
+
+/// Paths under /mcp that are not a valid endpoint 404 before any auth work.
+#[tokio::test]
+async fn malformed_mcp_paths_are_404() {
+    let state = test_state().await;
+    for path in ["/mcp/a/b", "/mcp/Bad!", "/mcp/-nope", "/mcp/UPPER"] {
+        let resp = app(state.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path {path}");
+    }
+}
+
+/// Token audience is the endpoint's own URL: a base-endpoint token is rejected
+/// on a group endpoint and vice versa; a group token only works on its own
+/// slug — and only for the user who owns that slug (foreign slug → 404).
+#[tokio::test]
+async fn group_token_audience_and_ownership() {
+    let state = test_state().await;
+    let alice = mcp_hub::users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let bob = mcp_hub::users::create(&state.db, "u2", "bob", "Bob", false)
+        .await
+        .unwrap();
+    mcp_hub::groups::create(&state.db, &alice.id, "g", "").await.unwrap();
+
+    let issue = |user_id: &str, aud: &str| {
+        state
+            .signer
+            .issue_access_token(user_id, "c", &format!("{BASE}{aud}"), "mcp", false, 3600)
+            .unwrap()
+            .0
+    };
+    let request = |path: &str, token: &str| {
+        Request::post(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "localhost")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+            ))
+            .unwrap()
+    };
+
+    // Base token: fine on /mcp, rejected on the group.
+    let base_token = issue(&alice.id, "/mcp");
+    let ok = app(state.clone()).oneshot(request("/mcp", &base_token)).await.unwrap();
+    assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
+    let cross = app(state.clone()).oneshot(request("/mcp/g", &base_token)).await.unwrap();
+    assert_eq!(cross.status(), StatusCode::UNAUTHORIZED);
+
+    // Group token: fine on its slug, rejected on /mcp and on a sibling slug.
+    let g_token = issue(&alice.id, "/mcp/g");
+    let ok = app(state.clone()).oneshot(request("/mcp/g", &g_token)).await.unwrap();
+    assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(ok.status(), StatusCode::NOT_FOUND);
+    let cross = app(state.clone()).oneshot(request("/mcp", &g_token)).await.unwrap();
+    assert_eq!(cross.status(), StatusCode::UNAUTHORIZED);
+    let sibling = app(state.clone()).oneshot(request("/mcp/other", &g_token)).await.unwrap();
+    assert_eq!(sibling.status(), StatusCode::UNAUTHORIZED);
+
+    // Bob's token with the right audience still 404s: the slug is Alice's.
+    let bob_token = issue(&bob.id, "/mcp/g");
+    let foreign = app(state.clone()).oneshot(request("/mcp/g", &bob_token)).await.unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn mcp_with_token_for_unknown_user_is_401() {
     // A correctly-signed token whose subject has no account (e.g. deleted) is

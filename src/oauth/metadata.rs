@@ -36,6 +36,31 @@ pub async fn protected_resource(State(state): State<AppState>) -> Json<serde_jso
     }))
 }
 
+/// `GET /.well-known/oauth-protected-resource/mcp/{slug}` (RFC 9728,
+/// path-suffix form) — the metadata for a connector-group endpoint.
+///
+/// Purely syntactic: it does NOT check that the slug exists (groups are
+/// per-user and this document is unauthenticated, so an existence check would
+/// leak which slugs users have). A token for a nonexistent group simply fails
+/// at the endpoint with a 404 after auth.
+pub async fn protected_resource_group(
+    State(state): State<AppState>,
+    axum::extract::Path(slug): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !crate::groups::valid_slug(&slug) {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    let base = &state.config.base_url;
+    Json(serde_json::json!({
+        "resource": state.config.group_mcp_url(&slug),
+        "authorization_servers": [base],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    }))
+    .into_response()
+}
+
 /// `GET /.well-known/jwks.json` — the access-token verification keys.
 pub async fn jwks(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(state.signer.jwks())

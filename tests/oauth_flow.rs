@@ -123,6 +123,158 @@ async fn metadata_documents() {
     assert_eq!(jwks["keys"][0]["alg"], "ES256");
 }
 
+/// Group endpoints publish their own RFC 9728 metadata under the path-suffix
+/// well-known. Purely syntactic — it never confirms whether a slug exists.
+#[tokio::test]
+async fn group_protected_resource_metadata() {
+    let app = app(test_state().await);
+    let meta = json_body(
+        app.clone()
+            .oneshot(
+                Request::get("/.well-known/oauth-protected-resource/mcp/zabbix")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(meta["resource"], format!("{BASE}/mcp/zabbix"));
+    assert_eq!(meta["authorization_servers"][0], BASE);
+
+    // An invalid slug is not a resource.
+    let bad = app
+        .oneshot(
+            Request::get("/.well-known/oauth-protected-resource/mcp/Bad!")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::NOT_FOUND);
+}
+
+/// `resource` at /authorize accepts the base endpoint and any group the
+/// logged-in user owns; a slug they don't own is `invalid_target` at consent
+/// time, not a token that 404s later.
+#[tokio::test]
+async fn authorize_validates_group_resource_ownership() {
+    let state = test_state().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    mcp_hub::groups::create(&state.db, &user.id, "work", "").await.unwrap();
+    let sid = session::create(&state.db, &user.id, &Default::default(), state.config.session_idle_ttl_secs).await.unwrap();
+    let session_header = signed_session_cookie(&state, &sid);
+    store::create_client(
+        &state.db,
+        "client-x",
+        None,
+        &["http://127.0.0.1:9999/cb".into()],
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+
+    let authorize_uri = |resource: &str| {
+        format!(
+            "/authorize?response_type=code&client_id=client-x&redirect_uri={}&code_challenge=abc&code_challenge_method=S256&state=st&resource={}",
+            urlencoding("http://127.0.0.1:9999/cb"),
+            urlencoding(resource),
+        )
+    };
+
+    // Owned group → consent page.
+    let ok = app(state.clone())
+        .oneshot(
+            Request::get(authorize_uri(&format!("{BASE}/mcp/work")))
+                .header("cookie", &session_header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // Unowned slug → invalid_target back at the client.
+    let bad = app(state.clone())
+        .oneshot(
+            Request::get(authorize_uri(&format!("{BASE}/mcp/ghost")))
+                .header("cookie", &session_header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::SEE_OTHER);
+    assert!(bad.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+
+    // A resource outside /mcp entirely is rejected as before.
+    let alien = app(state.clone())
+        .oneshot(
+            Request::get(authorize_uri("https://evil.example.com/mcp"))
+                .header("cookie", &session_header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(alien.status(), StatusCode::SEE_OTHER);
+    assert!(alien.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+}
+
+/// A code minted for a group resource yields a token with the group audience.
+#[tokio::test]
+async fn token_carries_group_resource_audience() {
+    let state = test_state().await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    store::create_client(&state.db, "c", None, &["http://x/cb".into()], &serde_json::json!({}))
+        .await
+        .unwrap();
+    let verifier = "group-audience-verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let challenge = b64url(&sha256(verifier.as_bytes()));
+    store::insert_code(
+        &state.db,
+        "gcode",
+        "c",
+        &user.id,
+        "http://x/cb",
+        &challenge,
+        "mcp",
+        Some(&format!("{BASE}/mcp/work")),
+        600,
+    )
+    .await
+    .unwrap();
+
+    let body = format!(
+        "grant_type=authorization_code&code=gcode&client_id=c&redirect_uri={}&code_verifier={verifier}",
+        urlencoding("http://x/cb"),
+    );
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let access = json_body(resp).await["access_token"].as_str().unwrap().to_string();
+    // Verifies against the group audience, not the base endpoint's.
+    state
+        .signer
+        .verify_access_token(&access, &format!("{BASE}/mcp/work"))
+        .unwrap();
+    assert!(state
+        .signer
+        .verify_access_token(&access, &format!("{BASE}/mcp"))
+        .is_err());
+}
+
 #[tokio::test]
 async fn dynamic_client_registration() {
     let resp = app(test_state().await)

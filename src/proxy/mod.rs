@@ -1,5 +1,9 @@
-//! The MCP proxy: a Streamable HTTP endpoint at `/mcp` that authenticates with
-//! OAuth bearer tokens and aggregates each user's configured backends.
+//! The MCP proxy: Streamable HTTP endpoints under `/mcp` that authenticate
+//! with OAuth bearer tokens. The base `/mcp` endpoint serves only the built-in
+//! `hub__*` management tools; each named connector group a user defines is its
+//! own endpoint at `/mcp/<slug>` aggregating that group's backends (see
+//! [`crate::groups`]). Splitting the catalog across endpoints keeps every
+//! connector under client-side tool caps (claude.ai truncates at 256 tools).
 
 pub mod backend;
 pub mod management;
@@ -43,6 +47,36 @@ impl AuthedUser {
         } else {
             self.pat_id.as_deref().map(|p| (crate::access::PAT, p))
         }
+    }
+}
+
+/// Which MCP endpoint a request arrived at, resolved from the URL path and (for
+/// groups) the authenticated user. Forwarded via request extensions alongside
+/// [`AuthedUser`]. Sessions are shared across paths by the session manager, so
+/// this is resolved **per request** and must never be cached in session state.
+#[derive(Clone, Debug)]
+pub enum McpEndpoint {
+    /// The base `/mcp` endpoint: management (`hub__*`) tools only.
+    Management,
+    /// A `/mcp/<slug>` endpoint serving one of the user's connector groups.
+    Group { group_id: String, slug: String },
+}
+
+/// The endpoint a request's path names, before the group slug (if any) has
+/// been resolved against the authenticated user.
+enum EndpointCandidate {
+    Management,
+    GroupSlug(String),
+}
+
+/// Parse the (nest-stripped) request path into an endpoint candidate. `None`
+/// means the path is not a valid MCP endpoint (deeper nesting, bad slug) and
+/// should 404 before any auth work.
+fn endpoint_candidate(path: &str) -> Option<EndpointCandidate> {
+    match path.trim_start_matches('/') {
+        "" => Some(EndpointCandidate::Management),
+        slug if crate::groups::valid_slug(slug) => Some(EndpointCandidate::GroupSlug(slug.into())),
+        _ => None,
     }
 }
 
@@ -101,6 +135,12 @@ async fn session_expiry_to_404(req: Request, next: Next) -> Response {
 /// for clients that can't do OAuth) or an OAuth access token (ES256 JWT).
 async fn require_bearer(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let info = crate::auth::RequestInfo::from_headers(req.headers());
+    // The nest at `/mcp` strips the prefix, so the path seen here is `/` for
+    // the base endpoint and `/<slug>` for a group endpoint. Anything else is
+    // not an MCP endpoint at all — 404 before any auth work.
+    let Some(candidate) = endpoint_candidate(req.uri().path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let token = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -108,30 +148,35 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
 
     let Some(token) = token else {
-        return reject(&state, &info, "no_bearer");
+        return reject(&state, &info, "no_bearer", &candidate);
     };
 
     // A personal access token is opaque; the prefix lets us route it without a
-    // JWT decode. `admin` comes from the live user row rather than a baked claim.
+    // JWT decode. `admin` comes from the live user row rather than a baked
+    // claim. PATs carry no audience, so they are valid on every endpoint.
     if crate::tokens::looks_like_pat(token) {
         let hash = crate::oauth::token_hash(token);
         return match crate::tokens::resolve_valid(&state.db, &hash).await {
             Ok(Some((user_id, token_id))) => {
                 // Best-effort usage bookkeeping; never fail auth on this write.
                 let _ = crate::tokens::touch(&state.db, &token_id).await;
-                authorize(&state, req, next, &user_id, None, None, Some(token_id), info).await
+                authorize(&state, req, next, &user_id, None, None, Some(token_id), info, candidate)
+                    .await
             }
-            _ => reject(&state, &info, "bad_token"),
+            _ => reject(&state, &info, "bad_token", &candidate),
         };
     }
 
-    // Otherwise treat it as an OAuth access token (stateless ES256 JWT).
-    let claims = match state
-        .signer
-        .verify_access_token(token, &state.config.mcp_url())
-    {
+    // Otherwise treat it as an OAuth access token (stateless ES256 JWT). The
+    // audience is the endpoint's own resource URL, so a token minted for one
+    // endpoint cannot be replayed against another.
+    let expected_audience = match &candidate {
+        EndpointCandidate::Management => state.config.mcp_url(),
+        EndpointCandidate::GroupSlug(slug) => state.config.group_mcp_url(slug),
+    };
+    let claims = match state.signer.verify_access_token(token, &expected_audience) {
         Ok(c) => c,
-        Err(_) => return reject(&state, &info, "bad_token"),
+        Err(_) => return reject(&state, &info, "bad_token", &candidate),
     };
     authorize(
         &state,
@@ -142,16 +187,22 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         Some(claims.client_id),
         None,
         info,
+        candidate,
     )
     .await
 }
 
 /// Log an `auth.unauthorized` audit event and return the 401 challenge.
-fn reject(state: &AppState, info: &crate::auth::RequestInfo, reason: &str) -> Response {
+fn reject(
+    state: &AppState,
+    info: &crate::auth::RequestInfo,
+    reason: &str,
+    candidate: &EndpointCandidate,
+) -> Response {
     crate::audit::event("auth.unauthorized")
         .request(info)
         .denied(reason);
-    unauthorized(state)
+    unauthorized(state, candidate)
 }
 
 /// Confirm the account still exists and is enabled, then forward the request
@@ -169,9 +220,28 @@ async fn authorize(
     client_id: Option<String>,
     pat_id: Option<String>,
     info: crate::auth::RequestInfo,
+    candidate: EndpointCandidate,
 ) -> Response {
     match crate::users::find_by_id(&state.db, user_id).await {
         Ok(Some(user)) if !user.disabled => {
+            // A group slug resolves against this user's groups. A slug that
+            // doesn't exist for them is a 404, not a 401 — the credential was
+            // fine; the resource isn't there. Looked up per request so group
+            // deletion cuts access immediately.
+            let endpoint = match candidate {
+                EndpointCandidate::Management => McpEndpoint::Management,
+                EndpointCandidate::GroupSlug(slug) => {
+                    match crate::groups::find_by_slug(&state.db, &user.id, &slug).await {
+                        Ok(Some(group)) => McpEndpoint::Group { group_id: group.id, slug },
+                        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"), "group lookup failed");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    }
+                }
+            };
+            req.extensions_mut().insert(endpoint);
             req.extensions_mut().insert(AuthedUser {
                 user_id: user.id,
                 admin: admin_claim.unwrap_or(user.is_admin),
@@ -181,16 +251,23 @@ async fn authorize(
             });
             next.run(req).await
         }
-        _ => reject(state, &info, "user_unavailable"),
+        _ => reject(state, &info, "user_unavailable", &candidate),
     }
 }
 
 /// A 401 that points clients at the protected-resource metadata (RFC 9728), so
 /// MCP clients can discover the authorization server and start the OAuth flow.
-fn unauthorized(state: &AppState) -> Response {
+/// The metadata URL carries the endpoint path, which is how a client learns to
+/// request that endpoint's `resource` during authorization — and hence how its
+/// token ends up with the right audience.
+fn unauthorized(state: &AppState, candidate: &EndpointCandidate) -> Response {
+    let resource_suffix = match candidate {
+        EndpointCandidate::Management => "/mcp".to_string(),
+        EndpointCandidate::GroupSlug(slug) => format!("/mcp/{slug}"),
+    };
     let challenge = format!(
-        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
-        state.config.base_url
+        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{}\"",
+        state.config.base_url, resource_suffix
     );
     (
         StatusCode::UNAUTHORIZED,

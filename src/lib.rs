@@ -7,6 +7,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod gitsrc;
+pub mod groups;
 pub mod instances;
 pub mod invites;
 pub mod oauth;
@@ -258,6 +259,10 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/{id}/restart", post(web::restart_server))
         .route("/servers/{id}/update", post(web::update_server))
         .route("/servers/{id}/delete", post(web::delete_server))
+        // Connector group management (every user manages their own)
+        .route("/groups/create", post(web::create_group))
+        .route("/groups/{id}/update", post(web::update_group))
+        .route("/groups/{id}/delete", post(web::delete_group))
         // Invite management (admin)
         .route("/invites", get(web::invites_page))
         .route("/invites/create", post(web::create_invite))
@@ -282,6 +287,11 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route(
             "/.well-known/oauth-protected-resource/mcp",
             get(metadata::protected_resource),
+        )
+        // Connector-group endpoints each have their own resource metadata.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp/{slug}",
+            get(metadata::protected_resource_group),
         )
         .route("/.well-known/jwks.json", get(metadata::jwks))
         // OAuth 2.1 endpoints
