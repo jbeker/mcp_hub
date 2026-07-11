@@ -1,5 +1,8 @@
-//! Git-sourced backends: build a repo into a prebuilt virtualenv once, then run
-//! it directly so connecting never fetches or installs. Updates are explicit.
+//! Git-sourced backends: build a repo into a prebuilt environment once (a
+//! virtualenv for Python via uv, a `bin/` of compiled binaries for Go), then
+//! run it directly so connecting never fetches or installs. Updates are
+//! explicit. The language is detected from the repo root: `go.mod` → Go,
+//! `pyproject.toml`/`setup.py` → Python.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,7 +15,9 @@ use crate::instances::{self, Instance, ServerDef};
 use crate::sandbox::Sandbox;
 
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
-const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+// Generous enough for a cold Go build (module downloads + compile) as well as
+// a uv install.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Result of an update request.
 pub struct UpdateReport {
@@ -21,7 +26,7 @@ pub struct UpdateReport {
     pub commit: String,
 }
 
-/// The on-disk virtualenv path for an instance.
+/// The on-disk built-environment path for an instance.
 pub fn env_path(env_dir: &str, instance_id: &str) -> PathBuf {
     Path::new(env_dir).join(instance_id)
 }
@@ -90,9 +95,9 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 /// Resolve the program and args to launch a built git backend: the command's
-/// first token resolves to `<venv>/bin/<command>` so console scripts and
-/// `python` come from the built environment; the rest of the command line is
-/// passed through unchanged.
+/// first token resolves to `<env>/bin/<command>` so console scripts, `python`,
+/// and compiled Go binaries all come from the built environment; the rest of
+/// the command line is passed through unchanged.
 pub fn launch_command(env_dir: &str, instance_id: &str, def: &ServerDef) -> Result<(String, Vec<String>)> {
     let bin = env_path(env_dir, instance_id).join("bin");
     let command = def
@@ -139,6 +144,70 @@ async fn resolve_commit(repo: &str, git_ref: &str) -> Result<String> {
         return Ok(git_ref.to_string());
     }
     bail!("ref '{git_ref}' not found in {repo}")
+}
+
+/// Language of a git source, detected from files at the checkout root.
+enum Lang {
+    Python,
+    Go,
+}
+
+fn detect_lang(checkout: &Path) -> Result<Lang> {
+    if checkout.join("go.mod").is_file() {
+        return Ok(Lang::Go);
+    }
+    if checkout.join("pyproject.toml").is_file() || checkout.join("setup.py").is_file() {
+        return Ok(Lang::Python);
+    }
+    bail!("cannot determine how to build this repo: no go.mod or pyproject.toml/setup.py at its root")
+}
+
+/// Check out `commit` from `repo` into `dest`. No repo code executes here —
+/// git never runs hooks from a fetched repository. Tries a shallow
+/// fetch-by-SHA first (GitHub and most hosts allow it), falling back to a
+/// full clone for hosts that reject it.
+async fn clone_at_commit(repo: &str, commit: &str, dest: &Path) -> Result<()> {
+    let _ = std::fs::remove_dir_all(dest);
+    std::fs::create_dir_all(dest).context("creating source checkout dir")?;
+    let dest_s = dest.to_string_lossy().into_owned();
+    let shallow: Result<()> = async {
+        run_git(&["init", "-q", &dest_s]).await?;
+        run_git(&["-C", &dest_s, "fetch", "-q", "--depth", "1", repo, commit]).await?;
+        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", "FETCH_HEAD"]).await
+    }
+    .await;
+    if let Err(e) = shallow {
+        tracing::debug!(error = %e, repo, "shallow fetch-by-sha failed; falling back to a full clone");
+        let _ = std::fs::remove_dir_all(dest);
+        run_git(&["clone", "-q", repo, &dest_s]).await?;
+        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", commit]).await?;
+    }
+    Ok(())
+}
+
+async fn run_git(args: &[&str]) -> Result<()> {
+    let out = tokio::time::timeout(
+        BUILD_TIMEOUT,
+        Command::new("git")
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output(),
+    )
+    .await
+    .context("git command timed out")?
+    .context("running git")?;
+    if !out.status.success() {
+        let verb = args
+            .iter()
+            .find(|a| matches!(**a, "init" | "fetch" | "checkout" | "clone"))
+            .copied()
+            .unwrap_or("command");
+        bail!(
+            "git {verb} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Build `git+<repo>@<commit>` into a fresh virtualenv, swapping it in
@@ -209,6 +278,147 @@ async fn build_env(
     Ok(())
 }
 
+/// Build a Go checkout into an env whose `bin/` holds the compiled binaries,
+/// swapping it in atomically on success. Slow; only ever called from an update.
+///
+/// `go build` evaluates repo-controlled inputs (module fetches, go.mod
+/// toolchain directives), so like the Python install it runs as the owner's
+/// unprivileged UID when `sandbox` is set.
+async fn build_go_env(
+    env_dir: &str,
+    instance_id: &str,
+    src: &Path,
+    def: &ServerDef,
+    sandbox: Option<&Sandbox>,
+) -> Result<()> {
+    std::fs::create_dir_all(env_dir).context("creating env directory")?;
+    let final_path = env_path(env_dir, instance_id);
+    let tmp = Path::new(env_dir).join(format!(".{instance_id}.building"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let bin = tmp.join("bin");
+    std::fs::create_dir_all(&bin).context("creating build output dir")?;
+
+    // 1) The build reads the checkout (go.sum verification, embeds) and writes
+    //    bin/, both as the sandbox UID.
+    if let Some(sb) = sandbox {
+        crate::sandbox::chown_recursive(&src.to_string_lossy(), sb.uid, sb.gid)
+            .context("handing source checkout to sandbox uid")?;
+        crate::sandbox::chown_recursive(&tmp.to_string_lossy(), sb.uid, sb.gid)
+            .context("handing build dir to sandbox uid")?;
+    }
+
+    // 2) Build the conventional cmd/<name> package when the command names one;
+    //    otherwise build every package (`./...` fails if anything in the repo
+    //    fails to compile, so prefer the narrow target).
+    let entry = def.command.as_deref().map(str::trim).unwrap_or("");
+    let target = if !entry.is_empty() && src.join("cmd").join(entry).is_dir() {
+        format!("./cmd/{entry}")
+    } else {
+        "./...".to_string()
+    };
+    let out_dir = format!("{}/", bin.to_string_lossy());
+    run_go(&["build", "-o", &out_dir, &target], env_dir, src, sandbox).await?;
+
+    // 3) The command's first token must name one of the built binaries, or the
+    //    launch path resolved by `launch_command` will not exist.
+    if entry.is_empty() || !bin.join(entry).is_file() {
+        let mut built: Vec<String> = std::fs::read_dir(&bin)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        built.sort();
+        bail!(
+            "command '{entry}' does not name a built binary; the build produced: {}",
+            if built.is_empty() { "(nothing)".to_string() } else { built.join(", ") }
+        );
+    }
+
+    // 4) Swap in atomically (as the hub; root may rename the UID-owned tree).
+    let _ = std::fs::remove_dir_all(&final_path);
+    std::fs::rename(&tmp, &final_path).context("installing built environment")?;
+
+    // 5) Ensure the env is owned by the sandbox UID that will run it. The
+    //    binaries are static and 0755, so no relocation or permission dance.
+    if let Some(sb) = sandbox {
+        if let Err(e) =
+            crate::sandbox::chown_recursive(&final_path.to_string_lossy(), sb.uid, sb.gid)
+        {
+            tracing::warn!(error = %e, "could not chown built env to sandbox uid");
+        }
+    }
+    Ok(())
+}
+
+async fn run_go(
+    args: &[&str],
+    env_dir: &str,
+    workdir: &Path,
+    sandbox: Option<&Sandbox>,
+) -> Result<()> {
+    let mut cmd = Command::new("go");
+    cmd.args(args)
+        .current_dir(workdir)
+        // Static binaries: the runtime image has no C toolchain, and static
+        // output keeps working after the env is renamed into place.
+        .env("CGO_ENABLED", "0")
+        .env("GOFLAGS", "-trimpath")
+        // Let a go.mod `go`/`toolchain` directive fetch a newer, sumdb-verified
+        // toolchain into the (per-user) cache when the image's Go is too old.
+        // Costs reproducibility against the image pin; buys not rebuilding the
+        // image every time a repo bumps its Go requirement.
+        .env("GOTOOLCHAIN", "auto")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    match sandbox {
+        // Run as the owner's unprivileged UID with the module/build caches in
+        // that user's own writable sandbox directory (never shared/writable
+        // across users, so one user cannot poison another's build cache).
+        Some(sb) => {
+            cmd.uid(sb.uid)
+                .gid(sb.gid)
+                .env("HOME", &sb.cache_dir)
+                .env("USER", "mcp-sandbox")
+                .env("GOPATH", format!("{}/go", sb.cache_dir))
+                .env("GOMODCACHE", format!("{}/go-mod", sb.cache_dir))
+                .env("GOCACHE", format!("{}/go-build", sb.cache_dir));
+        }
+        None => {
+            let cache = Path::new(env_dir).join(".go-cache");
+            cmd.env("GOPATH", cache.join("gopath"))
+                .env("GOMODCACHE", cache.join("mod"))
+                .env("GOCACHE", cache.join("build"));
+        }
+    }
+    let out = tokio::time::timeout(BUILD_TIMEOUT, cmd.output())
+        .await
+        .context("go build timed out")?
+        .context("running go (is the Go toolchain installed?)")?;
+    if !out.status.success() {
+        // Compiler output is long and the errors are at the end; keep the tail.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "go {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            tail_str(stderr.trim(), 3000)
+        );
+    }
+    Ok(())
+}
+
+/// The trailing `max` bytes of `s`, trimmed forward to a char boundary.
+fn tail_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut idx = s.len() - max;
+    while !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    &s[idx..]
+}
+
 /// The shared directory uv installs managed Python interpreters into. Kept on
 /// the data volume (not root's home) so unprivileged sandbox UIDs can reach the
 /// interpreter a built venv symlinks to.
@@ -225,7 +435,17 @@ pub fn venv_is_stale(env_dir: &str, inst: &Instance, def: &ServerDef) -> bool {
     def.is_git()
         && inst.build_status == "ready"
         && env_path(env_dir, &inst.id).exists()
+        && env_is_python_venv(env_dir, &inst.id)
         && !venv_python_is_shared(env_dir, &inst.id)
+}
+
+/// Whether a built env is a Python virtualenv (vs. a Go env, whose `bin/`
+/// holds only compiled binaries). Uses `symlink_metadata` so a *dangling*
+/// legacy `bin/python` symlink still counts as Python and still takes the
+/// stale-venv heal path above.
+fn env_is_python_venv(env_dir: &str, instance_id: &str) -> bool {
+    let link = env_path(env_dir, instance_id).join("bin").join("python");
+    std::fs::symlink_metadata(link).is_ok()
 }
 
 /// Whether an instance's built venv resolves its interpreter to the shared
@@ -307,8 +527,9 @@ pub async fn update_instance(
         && env_path(env_dir, &inst.id).exists()
         // A venv built before the interpreter was relocated points `bin/python`
         // into root's home, which sandbox UIDs cannot exec — force a rebuild so
-        // it relinks to the shared, world-readable interpreter.
-        && venv_python_is_shared(env_dir, &inst.id);
+        // it relinks to the shared, world-readable interpreter. Go envs have no
+        // interpreter and never take this heal path.
+        && (!env_is_python_venv(env_dir, &inst.id) || venv_python_is_shared(env_dir, &inst.id));
     if already_built {
         return Ok(UpdateReport {
             changed: false,
@@ -317,7 +538,24 @@ pub async fn update_instance(
         });
     }
 
-    match build_env(env_dir, &inst.id, repo, &commit, sandbox).await {
+    // Check the repo out once to detect its language; the Go build compiles
+    // from this checkout, while the Python path lets uv re-fetch the repo.
+    std::fs::create_dir_all(env_dir).context("creating env directory")?;
+    let src = Path::new(env_dir).join(format!(".{}.src", inst.id));
+    let build_result: Result<()> = async {
+        clone_at_commit(repo, &commit, &src).await?;
+        match detect_lang(&src)? {
+            Lang::Python => {
+                let _ = std::fs::remove_dir_all(&src);
+                build_env(env_dir, &inst.id, repo, &commit, sandbox).await
+            }
+            Lang::Go => build_go_env(env_dir, &inst.id, &src, def, sandbox).await,
+        }
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&src);
+
+    match build_result {
         Ok(()) => {
             instances::set_build_state(pool, &inst.id, "ready", Some(&commit)).await?;
             Ok(UpdateReport {
@@ -379,6 +617,76 @@ mod tests {
         assert!(launch_command("/envs", "abc", &git_def(None, &[])).is_err());
     }
 
+    fn instance(id: &str, build_status: &str) -> Instance {
+        Instance {
+            id: id.into(),
+            user_id: "u".into(),
+            catalog_server_id: None,
+            custom_def: None,
+            namespace: "ns".into(),
+            display_name: "ns".into(),
+            enabled: true,
+            config: Default::default(),
+            built_commit: Some("abc".into()),
+            build_status: build_status.into(),
+            runtime_status: "unknown".into(),
+            runtime_detail: None,
+            runtime_checked_at: None,
+        }
+    }
+
+    #[test]
+    fn detects_language_from_checkout_root() {
+        let root = std::env::temp_dir().join(format!("mcp_hub_langtest_{}", uuid::Uuid::new_v4()));
+
+        let go = root.join("go");
+        std::fs::create_dir_all(&go).unwrap();
+        std::fs::write(go.join("go.mod"), "module example.com/x\n").unwrap();
+        assert!(matches!(detect_lang(&go), Ok(Lang::Go)));
+
+        let py = root.join("py");
+        std::fs::create_dir_all(&py).unwrap();
+        std::fs::write(py.join("pyproject.toml"), "[project]\n").unwrap();
+        assert!(matches!(detect_lang(&py), Ok(Lang::Python)));
+
+        // go.mod wins if both are present (a Go repo may vendor Python tooling).
+        std::fs::write(py.join("go.mod"), "module example.com/y\n").unwrap();
+        assert!(matches!(detect_lang(&py), Ok(Lang::Go)));
+
+        let neither = root.join("none");
+        std::fs::create_dir_all(&neither).unwrap();
+        assert!(detect_lang(&neither).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A built Go env has no `bin/python`; it must be neither "stale" (which
+    /// would flag a rebuild forever) nor rebuilt when already at the commit.
+    #[test]
+    fn go_env_is_not_python_and_never_stale() {
+        let root = std::env::temp_dir().join(format!("mcp_hub_stalttest_{}", uuid::Uuid::new_v4()));
+        let env_dir = root.to_string_lossy().into_owned();
+        let bin = root.join("go-inst").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("my-mcp"), "").unwrap();
+
+        assert!(!env_is_python_venv(&env_dir, "go-inst"));
+        let inst = instance("go-inst", "ready");
+        let def = git_def(Some("my-mcp"), &[]);
+        assert!(!venv_is_stale(&env_dir, &inst, &def));
+
+        // A venv whose bin/python dangles (legacy build) still reads as Python
+        // and still takes the stale-heal path.
+        let pybin = root.join("py-inst").join("bin");
+        std::fs::create_dir_all(&pybin).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/python", pybin.join("python")).unwrap();
+        assert!(env_is_python_venv(&env_dir, "py-inst"));
+        let inst = instance("py-inst", "ready");
+        assert!(venv_is_stale(&env_dir, &inst, &def));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn validation_rules() {
         assert!(validate_repo("https://github.com/o/r").is_ok());
@@ -424,6 +732,82 @@ mod tests {
         let out = Sync::new(&program).args(&args).output().unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Full Go clone → build → run against a local git repo. Ignored by
+    /// default because it needs the Go toolchain (and go may fetch a newer
+    /// toolchain per go.mod). Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs the Go toolchain"]
+    async fn build_go_env_produces_a_runnable_binary() {
+        use std::process::Command as Sync;
+        let root = std::env::temp_dir().join(format!("mcp_hub_gobuildtest_{}", uuid::Uuid::new_v4()));
+        let repo = root.join("repo");
+        let envs = root.join("envs");
+        std::fs::create_dir_all(repo.join("cmd/echo-mcp")).unwrap();
+        std::fs::write(repo.join("go.mod"), "module example.com/echo\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            repo.join("cmd/echo-mcp/main.go"),
+            "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"ok\") }\n",
+        )
+        .unwrap();
+        let g = |args: &[&str]| Sync::new("git").args(args).current_dir(&repo).output().unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "v1"]);
+        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+
+        let repo_url = format!("file://{}", repo.display());
+        let env_dir = envs.to_string_lossy().into_owned();
+        let src = envs.join(".inst1.src");
+        std::fs::create_dir_all(&envs).unwrap();
+        clone_at_commit(&repo_url, &sha, &src).await.unwrap();
+        assert!(matches!(detect_lang(&src), Ok(Lang::Go)));
+
+        // The command must name a built binary.
+        let bad = git_def(Some("no-such-binary"), &[]);
+        let err = build_go_env(&env_dir, "inst1", &src, &bad, None).await.unwrap_err();
+        assert!(err.to_string().contains("does not name a built binary"), "{err}");
+
+        let def = git_def(Some("echo-mcp"), &[]);
+        build_go_env(&env_dir, "inst1", &src, &def, None).await.unwrap();
+
+        // A Go env resolves and runs through the same launch path as a venv,
+        // and reads as neither Python nor stale.
+        let (program, args) = launch_command(&env_dir, "inst1", &def).unwrap();
+        let out = Sync::new(&program).args(&args).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        assert!(!env_is_python_venv(&env_dir, "inst1"));
+        assert!(!venv_is_stale(&env_dir, &instance("inst1", "ready"), &def));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn clone_at_commit_checks_out_a_local_repo() {
+        use std::process::Command as Sync;
+        let root = std::env::temp_dir().join(format!("mcp_hub_clonetest_{}", uuid::Uuid::new_v4()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| Sync::new("git").args(args).current_dir(&repo).output().unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("go.mod"), "module example.com/x\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-qm", "v1"]);
+        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+
+        let dest = root.join("checkout");
+        clone_at_commit(&format!("file://{}", repo.display()), &sha, &dest)
+            .await
+            .unwrap();
+        assert!(dest.join("go.mod").is_file());
 
         let _ = std::fs::remove_dir_all(&root);
     }

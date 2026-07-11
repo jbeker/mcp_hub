@@ -37,15 +37,17 @@ pub fn tools(admin: bool) -> Vec<Tool> {
         tool(
             "hub__add_server",
             "Add one of your own MCP servers. For stdio, give a 'command' line \
-             (and optionally a 'repo' to build a cached venv from); for http, give \
-             a 'url'. 'env' is a map of environment variables (encrypted).",
+             (and optionally a 'repo' to build a cached environment from — Python \
+             via uv or Go via go build, detected from pyproject.toml / go.mod; the \
+             command's first word names the console script or built binary); for \
+             http, give a 'url'. 'env' is a map of environment variables (encrypted).",
             schema(
                 json!({
                     "namespace": {"type": "string", "description": "Unique tool-name prefix, e.g. 'zabbix'"},
                     "transport": {"type": "string", "enum": ["stdio", "http"]},
                     "command": {"type": "string", "description": "stdio: the command line, e.g. 'uvx zabbix-mcp-server'"},
                     "url": {"type": "string", "description": "http: the remote endpoint URL"},
-                    "repo": {"type": "string", "description": "stdio (optional): git repo to build a cached venv from"},
+                    "repo": {"type": "string", "description": "stdio (optional): git repo to build a cached environment from (Python or Go, auto-detected)"},
                     "git_ref": {"type": "string", "description": "branch/tag for 'repo' (default main)"},
                     "display_name": {"type": "string"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Values may reference ${VAR}, e.g. GOOGLE_APPLICATION_CREDENTIALS=${MCP_CONFIG_FILE}"},

@@ -203,9 +203,11 @@ safeguards:
 
 ## Running a server from a GitHub repo
 
-A stdio server with a **repository** is **built once** into a virtualenv on the data
-volume; connecting then runs that prebuilt environment directly — no fetch, no install — so
-startup stays fast. Updates are explicit: you push to GitHub, then run an update.
+A stdio server with a **repository** is **built once** into a prebuilt environment on the
+data volume — a virtualenv for Python repos, a directory of compiled binaries for Go repos
+(detected from `pyproject.toml` vs `go.mod`). Connecting then runs that environment directly
+— no fetch, no install — so startup stays fast. Updates are explicit: you push to GitHub,
+then run an update.
 
 Add it (web form, or `hub__add_server`):
 
@@ -220,11 +222,28 @@ Add it (web form, or `hub__add_server`):
 }
 ```
 
-The `command`'s first word resolves to the built venv's `bin/` (so a console
-script or `python` comes from the repo's environment). Then:
+The `command`'s first word resolves to the built environment's `bin/` (so a console
+script, `python`, or a compiled Go binary comes from the repo's environment). Then:
 
 1. `hub__update_server` → `{ "namespace": "mine" }` builds it (the one slow step).
-2. Connect — the cached venv runs directly.
+2. Connect — the cached environment runs directly.
+
+For a Go repo, the first word of `command` names a main package under `cmd/` (its
+built binary). For example, [Teamwork's MCP server](https://github.com/Teamwork/mcp):
+
+```jsonc
+{
+  "namespace": "teamwork",
+  "transport": "stdio",
+  "command": "mcp-stdio -toolsets project-manager -read-only",  // builds+runs cmd/mcp-stdio
+  "repo": "https://github.com/Teamwork/mcp",
+  "git_ref": "main",
+  "env": {
+    "TW_MCP_BEARER_TOKEN": "...",
+    "TW_MCP_API_URL": "https://yoursite.teamwork.com"
+  }
+}
+```
 
 **Updating after you push:** run `hub__update_server` again (or the "Update from repository"
 button on the server's page). It resolves the branch tip; if nothing changed it's a no-op,
@@ -232,9 +251,10 @@ otherwise it rebuilds in the background and the next session uses the new code. 
 built version keeps serving until the rebuild succeeds.
 
 Notes:
-- v1 supports **Python (uv)** git sources; the repo must be `pip`-installable (has a
-  `pyproject.toml`). The image ships `git` + `uv`; packages needing C build tools may need a
-  customized image.
+- Git sources support **Python (uv)** — the repo must be `pip`-installable (has a
+  `pyproject.toml`) — and **Go** — the repo must have a `go.mod`; it is built with
+  `CGO_ENABLED=0`, so pure-Go servers only. The image ships `git`, `uv`, and `go`;
+  packages needing C build tools may need a customized image.
 - **Public repos only** for now — a private repo would need a token, which isn't yet handled
   cleanly.
 

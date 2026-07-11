@@ -21,8 +21,9 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
 # ---- runtime stage ------------------------------------------------------
-# The runtime image bundles node (npx) and uv (uvx) because stdio backend
-# MCP servers are launched as child processes inside this container.
+# The runtime image bundles node (npx), uv (uvx), and go because stdio backend
+# MCP servers are launched (and git-sourced ones built) as child processes
+# inside this container.
 FROM debian:trixie-slim AS runtime
 WORKDIR /app
 
@@ -56,6 +57,29 @@ RUN set -eux; \
 ENV UV_VERSION=0.11.26
 RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin sh \
     && uv --version && uvx --version
+
+# Go toolchain, for building Go-based MCP servers from git sources at runtime
+# (gitsrc.rs runs `go build` on demand). go.dev publishes per-file checksums
+# rather than a SHASUMS file, so both arch digests are pinned here. Adds ~250MB
+# unpacked. CGO_ENABLED/GOFLAGS are set per-invocation by the hub, not
+# globally, so backend child processes are not polluted.
+ENV GO_VERSION=1.26.5 \
+    GO_SHA256_AMD64=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053 \
+    GO_SHA256_ARM64=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) go_arch="amd64"; go_sha="$GO_SHA256_AMD64" ;; \
+      arm64) go_arch="arm64"; go_sha="$GO_SHA256_ARM64" ;; \
+      *) echo "unsupported arch $arch" && exit 1 ;; \
+    esac; \
+    tarball="go${GO_VERSION}.linux-${go_arch}.tar.gz"; \
+    curl -fsSL "https://go.dev/dl/${tarball}" -o /tmp/go.tar.gz; \
+    echo "${go_sha}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/go.tar.gz -C /usr/local; \
+    rm /tmp/go.tar.gz; \
+    ln -s /usr/local/go/bin/go /usr/local/bin/go; \
+    go version
 
 COPY --from=build /app/target/release/mcp_hub /usr/local/bin/mcp_hub
 # Static web assets are read at runtime from the working directory.
