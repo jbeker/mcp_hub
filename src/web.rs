@@ -41,6 +41,22 @@ pub struct NextQuery {
 }
 
 /// Wrap page content in the shared HTML shell.
+/// Cache-busting version for the static assets, computed once at startup from
+/// their contents. Browsers heuristically cache /static/* (it is served with a
+/// Last-Modified but no Cache-Control), so markup changes could otherwise pair
+/// with a stale stylesheet/script; a content-derived query string gives every
+/// asset revision a fresh URL.
+static ASSET_VER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for path in ["static/style.css", "static/auth.js"] {
+        if let Ok(bytes) = std::fs::read(path) {
+            h.update(&bytes);
+        }
+    }
+    h.finalize()[..4].iter().map(|b| format!("{b:02x}")).collect()
+});
+
 fn page_with(title: &str, body: &str, class: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html>
@@ -49,13 +65,14 @@ fn page_with(title: &str, body: &str, class: &str) -> Html<String> {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title} · MCP Hub</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={v}">
 </head>
 <body>
   <main class="{class}">{body}</main>
-  <script src="/static/auth.js"></script>
+  <script src="/static/auth.js?v={v}"></script>
 </body>
-</html>"#
+</html>"#,
+        v = &*ASSET_VER,
     ))
 }
 
@@ -79,9 +96,11 @@ fn esc(s: &str) -> String {
 
 /// Clipboard + checkmark icons for copy buttons; CSS shows one at a time
 /// (the checkmark only while the button carries the transient `.copied`).
+/// The explicit width/height attributes are a stale-CSS safety net: an
+/// unstyled SVG with only a viewBox renders at 300×150.
 const COPY_ICONS: &str = concat!(
-    r#"<svg class="icon-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>"#,
-    r#"<svg class="icon-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5"/></svg>"#,
+    r#"<svg class="icon-copy" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>"#,
+    r#"<svg class="icon-check" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5"/></svg>"#,
 );
 
 /// A bare icon button that copies `value` (raw, unescaped) to the clipboard.
