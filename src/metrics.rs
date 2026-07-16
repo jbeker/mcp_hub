@@ -189,8 +189,17 @@ pub async fn load_or_create_key(
             .fetch_optional(db)
             .await?;
     if let Some((nonce, ciphertext)) = row {
-        let plain = secrets.open(&crate::crypto::Sealed { nonce, ciphertext })?;
-        return Ok(String::from_utf8(plain)?);
+        // A key sealed under a different master key (rotation) must not block
+        // startup — rotate the metrics key like the OAuth signing key does.
+        match secrets
+            .open(&crate::crypto::Sealed { nonce, ciphertext })
+            .map(String::from_utf8)
+        {
+            Ok(Ok(key)) => return Ok(key),
+            Ok(Err(_)) | Err(_) => tracing::warn!(
+                "metrics API key could not be decrypted; rotating it (update your scraper)"
+            ),
+        }
     }
     let key = format!("{KEY_PREFIX}{}", crate::oauth::random_token());
     store_key(db, secrets, &key).await?;

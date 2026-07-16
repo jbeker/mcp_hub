@@ -77,6 +77,41 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Clipboard + checkmark icons for copy buttons; CSS shows one at a time
+/// (the checkmark only while the button carries the transient `.copied`).
+const COPY_ICONS: &str = concat!(
+    r#"<svg class="icon-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>"#,
+    r#"<svg class="icon-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5"/></svg>"#,
+);
+
+/// A bare icon button that copies `value` (raw, unescaped) to the clipboard.
+/// Wired up in auth.js via the `data-copy` attribute — the CSP forbids inline
+/// handlers. `type="button"` because these often sit inside POST forms.
+fn copy_btn(value: &str) -> String {
+    format!(
+        r#"<button type="button" class="copy" data-copy="{v}" title="Copy" aria-label="Copy to clipboard">{COPY_ICONS}</button>"#,
+        v = esc(value),
+    )
+}
+
+/// An inline copyable value: `<code>` plus a copy button.
+fn copy_code(value: &str) -> String {
+    format!(
+        r#"<span class="copywrap"><code>{v}</code>{btn}</span>"#,
+        v = esc(value),
+        btn = copy_btn(value),
+    )
+}
+
+/// A block copyable value: `pre.cmd` with the copy button in its corner.
+fn copy_pre(value: &str) -> String {
+    format!(
+        r#"<div class="copywrap block"><pre class="cmd"><code>{v}</code></pre>{btn}</div>"#,
+        v = esc(value),
+        btn = copy_btn(value),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------
@@ -133,7 +168,7 @@ pub async fn dashboard(
 </section>
 {groups_section}
 {admin_section}
-<p class="muted">Management endpoint (hub tools only): <code>{mcp}</code> — backend tools are served on your connector group endpoints above.</p>"#,
+<p class="muted">Management endpoint (hub tools only): {mcp} — backend tools are served on your connector group endpoints above.</p>"#,
         csrf = csrf,
         handle = esc(&user.handle),
         badge = admin_badge,
@@ -144,7 +179,7 @@ pub async fn dashboard(
         } else {
             ""
         },
-        mcp = esc(&state.config.mcp_url()),
+        mcp = copy_code(&state.config.mcp_url()),
     );
     page_wide("Dashboard", &body).into_response()
 }
@@ -207,32 +242,36 @@ async fn groups_section(
         };
         let title = if g.name.is_empty() { g.slug.clone() } else { g.name.clone() };
         cards.push_str(&format!(
-            r#"<li>
-  <div class="row"><strong>{title}</strong> {count_line}
+            r#"<div class="group-card">
+  <div class="group-head"><strong>{title}</strong> {count_line}
     <form method="post" action="/groups/{id}/delete" data-confirm="Delete group '{slug}'? Clients connected to its endpoint lose access immediately.">{csrf}<button class="ghost danger">Delete</button></form>
   </div>
-  <p class="muted">Connector URL: <code>{url}</code></p>
-  <form class="access" method="post" action="/groups/{id}/update">{csrf}<span class="muted">Servers:</span><div class="access-grid">{boxes}</div><button class="ghost" type="submit">Save members</button></form>
-</li>"#,
+  <div class="group-url muted">Connector URL: {url}</div>
+  <form class="group-members" method="post" action="/groups/{id}/update">{csrf}
+    <span class="muted">Servers</span>
+    <div class="member-grid">{boxes}</div>
+    <button class="ghost" type="submit">Save members</button>
+  </form>
+</div>"#,
             title = esc(&title),
             count_line = count_line,
             id = esc(&g.id),
             slug = esc(&g.slug),
             csrf = csrf,
-            url = esc(&state.config.group_mcp_url(&g.slug)),
+            url = copy_code(&state.config.group_mcp_url(&g.slug)),
             boxes = boxes,
         ));
     }
     let list = if groups.is_empty() {
         r#"<p class="muted">No groups yet. Each group is its own MCP endpoint serving only its servers' tools — that is how every connector stays under client tool caps (claude.ai truncates at 256 tools).</p>"#.to_string()
     } else {
-        format!("<ul class=\"servers\">{cards}</ul>")
+        format!(r#"<div class="groups">{cards}</div>"#)
     };
     format!(
         r#"<section>
   <div class="row"><h2>Connector groups</h2></div>
   {list}
-  <form class="row" method="post" action="/groups/create">{csrf}
+  <form class="group-create" method="post" action="/groups/create">{csrf}
     <input name="slug" placeholder="slug (e.g. monitoring)" required pattern="[a-z0-9][a-z0-9-]*[a-z0-9]|[a-z0-9]">
     <input name="name" placeholder="display name (optional)">
     <button type="submit">Create group</button>
@@ -1485,10 +1524,11 @@ pub async fn create_recovery(
     let body = format!(
         r#"<header class="row"><h1>Recovery code created</h1><a href="/invites">← Back</a></header>
 <p>Give this one-time code to <strong>{handle}</strong>. It works once and <strong>will not be shown again</strong>:</p>
-<p><code class="invite-code">{code}</code></p>
+<p class="copywrap"><code class="invite-code">{code}</code>{copy}</p>
 <p class="muted">They enroll a new passkey at <code>{base}/recover</code> using their handle and this code.</p>"#,
         handle = esc(&target.handle),
         code = esc(&code),
+        copy = copy_btn(&code),
         base = esc(&state.config.base_url),
     );
     page("Recovery code created", &body).into_response()
@@ -1527,9 +1567,10 @@ pub async fn create_invite(
     let body = format!(
         r#"<header class="row"><h1>Invite created</h1><a href="/invites">← Back</a></header>
 <p>Share this code with the person you are inviting. It works once and <strong>will not be shown again</strong>:</p>
-<p><code class="invite-code">{code}</code></p>
+<p class="copywrap"><code class="invite-code">{code}</code>{copy}</p>
 <p class="muted">They register at <code>{base}/register</code> using this code.</p>"#,
         code = esc(&code),
+        copy = copy_btn(&code),
         base = esc(&state.config.base_url),
     );
     page("Invite created", &body).into_response()
@@ -2127,23 +2168,23 @@ pub async fn create_token(
     audit_ok("token.create", &user, &headers, name);
 
     // Reveal the secret exactly once. It is never recoverable after this page.
+    // Raw string — copy_pre escapes for display and the data-copy attribute.
     let example = format!(
-        "curl -H \"Authorization: Bearer {tok}\" {url}",
-        tok = esc(&plaintext),
-        url = esc(&state.config.mcp_url()),
+        "curl -H \"Authorization: Bearer {plaintext}\" {url}",
+        url = state.config.mcp_url(),
     );
     let body = format!(
         r#"<header class="row"><h1>Token created</h1><a href="/account">← Account</a></header>
 <p class="status status-warn">Copy this token now — it will <strong>not</strong> be shown again.</p>
 <p class="muted">Token <code>{name}</code>, expires in {days} days. It grants full access to your MCP endpoint; store it like a password.</p>
-<pre class="cmd"><code>{tok}</code></pre>
+{tok}
 <p class="muted">Use it as a bearer token, e.g.</p>
-<pre class="cmd"><code>{example}</code></pre>
+{example}
 <p><a href="/account">← Back to account</a></p>"#,
         name = esc(name),
         days = days,
-        tok = esc(&plaintext),
-        example = example,
+        tok = copy_pre(&plaintext),
+        example = copy_pre(&example),
     );
     page("Token created", &body).into_response()
 }
@@ -2349,7 +2390,7 @@ pub async fn users_page(
             )
         };
         rows.push_str(&format!(
-            r#"<tr><td><code>{h}</code></td><td>{role}</td><td>{status}</td><td><div class="row">{actions}</div></td></tr>"#,
+            r#"<tr><td><code>{h}</code></td><td>{role}</td><td>{status}</td><td><div class="actions">{actions}</div></td></tr>"#,
             h = esc(&u.handle),
             role = role,
             status = status,
@@ -2506,16 +2547,19 @@ pub async fn stats_page(
         .read()
         .map(|k| k.clone())
         .unwrap_or_default();
+    let endpoint = format!("{}/metrics", state.config.base_url);
+    let auth_header = format!("Authorization: Bearer {metrics_key}");
     let metrics = format!(
         r#"<p class="muted">Per-user/server/tool usage counters in Prometheus text format, for a Zabbix HTTP-agent item (or any Prometheus scraper). Counters reset on restart; use rate/delta preprocessing.</p>
 <table class="invites"><tbody>
-<tr><td>Endpoint</td><td><code>{base}/metrics</code></td></tr>
-<tr><td>API key</td><td><code>{key}</code></td></tr>
-<tr><td>Header</td><td><code>Authorization: Bearer {key}</code></td></tr>
+<tr><td>Endpoint</td><td>{endpoint}</td></tr>
+<tr><td>API key</td><td>{key}</td></tr>
+<tr><td>Header</td><td>{header}</td></tr>
 </tbody></table>
 <form method="post" action="/stats/metrics-key/regenerate" data-confirm="Regenerate the metrics API key? The current key stops working immediately.">{csrf}<button class="ghost danger">Regenerate key</button></form>"#,
-        base = esc(&state.config.base_url),
-        key = esc(&metrics_key),
+        endpoint = copy_code(&endpoint),
+        key = copy_code(&metrics_key),
+        header = copy_code(&auth_header),
         csrf = csrf,
     );
 

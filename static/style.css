@@ -1,9 +1,13 @@
 :root {
   --bg: #0f1115;
   --card: #181b22;
+  --card-inset: #14171e;  /* nested panels (group cards) between bg and card */
+  --inset: #11141a;       /* sunken surfaces: inputs, code, command blocks */
   --fg: #e6e8ed;
   --muted: #8b91a0;
   --accent: #5b8cff;
+  --ok: #6ee787;
+  --warn: #e3b341;
   --error: #ff6b6b;
   --border: #262b35;
 }
@@ -14,9 +18,21 @@ body {
   display: grid;
   place-items: center;
   background: var(--bg);
-  color: #e6e8ed;
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--fg);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
   padding: 24px;
+}
+/* Interaction states are part of the design: quiet 150ms fades on state
+   changes, a visible keyboard focus ring, and no motion for those who ask. */
+a, button, input, textarea, select, summary, nav.tabs a {
+  transition: color 0.15s ease-out, background-color 0.15s ease-out,
+    border-color 0.15s ease-out, filter 0.15s ease-out;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+input[type="checkbox"] { accent-color: var(--accent); }
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
 }
 .card {
   width: 100%;
@@ -31,15 +47,15 @@ body {
 .card.wide { max-width: 960px; }
 h1 { margin: 0 0 16px; font-size: 22px; }
 h2 { font-size: 16px; margin: 24px 0 8px; }
-.row { display: flex; align-items: center; justify-content: space-between; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 13px; }
 input, textarea, select {
   width: 100%;
   padding: 10px 12px;
-  background: #11141a;
+  background: var(--inset);
   border: 1px solid var(--border);
   border-radius: 8px;
-  color: #e6e8ed;
+  color: var(--fg);
   font-size: 15px;
 }
 textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; resize: vertical; }
@@ -60,13 +76,18 @@ button {
 button.ghost {
   width: auto;
   margin: 0;
+  padding: 7px 12px;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--muted);
+  font-size: 13px;
   font-weight: 500;
 }
 button:hover { filter: brightness(1.08); }
+button.ghost:hover { filter: none; color: var(--fg); border-color: var(--muted); }
+button.ghost.danger:hover { color: var(--error); border-color: var(--error); }
 a { color: var(--accent); text-decoration: none; }
+a:hover { color: #82a7ff; }
 .muted { color: var(--muted); font-size: 13px; }
 .error { color: var(--error); min-height: 1.2em; font-size: 13px; }
 .badge {
@@ -79,11 +100,11 @@ a { color: var(--accent); text-decoration: none; }
   font-weight: 600;
 }
 /* Tool annotation hint chips (readOnlyHint, destructiveHint, ...). */
-.badge.ann-safe    { background: rgba(63, 185, 80, 0.18);   color: #6ee787; }
+.badge.ann-safe    { background: rgba(63, 185, 80, 0.18);   color: var(--ok); }
 .badge.ann-warn    { background: rgba(255, 107, 107, 0.18); color: var(--error); }
 .badge.ann-neutral { background: rgba(139, 145, 160, 0.20); color: var(--muted); }
 code {
-  background: #11141a;
+  background: var(--inset);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 1px 5px;
@@ -92,7 +113,9 @@ code {
 ul.servers { list-style: none; padding: 0; }
 ul.servers li {
   display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 10px 0;
   border-bottom: 1px solid var(--border);
 }
@@ -113,7 +136,13 @@ table.invites th, table.invites td {
   border-bottom: 1px solid var(--border);
   font-size: 14px;
 }
-table.invites th { color: var(--muted); font-weight: 600; }
+table.invites th {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 code.invite-code {
   display: inline-block;
   padding: 10px 14px;
@@ -121,10 +150,10 @@ code.invite-code {
   user-select: all;
 }
 .status { border-radius: 8px; padding: 8px 12px; font-size: 14px; }
-.status-ok { background: rgba(80, 200, 120, 0.15); color: #2e7d52; }
-.status-warn { background: rgba(230, 180, 60, 0.15); color: #8a6d1a; }
-.status-danger { background: rgba(255, 107, 107, 0.15); color: var(--error); }
-pre.cmd { background: #11141a; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+.status-ok { background: rgba(80, 200, 120, 0.14); color: var(--ok); }
+.status-warn { background: rgba(227, 179, 65, 0.14); color: var(--warn); }
+.status-danger { background: rgba(255, 107, 107, 0.14); color: var(--error); }
+pre.cmd { background: var(--inset); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
 pre.cmd code { background: none; padding: 0; font-size: 13px; }
 
 /* Inline action buttons that shouldn't span the full card width. */
@@ -178,6 +207,10 @@ ul.conns li {
 
 .hidden { display: none; }
 
+/* Right-aligned action-button cluster (e.g. table action cells). */
+.actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.actions form { margin: 0; }
+
 /* Server detail tabs: the active tab is just a highlighted link. */
 /* Segmented control: an unmistakable two-tab switch. The active tab is filled
    with a tint of the accent and brightened; inactive tabs sit in bordered
@@ -197,3 +230,57 @@ details.tool summary { cursor: pointer; }
 details.tool summary code { font-size: 14px; }
 details.tool > p { margin: 8px 0 4px; }
 details.tool pre.cmd { margin: 4px 0 8px; max-height: 360px; overflow: auto; }
+
+/* Connector group cards: each group is a bordered card with a title row,
+   its connector URL, and an aligned member-checkbox grid. */
+.group-card {
+  background: var(--card-inset);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+.group-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.group-head form { margin-left: auto; }
+.group-head form button { margin: 0; }
+.group-url { margin: 8px 0 0; }
+.group-members { margin-top: 12px; }
+.group-members > .muted { font-size: 13px; }
+.member-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 6px 16px;
+  margin: 6px 0 10px;
+}
+.member-grid label.checkbox { margin: 0; font-size: 13px; }
+form.group-create { display: flex; gap: 8px; margin-top: 14px; }
+form.group-create input { flex: 1; }
+form.group-create button { width: auto; margin: 0; white-space: nowrap; flex: 0 0 auto; }
+
+/* Copy-to-clipboard buttons (web.rs copy_btn/copy_code/copy_pre + auth.js). */
+.copywrap { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
+.copywrap code { overflow-wrap: anywhere; }
+button.copy {
+  width: auto;
+  margin: 0;
+  padding: 3px 5px;
+  display: inline-flex;
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+button.copy:hover { color: var(--fg); border-color: var(--muted); filter: none; }
+button.copy svg { width: 14px; height: 14px; display: block; }
+button.copy .icon-check { display: none; }
+button.copy.copied { color: var(--ok); border-color: rgba(63, 185, 80, 0.4); }
+button.copy.copied .icon-copy { display: none; }
+button.copy.copied .icon-check { display: block; }
+
+/* Block variant: the button sits in the corner of a pre.cmd. */
+.copywrap.block { display: block; position: relative; }
+.copywrap.block pre.cmd { margin: 8px 0; padding-right: 40px; }
+.copywrap.block button.copy { position: absolute; top: 10px; right: 8px; background: var(--card); }

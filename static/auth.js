@@ -201,6 +201,33 @@ function wire() {
       if (!window.confirm(f.getAttribute("data-confirm"))) e.preventDefault();
     });
   });
+  // Copy-to-clipboard buttons ([data-copy], emitted by web.rs's copy_btn).
+  // navigator.clipboard needs a secure context; the hidden-textarea path
+  // covers plain-http origins. Feedback (the checkmark) only on success.
+  document.querySelectorAll("button[data-copy]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const text = btn.getAttribute("data-copy");
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          ta.remove();
+          if (!ok) return;
+        }
+      } catch (e) {
+        return;
+      }
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1500);
+    });
+  });
 }
 
 document.addEventListener("DOMContentLoaded", wire);
