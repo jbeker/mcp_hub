@@ -275,6 +275,17 @@ already-issued access token until it expires — but the proxy re-checks the
 account on every request, so revocation takes effect within seconds, well inside
 the 15-minute token lifetime.
 
+## Usage metrics
+
+`GET /metrics` serves per-user/server/tool usage counters (calls, errors by
+kind, cumulative duration) plus live health gauges in the Prometheus text
+format, ready for a Zabbix HTTP-agent item or any Prometheus scraper. The
+endpoint is gated by an API key sent as `Authorization: Bearer <key>`; the key
+is generated on first startup, stored encrypted like other secrets, and shown
+(and regenerable) in the **Metrics** section of the admin **Stats** page.
+Counters are in-memory and reset on restart — use rate/delta preprocessing
+(e.g. Zabbix *Change per second*) when graphing.
+
 ## Security notes
 
 - Secrets **and the OAuth signing key** are encrypted at rest with XChaCha20-Poly1305 using

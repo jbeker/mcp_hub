@@ -2383,7 +2383,11 @@ fn secs_or(secs: u64, zero: &str) -> String {
     }
 }
 
-pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser) -> Response {
+pub async fn stats_page(
+    State(state): State<AppState>,
+    AuthUser(admin): AuthUser,
+    jar: SignedCookieJar,
+) -> Response {
     if !admin.is_admin {
         return admin_forbidden();
     }
@@ -2494,18 +2498,71 @@ pub async fn stats_page(State(state): State<AppState>, AuthUser(admin): AuthUser
     }
     rows.push_str("</tbody></table>");
 
+    // Usage-metrics scrape endpoint: where to point Zabbix and the key that
+    // gates it. Regenerating invalidates the old key immediately.
+    let csrf = session::csrf_field(&jar, &state.config.master_key);
+    let metrics_key = state
+        .metrics_key
+        .read()
+        .map(|k| k.clone())
+        .unwrap_or_default();
+    let metrics = format!(
+        r#"<p class="muted">Per-user/server/tool usage counters in Prometheus text format, for a Zabbix HTTP-agent item (or any Prometheus scraper). Counters reset on restart; use rate/delta preprocessing.</p>
+<table class="invites"><tbody>
+<tr><td>Endpoint</td><td><code>{base}/metrics</code></td></tr>
+<tr><td>API key</td><td><code>{key}</code></td></tr>
+<tr><td>Header</td><td><code>Authorization: Bearer {key}</code></td></tr>
+</tbody></table>
+<form method="post" action="/stats/metrics-key/regenerate" data-confirm="Regenerate the metrics API key? The current key stops working immediately.">{csrf}<button class="ghost danger">Regenerate key</button></form>"#,
+        base = esc(&state.config.base_url),
+        key = esc(&metrics_key),
+        csrf = csrf,
+    );
+
     let body = format!(
         r#"<header class="row"><h1>Runtime stats</h1><a href="/">← Back</a></header>
 <p class="muted">Backend slots and active sessions are live; the server table shows each backend's last-known status. Reload to refresh.</p>
 {headline}
 <section><h2>Limits</h2>{limits}</section>
-<section><h2>Servers</h2>{totals}{rows}</section>"#,
+<section><h2>Servers</h2>{totals}{rows}</section>
+<section><h2>Metrics</h2>{metrics}</section>"#,
         headline = headline,
         limits = limits,
         totals = totals,
         rows = rows,
+        metrics = metrics,
     );
     page_wide("Runtime stats", &body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct MetricsKeyForm {
+    #[serde(default)]
+    pub csrf: String,
+}
+
+/// `POST /stats/metrics-key/regenerate` — admin rotates the API key gating
+/// `GET /metrics`. The old key stops working immediately.
+pub async fn regenerate_metrics_key(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<MetricsKeyForm>,
+) -> Response {
+    if !user.is_admin {
+        audit_denied("metrics.key_regenerate", &user, &headers, "", "not_admin");
+        return admin_forbidden();
+    }
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("metrics.key_regenerate", &user, &headers, "", "csrf");
+        return forbidden();
+    }
+    if let Err(e) = crate::metrics::regenerate_key(&state).await {
+        return error_page(&e.to_string());
+    }
+    audit_ok("metrics.key_regenerate", &user, &headers, "");
+    Redirect::to("/stats").into_response()
 }
 
 #[derive(Deserialize)]

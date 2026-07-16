@@ -10,6 +10,7 @@ pub mod gitsrc;
 pub mod groups;
 pub mod instances;
 pub mod invites;
+pub mod metrics;
 pub mod oauth;
 pub mod proxy;
 pub mod sandbox;
@@ -71,6 +72,11 @@ pub struct AppState {
     /// re-fetches without a manual refresh. In-memory; entries are removed when
     /// the session's `HubProxy` is dropped.
     pub client_peers: Arc<Mutex<HashMap<uuid::Uuid, ClientPeer>>>,
+    /// In-memory usage counters served by `/metrics`; reset on restart.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// The API key gating `/metrics`, sealed at rest in the `settings` table
+    /// and swapped in place when an admin regenerates it.
+    pub metrics_key: Arc<std::sync::RwLock<String>>,
 }
 
 /// A registered client session's notification channel.
@@ -95,7 +101,10 @@ impl AppState {
         }
         let cookie_key = derive_cookie_key(&config.master_key);
         let backend_slots = Arc::new(Semaphore::new(config.limits.max_backends_global));
+        let metrics_key = crate::metrics::load_or_create_key(&db, &secrets).await?;
         Ok(Self {
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+            metrics_key: Arc::new(std::sync::RwLock::new(metrics_key)),
             secrets,
             webauthn,
             signer,
@@ -223,6 +232,8 @@ impl FromRef<AppState> for Key {
 pub fn build_router(state: AppState, static_dir: &str) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
+        // Prometheus exposition for Zabbix scraping (metrics-API-key gated).
+        .route("/metrics", get(metrics::endpoint))
         // Web UI
         .route("/", get(web::dashboard))
         .route("/login", get(web::login_page))
@@ -243,6 +254,7 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         // User administration (admin)
         .route("/users", get(web::users_page))
         .route("/stats", get(web::stats_page))
+        .route("/stats/metrics-key/regenerate", post(web::regenerate_metrics_key))
         .route("/users/disable", post(web::disable_user))
         .route("/users/enable", post(web::enable_user))
         .route("/users/delete", post(web::delete_user))

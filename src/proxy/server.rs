@@ -353,7 +353,17 @@ impl ServerHandler for HubProxy {
                     request: &authed.request,
                 };
                 let op = request.name.strip_prefix("hub__").unwrap_or_default();
-                return management::dispatch(&self.state, &caller, op, request.arguments).await;
+                let t0 = std::time::Instant::now();
+                let result =
+                    management::dispatch(&self.state, &caller, op, request.arguments).await;
+                let kind = match &result {
+                    Err(_) => Some(crate::metrics::ErrorKind::Error),
+                    Ok(r) if r.is_error == Some(true) => Some(crate::metrics::ErrorKind::ToolError),
+                    Ok(_) => None,
+                };
+                let user = if handle.is_empty() { &user_id } else { &handle };
+                self.state.metrics.record_call(user, "hub", op, t0.elapsed(), kind);
+                return result;
             }
             McpEndpoint::Group { group_id, .. } => {
                 if management::is_management_tool(&request.name) {
@@ -386,24 +396,52 @@ impl ServerHandler for HubProxy {
                 McpError::invalid_params(format!("no enabled server with namespace '{ns}'"), None)
             })?;
 
+        // The usage-metrics user label: the bound handle (bound is set — the
+        // group_backends call above binds), falling back to the raw user id.
+        let user = {
+            let guard = self.bound.lock().await;
+            guard
+                .as_ref()
+                .map(|b| if b.handle.is_empty() { b.user_id.clone() } else { b.handle.clone() })
+                .unwrap_or_default()
+        };
         let t0 = std::time::Instant::now();
-        let result = self
+        let outcome = self
             .with_call_timeout(&request.name, backend.call_tool(original.to_string(), request.arguments))
-            .await?
-            .map_err(|e| {
+            .await;
+        let elapsed = t0.elapsed();
+        let record =
+            |kind| self.state.metrics.record_call(&user, ns, original, elapsed, kind);
+        let result = match outcome {
+            // with_call_timeout's own error is always the call timeout.
+            Err(e) => {
+                record(Some(crate::metrics::ErrorKind::Timeout));
+                return Err(e);
+            }
+            Ok(Err(e)) => {
+                record(Some(crate::metrics::ErrorKind::Error));
                 tracing::warn!(
                     namespace = %ns,
                     tool = %request.name,
-                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    elapsed_ms = elapsed.as_millis() as u64,
                     error = %format!("{e:#}"),
                     "proxied tool call failed"
                 );
-                McpError::internal_error(format!("{e:#}"), None)
-            })?;
+                return Err(McpError::internal_error(format!("{e:#}"), None));
+            }
+            Ok(Ok(result)) => {
+                record(if result.is_error == Some(true) {
+                    Some(crate::metrics::ErrorKind::ToolError)
+                } else {
+                    None
+                });
+                result
+            }
+        };
         tracing::debug!(
             namespace = %ns,
             tool = %request.name,
-            elapsed_ms = t0.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed.as_millis() as u64,
             "proxied tool call done"
         );
         self.check_response_size(&result)?;
