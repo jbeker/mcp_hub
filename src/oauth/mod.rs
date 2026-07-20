@@ -46,7 +46,10 @@ pub fn random_token() -> String {
 
 /// Verify a PKCE `code_verifier` against the stored S256 `code_challenge`.
 pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
-    ct_eq(b64url(&sha256(verifier.as_bytes())).as_bytes(), challenge.as_bytes())
+    ct_eq(
+        b64url(&sha256(verifier.as_bytes())).as_bytes(),
+        challenge.as_bytes(),
+    )
 }
 
 /// Constant-time byte comparison (lengths are not secret here).
@@ -89,6 +92,7 @@ impl OAuthError {
 impl From<anyhow::Error> for OAuthError {
     fn from(e: anyhow::Error) -> Self {
         tracing::error!(error = %e, "oauth internal error");
+        crate::metrics::note_oauth_internal_error();
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",

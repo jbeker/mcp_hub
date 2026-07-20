@@ -10,6 +10,7 @@
 //! table and shown (and regenerable) on the admin `/stats` page.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -18,6 +19,24 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
+
+/// OAuth requests that died with an internal error (the 500 `server_error`
+/// path in [`crate::oauth::OAuthError`]). claude.ai treats such a token
+/// response as a disconnect, so any growth here is user-visible. Statics
+/// because the `From<anyhow::Error>` conversion has no [`AppState`].
+static OAUTH_INTERNAL_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// OAuth store operations retried after SQLite reported "database is locked" —
+/// write-lock pressure that would have been a 500 before the retry existed.
+static DB_BUSY_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_oauth_internal_error() {
+    OAUTH_INTERNAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_db_busy_retry() {
+    DB_BUSY_RETRIES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Why a tool call failed. A fixed taxonomy — the `error_kind` label never
 /// grows with user input.
@@ -80,7 +99,9 @@ impl Metrics {
         duration: Duration,
         error: Option<ErrorKind>,
     ) {
-        let Ok(mut map) = self.calls.lock() else { return };
+        let Ok(mut map) = self.calls.lock() else {
+            return;
+        };
         let key = CallKey {
             user: user.to_string(),
             server: server.to_string(),
@@ -301,6 +322,18 @@ pub async fn endpoint(State(state): State<AppState>, headers: HeaderMap) -> Resp
         );
     }
 
+    let _ = write!(
+        out,
+        "# TYPE mcp_hub_oauth_internal_errors_total counter\n\
+         mcp_hub_oauth_internal_errors_total {}\n\
+         # TYPE mcp_hub_db_busy_retries_total counter\n\
+         mcp_hub_db_busy_retries_total {}\n",
+        OAUTH_INTERNAL_ERRORS.load(Ordering::Relaxed),
+        DB_BUSY_RETRIES.load(Ordering::Relaxed),
+    );
+
+    render_group_tools(&state.db, &mut out).await;
+
     (
         [(
             header::CONTENT_TYPE,
@@ -311,9 +344,83 @@ pub async fn endpoint(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .into_response()
 }
 
+/// Append the `mcp_hub_group_tools` gauge: per-connector-group tool counts,
+/// from each enabled member's cached capabilities snapshot (an unprobed
+/// member counts 0 until its first Test connection). claude.ai truncates a
+/// connector's registry at 256 tools, so this gauge exists to alert before
+/// tools silently vanish.
+async fn render_group_tools(db: &sqlx::SqlitePool, out: &mut String) {
+    use std::fmt::Write;
+    let groups: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT u.handle, g.slug,
+                COALESCE(SUM(json_array_length(i.capabilities_json, '$.tools')), 0)
+         FROM connector_groups g
+         JOIN users u ON u.id = g.user_id
+         LEFT JOIN connector_group_members m ON m.group_id = g.id
+         LEFT JOIN user_server_instances i ON i.id = m.instance_id AND i.enabled = 1
+         GROUP BY g.id
+         ORDER BY u.handle, g.slug",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    out.push_str("# TYPE mcp_hub_group_tools gauge\n");
+    for (owner, slug, tools) in &groups {
+        let _ = writeln!(
+            out,
+            "mcp_hub_group_tools{{owner=\"{}\",group=\"{}\"}} {}",
+            escape_label(owner),
+            escape_label(slug),
+            tools
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn group_tools_sums_enabled_members_cached_tools() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES ('u1','alice','Alice',0,0)")
+            .execute(&pool).await.unwrap();
+        // Three instances: two tools + three tools, plus a disabled one that
+        // must not count. Snapshot rows only need the `tools` array here.
+        for (id, ns, enabled, tools) in [
+            ("i1", "a", 1, r#"{"tools":[{},{}]}"#),
+            ("i2", "b", 1, r#"{"tools":[{},{},{}]}"#),
+            ("i3", "c", 0, r#"{"tools":[{}]}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO user_server_instances (id, user_id, namespace, display_name, enabled, created_at, capabilities_json)
+                 VALUES (?, 'u1', ?, ?, ?, 0, ?)",
+            )
+            .bind(id).bind(ns).bind(ns).bind(enabled).bind(tools)
+            .execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO connector_groups (id, user_id, slug, created_at) VALUES ('g1','u1','work',0)")
+            .execute(&pool).await.unwrap();
+        for inst in ["i1", "i2", "i3"] {
+            sqlx::query("INSERT INTO connector_group_members (group_id, instance_id, created_at) VALUES ('g1', ?, 0)")
+                .bind(inst).execute(&pool).await.unwrap();
+        }
+        // An empty group renders 0, not NULL.
+        sqlx::query("INSERT INTO connector_groups (id, user_id, slug, created_at) VALUES ('g2','u1','empty',0)")
+            .execute(&pool).await.unwrap();
+
+        let mut out = String::new();
+        render_group_tools(&pool, &mut out).await;
+        assert!(
+            out.contains(r#"mcp_hub_group_tools{owner="alice",group="work"} 5"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"mcp_hub_group_tools{owner="alice",group="empty"} 0"#),
+            "{out}"
+        );
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -324,16 +431,20 @@ mod tests {
         let m = Metrics::default();
         m.record_call("alice", "github", "get_me", ms(250), None);
         m.record_call("alice", "github", "get_me", ms(750), None);
-        m.record_call("bob", "zabbix", "host_get", ms(100), Some(ErrorKind::Timeout));
+        m.record_call(
+            "bob",
+            "zabbix",
+            "host_get",
+            ms(100),
+            Some(ErrorKind::Timeout),
+        );
 
         let mut out = String::new();
         m.render(&mut out);
-        assert!(out.contains(
-            r#"mcp_hub_tool_calls_total{user="alice",server="github",tool="get_me"} 2"#
-        ));
-        assert!(out.contains(
-            r#"mcp_hub_tool_calls_total{user="bob",server="zabbix",tool="host_get"} 1"#
-        ));
+        assert!(out
+            .contains(r#"mcp_hub_tool_calls_total{user="alice",server="github",tool="get_me"} 2"#));
+        assert!(out
+            .contains(r#"mcp_hub_tool_calls_total{user="bob",server="zabbix",tool="host_get"} 1"#));
         assert!(out.contains(
             r#"mcp_hub_tool_call_duration_seconds_total{user="alice",server="github",tool="get_me"} 1.000000"#
         ));

@@ -128,6 +128,24 @@ Once connected, a group's tools and prompts appear namespaced
 > re-point PAT-based scripts at a group URL. OAuth access tokens are
 > audience-bound to the exact endpoint they were minted for.
 
+### Keeping clients' tool lists current
+
+Three freshness mechanisms, from most to least automatic:
+
+- **Live sessions** get a `tools/list_changed` notification whenever servers or
+  groups change (and when a slow backend joins the pool after connect), so an
+  open Claude Code session or active claude.ai conversation re-fetches on its
+  own.
+- **New claude.ai conversations** fetch a fresh `tools/list` at session start,
+  so per-chat freshness is automatic as long as the list is complete — the
+  keep-warm loop's heartbeat exists to guarantee that.
+- **The claude.ai connector registry** (the tool list in Settings → Connectors)
+  only refreshes when the connector is reconnected. After adding or removing
+  servers in a group, re-connect that connector in claude.ai settings — and
+  keep the group under the 256-tool cap, or the registry drops the
+  alphabetical tail silently. The `mcp_hub_group_tools` gauge on `/metrics`
+  exists so a scraper can alert on that before it bites.
+
 ### Management tools (`hub__`)
 
 | Tool | Who | Description |
@@ -285,6 +303,12 @@ is generated on first startup, stored encrypted like other secrets, and shown
 (and regenerable) in the **Metrics** section of the admin **Stats** page.
 Counters are in-memory and reset on restart — use rate/delta preprocessing
 (e.g. Zabbix *Change per second*) when graphing.
+
+Reliability families worth alerting on: `mcp_hub_oauth_internal_errors_total`
+(a token-endpoint 500 — claude.ai shows the connector as disconnected until it
+retries), `mcp_hub_db_busy_retries_total` (SQLite write-lock pressure absorbed
+by retry), and `mcp_hub_group_tools{owner,group}` (alert above 256, where
+claude.ai starts silently dropping tools).
 
 ## Security notes
 

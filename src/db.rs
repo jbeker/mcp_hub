@@ -23,7 +23,11 @@ pub async fn connect(db_path: &str) -> Result<SqlitePool> {
         .context("invalid sqlite path")?
         .create_if_missing(true)
         .foreign_keys(true)
-        .busy_timeout(std::time::Duration::from_secs(5))
+        // Generous: claude.ai refreshes every connector group's token in one
+        // burst, and a writer queueing behind that burst should wait, not 500.
+        // Only covers plain SQLITE_BUSY — write transactions must still BEGIN
+        // IMMEDIATE to avoid SQLITE_BUSY_SNAPSHOT, which fails instantly.
+        .busy_timeout(std::time::Duration::from_secs(10))
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
     let pool = SqlitePoolOptions::new()

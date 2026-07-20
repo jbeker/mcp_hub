@@ -5,6 +5,35 @@ use sqlx::SqlitePool;
 
 use crate::util::now_unix;
 
+/// True when an error chain bottoms out in SQLite's transient "database is
+/// locked" (SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT).
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains("database is locked"))
+}
+
+/// Retry a store operation a few times when SQLite reports the database
+/// locked. claude.ai refreshes every connector group's token in one burst, so
+/// the token endpoint sees concurrent writers; a brief retry turns a lock
+/// stall into a served request instead of a 500.
+async fn retry_busy<T, F, Fut>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const BACKOFF_MS: [u64; 3] = [50, 150, 300];
+    for delay in BACKOFF_MS {
+        match op().await {
+            Err(e) if is_busy(&e) => {
+                crate::metrics::note_db_busy_retry();
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            other => return other,
+        }
+    }
+    op().await
+}
+
 /// A registered OAuth client (created via Dynamic Client Registration).
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -103,27 +132,55 @@ type AuthCodeRow = (String, String, String, String, String, Option<String>, i64)
 /// Atomically consume an authorization code (one-time use). Returns the row if
 /// it existed and had not expired.
 pub async fn take_code(pool: &SqlitePool, code: &str) -> Result<Option<AuthCode>> {
-    let mut tx = pool.begin().await?;
-    let row: Option<AuthCodeRow> =
-        sqlx::query_as(
+    retry_busy(|| take_code_once(pool, code)).await
+}
+
+/// One attempt at [`take_code`]. Uses `BEGIN IMMEDIATE` (like
+/// `users::create_admin_if_first`) so the read-then-delete takes the write
+/// lock up front: a deferred transaction upgrading to a writer mid-flight
+/// fails instantly with SQLITE_BUSY_SNAPSHOT, which `busy_timeout` never
+/// waits on.
+async fn take_code_once(pool: &SqlitePool, code: &str) -> Result<Option<AuthCode>> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .context("starting immediate transaction")?;
+
+    let result: Result<Option<AuthCodeRow>> = async {
+        let row: Option<AuthCodeRow> = sqlx::query_as(
             "SELECT client_id, user_id, redirect_uri, code_challenge, scope, resource, expires_at
              FROM oauth_auth_codes WHERE code = ?",
         )
         .bind(code)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
+        if row.is_some() {
+            // Delete regardless of expiry so a replay cannot reuse it.
+            sqlx::query("DELETE FROM oauth_auth_codes WHERE code = ?")
+                .bind(code)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(row)
+    }
+    .await;
+
+    let row = match result {
+        Ok(row) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            row
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(e);
+        }
+    };
+
     let Some((client_id, user_id, redirect_uri, code_challenge, scope, resource, expires_at)) = row
     else {
-        tx.commit().await?;
         return Ok(None);
     };
-    // Delete regardless so a replay cannot reuse it.
-    sqlx::query("DELETE FROM oauth_auth_codes WHERE code = ?")
-        .bind(code)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-
     if expires_at < now_unix() {
         return Ok(None);
     }
@@ -160,24 +217,27 @@ pub async fn insert_refresh(
     info: &crate::auth::RequestInfo,
 ) -> Result<()> {
     let now = now_unix();
-    sqlx::query(
-        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scope, resource, family_id, consumed, created_at, expires_at, last_ip, last_user_agent)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
-    )
-    .bind(token_hash)
-    .bind(client_id)
-    .bind(user_id)
-    .bind(scope)
-    .bind(resource)
-    .bind(family_id)
-    .bind(now)
-    .bind(now + ttl_secs)
-    .bind(info.ip.as_deref())
-    .bind(info.user_agent.as_deref())
-    .execute(pool)
+    retry_busy(|| async {
+        sqlx::query(
+            "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scope, resource, family_id, consumed, created_at, expires_at, last_ip, last_user_agent)
+             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+        )
+        .bind(token_hash)
+        .bind(client_id)
+        .bind(user_id)
+        .bind(scope)
+        .bind(resource)
+        .bind(family_id)
+        .bind(now)
+        .bind(now + ttl_secs)
+        .bind(info.ip.as_deref())
+        .bind(info.user_agent.as_deref())
+        .execute(pool)
+        .await
+        .context("inserting refresh token")?;
+        Ok(())
+    })
     .await
-    .context("inserting refresh token")?;
-    Ok(())
 }
 
 /// The outcome of presenting a refresh token at the token endpoint.
@@ -195,56 +255,83 @@ type RefreshRow = (String, String, String, Option<String>, String, bool, i64);
 
 /// Atomically consume a refresh token, detecting replay of a rotated token.
 pub async fn consume_refresh(pool: &SqlitePool, token_hash: &str) -> Result<RefreshOutcome> {
-    let mut tx = pool.begin().await?;
-    let row: Option<RefreshRow> = sqlx::query_as(
-        "SELECT client_id, user_id, scope, resource, family_id, consumed, expires_at
-         FROM oauth_refresh_tokens WHERE token_hash = ?",
-    )
-    .bind(token_hash)
-    .fetch_optional(&mut *tx)
-    .await?;
+    retry_busy(|| consume_refresh_once(pool, token_hash)).await
+}
 
-    let Some((client_id, user_id, scope, resource, family_id, consumed, expires_at)) = row else {
-        tx.commit().await?;
-        return Ok(RefreshOutcome::Missing);
-    };
+/// One attempt at [`consume_refresh`]. `BEGIN IMMEDIATE` for the same reason
+/// as [`take_code_once`]: this SELECT-then-UPDATE is exactly the deferred
+/// reader-to-writer upgrade that fails with SQLITE_BUSY_SNAPSHOT when the
+/// connector groups all refresh at once.
+async fn consume_refresh_once(pool: &SqlitePool, token_hash: &str) -> Result<RefreshOutcome> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .context("starting immediate transaction")?;
 
-    if expires_at < now_unix() {
-        sqlx::query("DELETE FROM oauth_refresh_tokens WHERE token_hash = ?")
-            .bind(token_hash)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        return Ok(RefreshOutcome::Missing);
-    }
-
-    if consumed {
-        tx.commit().await?;
-        return Ok(RefreshOutcome::Replayed { family_id });
-    }
-
-    // First use: mark consumed so a later replay is detected.
-    sqlx::query("UPDATE oauth_refresh_tokens SET consumed = 1 WHERE token_hash = ?")
+    let result: Result<RefreshOutcome> = async {
+        let row: Option<RefreshRow> = sqlx::query_as(
+            "SELECT client_id, user_id, scope, resource, family_id, consumed, expires_at
+             FROM oauth_refresh_tokens WHERE token_hash = ?",
+        )
         .bind(token_hash)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
-    tx.commit().await?;
-    Ok(RefreshOutcome::Valid(RefreshToken {
-        client_id,
-        user_id,
-        scope,
-        resource,
-        family_id,
-    }))
+
+        let Some((client_id, user_id, scope, resource, family_id, consumed, expires_at)) = row
+        else {
+            return Ok(RefreshOutcome::Missing);
+        };
+
+        if expires_at < now_unix() {
+            sqlx::query("DELETE FROM oauth_refresh_tokens WHERE token_hash = ?")
+                .bind(token_hash)
+                .execute(&mut *conn)
+                .await?;
+            return Ok(RefreshOutcome::Missing);
+        }
+
+        if consumed {
+            return Ok(RefreshOutcome::Replayed { family_id });
+        }
+
+        // First use: mark consumed so a later replay is detected.
+        sqlx::query("UPDATE oauth_refresh_tokens SET consumed = 1 WHERE token_hash = ?")
+            .bind(token_hash)
+            .execute(&mut *conn)
+            .await?;
+        Ok(RefreshOutcome::Valid(RefreshToken {
+            client_id,
+            user_id,
+            scope,
+            resource,
+            family_id,
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(e)
+        }
+    }
 }
 
 /// Revoke every token in a family (used when reuse is detected).
 pub async fn revoke_family(pool: &SqlitePool, family_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM oauth_refresh_tokens WHERE family_id = ?")
-        .bind(family_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    retry_busy(|| async {
+        sqlx::query("DELETE FROM oauth_refresh_tokens WHERE family_id = ?")
+            .bind(family_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    })
+    .await
 }
 
 /// One OAuth client a user has connected (an authorized MCP client).
@@ -325,12 +412,13 @@ pub async fn get_client_label(
     user_id: &str,
     client_id: &str,
 ) -> Result<(String, String)> {
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT name, note FROM oauth_client_labels WHERE user_id = ? AND client_id = ?")
-            .bind(user_id)
-            .bind(client_id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT name, note FROM oauth_client_labels WHERE user_id = ? AND client_id = ?",
+    )
+    .bind(user_id)
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.unwrap_or_default())
 }
 
@@ -363,7 +451,11 @@ pub async fn set_client_label(
 
 /// Whether the user currently has a live connection (non-expired refresh token)
 /// to a given client — guards label edits against arbitrary client IDs.
-pub async fn user_has_connection(pool: &SqlitePool, user_id: &str, client_id: &str) -> Result<bool> {
+pub async fn user_has_connection(
+    pool: &SqlitePool,
+    user_id: &str,
+    client_id: &str,
+) -> Result<bool> {
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT 1 FROM oauth_refresh_tokens WHERE user_id = ? AND client_id = ? AND expires_at > ? LIMIT 1",
     )
@@ -394,4 +486,140 @@ pub async fn revoke_all_user_tokens(pool: &SqlitePool, user_id: &str) -> Result<
         .execute(pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file-backed pool via [`crate::db::connect`] so the test runs under
+    /// the production journal mode (WAL) and busy_timeout — an in-memory
+    /// database cannot reproduce write-lock contention.
+    async fn pool(name: &str) -> (SqlitePool, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("mcphub-oauth-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = crate::db::connect(path.to_str().unwrap()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, handle, display_name, is_admin, created_at) VALUES ('u1','alice','Alice',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        create_client(&pool, "c1", None, &[], &serde_json::json!({}))
+            .await
+            .unwrap();
+        (pool, path)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
+
+    /// claude.ai refreshes every connector group's token in a single burst;
+    /// each rotation is a consume (SELECT+UPDATE transaction) racing the
+    /// others' inserts. Before the BEGIN IMMEDIATE + retry fix this failed
+    /// intermittently with "database is locked" (SQLITE_BUSY_SNAPSHOT).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_refresh_burst_survives_lock_contention() {
+        let (pool, path) = pool("burst").await;
+        let info = crate::auth::RequestInfo::default();
+        for i in 0..12 {
+            insert_refresh(
+                &pool,
+                &format!("h{i}"),
+                "c1",
+                "u1",
+                "",
+                None,
+                &format!("f{i}"),
+                3600,
+                &info,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let pool = pool.clone();
+            tasks.spawn(async move {
+                let info = crate::auth::RequestInfo::default();
+                let out = consume_refresh(&pool, &format!("h{i}")).await?;
+                anyhow::ensure!(
+                    matches!(out, RefreshOutcome::Valid(_)),
+                    "token h{i} not valid on first use"
+                );
+                insert_refresh(
+                    &pool,
+                    &format!("h{i}-next"),
+                    "c1",
+                    "u1",
+                    "",
+                    None,
+                    &format!("f{i}"),
+                    3600,
+                    &info,
+                )
+                .await
+            });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.expect("task panicked").expect("refresh cycle errored");
+        }
+
+        // Every rotation landed: an old token replays as consumed.
+        let replay = consume_refresh(&pool, "h0").await.unwrap();
+        assert!(matches!(replay, RefreshOutcome::Replayed { .. }));
+
+        pool.close().await;
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_take_code_hands_out_each_code_once() {
+        let (pool, path) = pool("codes").await;
+        for i in 0..8 {
+            insert_code(
+                &pool,
+                &format!("code{i}"),
+                "c1",
+                "u1",
+                "https://x/cb",
+                "chal",
+                "",
+                None,
+                300,
+            )
+            .await
+            .unwrap();
+        }
+
+        // All codes exchanged concurrently, each twice — exactly one winner per code.
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            for _ in 0..2 {
+                let pool = pool.clone();
+                tasks.spawn(async move { take_code(&pool, &format!("code{i}")).await });
+            }
+        }
+        let mut won = 0;
+        while let Some(res) = tasks.join_next().await {
+            if res
+                .expect("task panicked")
+                .expect("take_code errored")
+                .is_some()
+            {
+                won += 1;
+            }
+        }
+        assert_eq!(won, 8, "each code must be exchangeable exactly once");
+
+        pool.close().await;
+        cleanup(&path);
+    }
 }
