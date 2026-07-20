@@ -629,9 +629,6 @@ mod tests {
             config: Default::default(),
             built_commit: Some("abc".into()),
             build_status: build_status.into(),
-            runtime_status: "unknown".into(),
-            runtime_detail: None,
-            runtime_checked_at: None,
         }
     }
 

@@ -569,6 +569,9 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
                 v
             })
         });
+        // Connection outcome from the in-memory registry; missing entry means
+        // no attempt this process — same shape as the old column defaults.
+        let rs = state.runtime_status.get(&i.id);
         out.push(json!({
             "namespace": i.namespace,
             "display_name": i.display_name,
@@ -580,9 +583,9 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
             "env_keys": env_keys,
             "build_status": i.build_status,
             "built_commit": i.built_commit,
-            "runtime_status": i.runtime_status,
-            "runtime_detail": i.runtime_detail,
-            "runtime_checked_at": i.runtime_checked_at,
+            "runtime_status": rs.as_ref().map_or("unknown", |s| s.state.as_str()),
+            "runtime_detail": rs.as_ref().and_then(|s| s.detail.clone()),
+            "runtime_checked_at": rs.as_ref().map(|s| s.checked_at),
         }));
     }
     ok(json!({ "servers": out }))
@@ -805,6 +808,10 @@ async fn set_enabled(
     instances::set_enabled(&state.db, &inst.id, enabled)
         .await
         .map_err(internal)?;
+    if !enabled {
+        // A disabled backend's last status is meaningless; show "unknown".
+        state.runtime_status.remove(&inst.id);
+    }
     // Converge live pooled backends (spawn / tear down) on the change.
     state.backend_pool.mark_dirty(user_id);
     state.notify_tools_changed(user_id);
@@ -821,6 +828,7 @@ async fn remove(
     instances::delete(&state.db, &inst.id)
         .await
         .map_err(internal)?;
+    state.runtime_status.remove(&inst.id);
     // Mirror the web delete path: drop the built git venv, the config-file
     // working directory, and the per-instance HOME so nothing the instance
     // owned lingers on disk after removal.

@@ -15,6 +15,7 @@ pub mod oauth;
 pub mod proxy;
 pub mod sandbox;
 pub mod stats;
+pub mod status;
 pub mod tokens;
 pub mod users;
 pub mod util;
@@ -76,6 +77,10 @@ pub struct AppState {
     /// re-fetches without a manual refresh. In-memory; entries are removed when
     /// the session's `HubProxy` is dropped.
     pub client_peers: Arc<Mutex<HashMap<uuid::Uuid, ClientPeer>>>,
+    /// Each instance's last connection outcome. In-memory: keep-warm rebuilds
+    /// it within a minute of a restart, and reads join it against the DB
+    /// instance list (missing entry = "unknown").
+    pub runtime_status: Arc<crate::status::StatusRegistry>,
     /// In-memory usage counters served by `/metrics`; reset on restart.
     pub metrics: Arc<crate::metrics::Metrics>,
     /// The API key gating `/metrics`, sealed at rest in the `settings` table
@@ -107,6 +112,7 @@ impl AppState {
         let backend_slots = Arc::new(Semaphore::new(config.limits.max_backends_global));
         let metrics_key = crate::metrics::load_or_create_key(&db, &secrets).await?;
         Ok(Self {
+            runtime_status: Arc::new(crate::status::StatusRegistry::default()),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             metrics_key: Arc::new(std::sync::RwLock::new(metrics_key)),
             secrets,

@@ -241,7 +241,7 @@ impl UserBackends {
                         inner.last_attempt.insert(inst.id.clone(), now);
                     }
                 }
-                mark_skipped(state, &enabled, &format!("sandbox unavailable: {e:#}")).await;
+                mark_skipped(state, &enabled, &format!("sandbox unavailable: {e:#}"));
                 return;
             }
         };
@@ -315,7 +315,7 @@ impl UserBackends {
             }
         }
         for (inst, reason) in &skipped {
-            mark_status(state, inst, "skipped", Some(reason)).await;
+            mark_status(state, inst, crate::status::RuntimeState::Skipped, Some(reason));
         }
 
         // Spawn concurrently as detached tasks: each pushes itself into the
@@ -404,14 +404,14 @@ async fn spawn_one(
     let mut def = match instances::resolve_def(&state.db, inst).await {
         Ok(d) => d,
         Err(e) => {
-            mark_status(state, inst, "error", Some(&format!("resolve failed: {e:#}"))).await;
+            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("resolve failed: {e:#}")));
             return None;
         }
     };
     if def.transport == "http" {
         let url = def.url.as_deref().unwrap_or("").trim();
         if url.is_empty() {
-            mark_status(state, inst, "error", Some("no remote URL set")).await;
+            mark_status(state, inst, crate::status::RuntimeState::Error, Some("no remote URL set"));
             return None;
         }
         // Re-resolve the host at connect time (not just at save) so the
@@ -419,7 +419,7 @@ async fn spawn_one(
         if let Err(e) =
             instances::check_backend_host(url, state.config.block_private_backend_ips)
         {
-            mark_status(state, inst, "error", Some(&format!("{e}"))).await;
+            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("{e}")));
             return None;
         }
     }
@@ -436,10 +436,9 @@ async fn spawn_one(
             mark_status(
                 state,
                 inst,
-                "unbuilt",
+                crate::status::RuntimeState::Unbuilt,
                 Some("needs rebuild after upgrade — open its page and click “Test connection”"),
-            )
-            .await;
+            );
             return None;
         }
         if ready {
@@ -450,19 +449,19 @@ async fn spawn_one(
                     def.args = args;
                 }
                 Err(e) => {
-                    mark_status(state, inst, "error", Some(&format!("git launch failed: {e:#}"))).await;
+                    mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("git launch failed: {e:#}")));
                     return None;
                 }
             }
         } else {
-            mark_status(state, inst, "unbuilt", Some("not built yet; run hub__update_server")).await;
+            mark_status(state, inst, crate::status::RuntimeState::Unbuilt, Some("not built yet; run hub__update_server"));
             return None;
         }
     }
     let env = match instances::resolved_env(&state.db, &state.secrets, inst).await {
         Ok(e) => e,
         Err(e) => {
-            mark_status(state, inst, "error", Some(&format!("config error: {e:#}"))).await;
+            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("config error: {e:#}")));
             return None;
         }
     };
@@ -470,7 +469,7 @@ async fn spawn_one(
         match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await {
             Ok(c) => c,
             Err(e) => {
-                mark_status(state, inst, "error", Some(&format!("config error: {e:#}"))).await;
+                mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("config error: {e:#}")));
                 return None;
             }
         };
@@ -498,7 +497,7 @@ async fn spawn_one(
                 elapsed_ms,
                 "backend connected"
             );
-            mark_status(state, inst, "ok", None).await;
+            mark_status(state, inst, crate::status::RuntimeState::Ok, None);
             Some(b)
         }
         Err(e) => {
@@ -509,7 +508,7 @@ async fn spawn_one(
                 error = %format!("{e:#}"),
                 "backend connect failed"
             );
-            mark_status(state, inst, "error", Some(&format!("failed to start: {e:#}"))).await;
+            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("failed to start: {e:#}")));
             None
         }
     }
@@ -527,6 +526,11 @@ async fn spawn_one(
 pub async fn warm_all(state: &AppState) -> (usize, usize) {
     let users = crate::users::list(&state.db).await.unwrap_or_default();
     let instances = instances::list_all(&state.db).await.unwrap_or_default();
+    // Prune status entries for instances that no longer exist — a spawn task's
+    // status write can race a delete's remove and re-insert an orphan.
+    state
+        .runtime_status
+        .retain(&instances.iter().map(|i| i.id.clone()).collect());
     let with_enabled: HashSet<&str> = instances
         .iter()
         .filter(|i| i.enabled)
@@ -570,6 +574,9 @@ pub async fn exercise_all(state: &AppState) -> (usize, usize) {
         .collect();
     let secs = state.config.limits.backend_list_timeout_secs;
     let (mut ok, mut failed) = (0, 0);
+    // Status writes for dropped backends, recorded after `inner` is released
+    // so this function only ever holds one lock at a time.
+    let mut dropped: Vec<String> = Vec::new();
     for ub in users {
         let backends = ub.inner.lock().unwrap().backends.clone();
         let results = futures::future::join_all(backends.iter().map(|b| async move {
@@ -611,6 +618,7 @@ pub async fn exercise_all(state: &AppState) -> (usize, usize) {
                         // respawn that raced in while we were listing.
                         if let Some(p) = inner.backends.iter().position(|x| Arc::ptr_eq(x, b)) {
                             inner.backends.remove(p);
+                            dropped.push(b.instance_id.clone());
                             tracing::info!(
                                 namespace = %b.namespace,
                                 "dropping wedged backend for respawn"
@@ -621,29 +629,35 @@ pub async fn exercise_all(state: &AppState) -> (usize, usize) {
             }
         }
     }
+    for id in dropped {
+        state.runtime_status.set(
+            &id,
+            crate::status::RuntimeState::Error,
+            Some("heartbeat failed; dropped for respawn"),
+        );
+    }
     (ok, failed)
 }
 
-/// Persist a backend's connection outcome so the UI / hub__ tools can show
-/// why it is (not) running. Best-effort: a status-write failure is logged,
-/// not propagated.
-async fn mark_status(
+/// Record a backend's connection outcome so the UI / hub__ tools can show
+/// why it is (not) running. In-memory ([`crate::status::StatusRegistry`]):
+/// this fires on every spawn attempt across all backends, and keeping it off
+/// the database's write lock is what lets the OAuth path stay uncontended.
+fn mark_status(
     state: &AppState,
     inst: &instances::Instance,
-    status: &str,
+    status: crate::status::RuntimeState,
     detail: Option<&str>,
 ) {
-    if status != "ok" {
-        tracing::warn!(namespace = %inst.namespace, status, detail, "backend not running");
+    if status != crate::status::RuntimeState::Ok {
+        tracing::warn!(namespace = %inst.namespace, status = status.as_str(), detail, "backend not running");
     }
-    if let Err(e) = instances::set_runtime_status(&state.db, &inst.id, status, detail).await {
-        tracing::error!(error = %e, "recording backend status failed");
-    }
+    state.runtime_status.set(&inst.id, status, detail);
 }
 
 /// Mark a run of instances skipped (capacity or sandbox kept them down).
-async fn mark_skipped(state: &AppState, insts: &[instances::Instance], reason: &str) {
+fn mark_skipped(state: &AppState, insts: &[instances::Instance], reason: &str) {
     for inst in insts {
-        mark_status(state, inst, "skipped", Some(reason)).await;
+        mark_status(state, inst, crate::status::RuntimeState::Skipped, Some(reason));
     }
 }

@@ -208,12 +208,6 @@ pub struct Instance {
     pub built_commit: Option<String>,
     /// Build state: `unbuilt`, `ready`, or `error`.
     pub build_status: String,
-    /// Last connection outcome: `ok`, `error`, `skipped`, `unbuilt`, `unknown`.
-    pub runtime_status: String,
-    /// Human-readable detail for a non-`ok` runtime status (e.g. an error).
-    pub runtime_detail: Option<String>,
-    /// When the runtime status was last recorded (unix seconds).
-    pub runtime_checked_at: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -228,9 +222,6 @@ struct Row {
     config_json: String,
     built_commit: Option<String>,
     build_status: String,
-    runtime_status: String,
-    runtime_detail: Option<String>,
-    runtime_checked_at: Option<i64>,
 }
 
 impl Row {
@@ -248,14 +239,11 @@ impl Row {
             config: serde_json::from_str(&self.config_json).unwrap_or_default(),
             built_commit: self.built_commit,
             build_status: self.build_status,
-            runtime_status: self.runtime_status,
-            runtime_detail: self.runtime_detail,
-            runtime_checked_at: self.runtime_checked_at,
         }
     }
 }
 
-const SELECT: &str = "SELECT id, user_id, catalog_server_id, custom_def_json, namespace, display_name, enabled, config_json, built_commit, build_status, runtime_status, runtime_detail, runtime_checked_at FROM user_server_instances";
+const SELECT: &str = "SELECT id, user_id, catalog_server_id, custom_def_json, namespace, display_name, enabled, config_json, built_commit, build_status FROM user_server_instances";
 
 pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> Result<Vec<Instance>> {
     let rows: Vec<Row> = sqlx::query_as(&format!("{SELECT} WHERE user_id = ? ORDER BY namespace"))
@@ -368,26 +356,6 @@ pub async fn set_build_state(
         .bind(id)
         .execute(pool)
         .await?;
-    Ok(())
-}
-
-/// Record the outcome of the most recent attempt to connect this backend.
-pub async fn set_runtime_status(
-    pool: &SqlitePool,
-    id: &str,
-    status: &str,
-    detail: Option<&str>,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE user_server_instances \
-         SET runtime_status = ?, runtime_detail = ?, runtime_checked_at = ? WHERE id = ?",
-    )
-    .bind(status)
-    .bind(detail)
-    .bind(now_unix())
-    .bind(id)
-    .execute(pool)
-    .await?;
     Ok(())
 }
 

@@ -100,6 +100,9 @@ pub async fn gather(state: &AppState) -> RuntimeStats {
         .collect();
 
     let all = instances::list_all(&state.db).await.unwrap_or_default();
+    // Instance config comes from the DB; the connection outcome joins in from
+    // the in-memory registry (no entry = no attempt this process = unknown).
+    let statuses = state.runtime_status.snapshot();
     let mut totals = Totals {
         users: users.len(),
         instances: all.len(),
@@ -110,12 +113,13 @@ pub async fn gather(state: &AppState) -> RuntimeStats {
         if i.enabled {
             totals.enabled_instances += 1;
         }
-        match i.runtime_status.as_str() {
-            "ok" => totals.running += 1,
-            "error" => totals.error += 1,
-            "skipped" => totals.skipped += 1,
-            "unbuilt" => totals.unbuilt += 1,
-            _ => totals.unknown += 1,
+        let rs = statuses.get(&i.id);
+        match rs.map(|s| s.state) {
+            Some(crate::status::RuntimeState::Ok) => totals.running += 1,
+            Some(crate::status::RuntimeState::Error) => totals.error += 1,
+            Some(crate::status::RuntimeState::Skipped) => totals.skipped += 1,
+            Some(crate::status::RuntimeState::Unbuilt) => totals.unbuilt += 1,
+            Some(crate::status::RuntimeState::Unknown) | None => totals.unknown += 1,
         }
         rows.push(InstanceStat {
             owner: handle_by_id
@@ -125,9 +129,11 @@ pub async fn gather(state: &AppState) -> RuntimeStats {
             namespace: i.namespace.clone(),
             display_name: i.display_name.clone(),
             enabled: i.enabled,
-            runtime_status: i.runtime_status.clone(),
-            runtime_detail: i.runtime_detail.clone(),
-            runtime_checked_at: i.runtime_checked_at,
+            runtime_status: rs
+                .map(|s| s.state.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            runtime_detail: rs.and_then(|s| s.detail.clone()),
+            runtime_checked_at: rs.map(|s| s.checked_at),
         });
     }
 

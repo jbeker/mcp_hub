@@ -655,7 +655,7 @@ pub async fn server_detail(
         transport = esc(&def.transport),
         status = if inst.enabled { "enabled" } else { "disabled" },
         tabs = server_tabs(&inst.id, "config"),
-        runtime = runtime_banner(&inst),
+        runtime = runtime_banner(state.runtime_status.get(&inst.id).as_ref()),
         argv_warning = argv_warning,
         command = command_line(&state, &inst, &def),
         id = esc(&inst.id),
@@ -734,21 +734,21 @@ fn argv_secret_banner(refs: &[String]) -> String {
     )
 }
 
-fn runtime_banner(inst: &instances::Instance) -> String {
-    let when = inst
-        .runtime_checked_at
-        .map(|t| format!(" · checked {}", ago(crate::util::now_unix() - t)))
-        .unwrap_or_default();
-    let (class, label) = match inst.runtime_status.as_str() {
-        "ok" => ("ok", "running".to_string()),
-        "error" => ("danger", "error".to_string()),
-        "unbuilt" => ("warn", "not built".to_string()),
-        "skipped" => ("warn", "not started".to_string()),
-        _ => return String::new(), // 'unknown' before the first connection
+fn runtime_banner(rs: Option<&crate::status::RuntimeStatus>) -> String {
+    // No entry means no connection attempt since this hub process started —
+    // same silence as the old 'unknown' before the first connection.
+    let Some(rs) = rs else { return String::new() };
+    let when = format!(" · checked {}", ago(crate::util::now_unix() - rs.checked_at));
+    let (class, label) = match rs.state {
+        crate::status::RuntimeState::Ok => ("ok", "running".to_string()),
+        crate::status::RuntimeState::Error => ("danger", "error".to_string()),
+        crate::status::RuntimeState::Unbuilt => ("warn", "not built".to_string()),
+        crate::status::RuntimeState::Skipped => ("warn", "not started".to_string()),
+        crate::status::RuntimeState::Unknown => return String::new(),
     };
     // A single-line reason sits inline; a multi-line one (e.g. captured stderr
     // from a Test connection) goes in its own block so it stays readable.
-    let detail = match &inst.runtime_detail {
+    let detail = match &rs.detail {
         Some(d) if d.contains('\n') => {
             format!("{when}<pre class=\"cmd\"><code>{}</code></pre>", esc(d))
         }
@@ -816,6 +816,10 @@ async fn set_enabled_and_redirect(
         return error_page("server not found");
     };
     let _ = instances::set_enabled(&state.db, id, enabled).await;
+    if !enabled {
+        // A disabled backend's last status is meaningless; show "unknown".
+        state.runtime_status.remove(id);
+    }
     // Converge live pooled backends on the change (spawn / tear down) and let
     // connected clients know their tool list moved.
     state.backend_pool.mark_dirty(&user.id);
@@ -900,6 +904,7 @@ pub async fn delete_server(
         return error_page("server not found");
     };
     let _ = instances::delete(&state.db, &id).await;
+    state.runtime_status.remove(&id);
     crate::gitsrc::remove_env(&state.config.env_dir, &id);
     crate::proxy::backend::remove_workdir(&state.config.env_dir, &id);
     crate::proxy::backend::remove_home(&state.config.env_dir, &id);
@@ -970,48 +975,48 @@ pub async fn test_server(
         return error_page("server not found");
     };
     let (status, detail, snapshot) = probe_instance(&state, &user.id, &inst).await;
-    let _ = instances::set_runtime_status(&state.db, &inst.id, status, detail.as_deref()).await;
+    state.runtime_status.set(&inst.id, status, detail.as_deref());
     if let Some(snap) = &snapshot {
         let _ = instances::set_capabilities_snapshot(&state.db, &inst.id, snap).await;
     }
-    if status == "ok" {
+    if status == crate::status::RuntimeState::Ok {
         audit_ok("server.test", &user, &headers, &inst.namespace);
     } else {
-        audit_denied("server.test", &user, &headers, &inst.namespace, status);
+        audit_denied("server.test", &user, &headers, &inst.namespace, status.as_str());
     }
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
 
 /// Resolve and start one instance once, mirroring the proxy's per-backend launch
 /// logic, and return a `(status, detail)` pair suitable for
-/// [`instances::set_runtime_status`].
+/// [`crate::status::StatusRegistry::set`].
 async fn probe_instance(
     state: &AppState,
     user_id: &str,
     inst: &instances::Instance,
 ) -> (
-    &'static str,
+    crate::status::RuntimeState,
     Option<String>,
     Option<instances::CapabilitiesSnapshot>,
 ) {
     let mut def = match instances::resolve_def(&state.db, inst).await {
         Ok(d) => d,
-        Err(e) => return ("error", Some(format!("resolve failed: {e:#}")), None),
+        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("resolve failed: {e:#}")), None),
     };
     if def.transport == "http" {
         let url = def.url.as_deref().unwrap_or("").trim();
         if url.is_empty() {
-            return ("error", Some("no remote URL set".into()), None);
+            return (crate::status::RuntimeState::Error, Some("no remote URL set".into()), None);
         }
         if let Err(e) = instances::check_backend_host(url, state.config.block_private_backend_ips) {
-            return ("error", Some(format!("{e}")), None);
+            return (crate::status::RuntimeState::Error, Some(format!("{e}")), None);
         }
     }
     // Fail closed: resolve the sandbox identity up front (used for both the
     // self-heal rebuild and the probe spawn) rather than ever running as root.
     let sandbox = match state.sandbox_or_fail(user_id).await {
         Ok(s) => s,
-        Err(e) => return ("error", Some(format!("sandbox unavailable: {e:#}")), None),
+        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("sandbox unavailable: {e:#}")), None),
     };
     // Git-sourced backends run from their prebuilt virtualenv; rewrite to a
     // direct stdio exec, or report that they need building first.
@@ -1020,7 +1025,7 @@ async fn probe_instance(
             && crate::gitsrc::env_path(&state.config.env_dir, &inst.id).exists();
         if !ready {
             return (
-                "unbuilt",
+                crate::status::RuntimeState::Unbuilt,
                 Some("not built yet; run “Update from repository” first".into()),
                 None,
             );
@@ -1038,7 +1043,7 @@ async fn probe_instance(
             )
             .await
             {
-                return ("error", Some(format!("rebuild failed: {e:#}")), None);
+                return (crate::status::RuntimeState::Error, Some(format!("rebuild failed: {e:#}")), None);
             }
         }
         match crate::gitsrc::launch_command(&state.config.env_dir, &inst.id, &def) {
@@ -1047,17 +1052,17 @@ async fn probe_instance(
                 def.command = Some(program);
                 def.args = args;
             }
-            Err(e) => return ("error", Some(format!("git launch failed: {e:#}")), None),
+            Err(e) => return (crate::status::RuntimeState::Error, Some(format!("git launch failed: {e:#}")), None),
         }
     }
     let env = match instances::resolved_env(&state.db, &state.secrets, inst).await {
         Ok(e) => e,
-        Err(e) => return ("error", Some(format!("config error: {e:#}")), None),
+        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("config error: {e:#}")), None),
     };
     let config_file = match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await
     {
         Ok(c) => c,
-        Err(e) => return ("error", Some(format!("config error: {e:#}")), None),
+        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("config error: {e:#}")), None),
     };
     match crate::proxy::backend::Backend::probe(
         &def,
@@ -1071,8 +1076,8 @@ async fn probe_instance(
     )
     .await
     {
-        Ok(snap) => ("ok", None, Some(snap)),
-        Err(e) => ("error", Some(format!("failed to start: {e:#}")), None),
+        Ok(snap) => (crate::status::RuntimeState::Ok, None, Some(snap)),
+        Err(e) => (crate::status::RuntimeState::Error, Some(format!("failed to start: {e:#}")), None),
     }
 }
 
@@ -1121,7 +1126,7 @@ pub async fn server_capabilities(
         transport = esc(&def.transport),
         status = if inst.enabled { "enabled" } else { "disabled" },
         tabs = server_tabs(&inst.id, "capabilities"),
-        runtime = runtime_banner(&inst),
+        runtime = runtime_banner(state.runtime_status.get(&inst.id).as_ref()),
         fetched = esc(&fetched),
         id = esc(&inst.id),
         csrf = csrf,
@@ -1149,14 +1154,14 @@ pub async fn refresh_capabilities(
         return error_page("server not found");
     };
     let (status, detail, snapshot) = probe_instance(&state, &user.id, &inst).await;
-    let _ = instances::set_runtime_status(&state.db, &inst.id, status, detail.as_deref()).await;
+    state.runtime_status.set(&inst.id, status, detail.as_deref());
     if let Some(snap) = &snapshot {
         let _ = instances::set_capabilities_snapshot(&state.db, &inst.id, snap).await;
     }
-    if status == "ok" {
+    if status == crate::status::RuntimeState::Ok {
         audit_ok("server.capabilities", &user, &headers, &inst.namespace);
     } else {
-        audit_denied("server.capabilities", &user, &headers, &inst.namespace, status);
+        audit_denied("server.capabilities", &user, &headers, &inst.namespace, status.as_str());
     }
     Redirect::to(&format!("/servers/{id}/capabilities")).into_response()
 }
@@ -2740,6 +2745,7 @@ pub async fn purge_user(state: &AppState, user_id: &str) -> anyhow::Result<()> {
         for inst in insts {
             crate::gitsrc::remove_env(&state.config.env_dir, &inst.id);
             crate::proxy::backend::remove_home(&state.config.env_dir, &inst.id);
+            state.runtime_status.remove(&inst.id);
         }
     }
     users::delete(&state.db, user_id).await?;
