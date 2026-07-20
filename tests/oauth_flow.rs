@@ -236,7 +236,7 @@ async fn token_carries_group_resource_audience() {
     let verifier = "group-audience-verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let challenge = b64url(&sha256(verifier.as_bytes()));
     store::insert_code(
-        &state.db,
+        &state.auth_codes,
         "gcode",
         "c",
         &user.id,
@@ -246,7 +246,6 @@ async fn token_carries_group_resource_audience() {
         Some(&format!("{BASE}/mcp/work")),
         600,
     )
-    .await
     .unwrap();
 
     let body = format!(
@@ -352,7 +351,7 @@ async fn token_authorization_code_pkce_happy_path() {
     let verifier = "abc123_verifier-with-enough-entropy-padding-xxxxxxxxxxxxxxxx";
     let challenge = b64url(&sha256(verifier.as_bytes()));
     store::insert_code(
-        &state.db,
+        &state.auth_codes,
         "thecode",
         "client-x",
         &user.id,
@@ -362,7 +361,6 @@ async fn token_authorization_code_pkce_happy_path() {
         Some(&format!("{BASE}/mcp")),
         600,
     )
-    .await
     .unwrap();
 
     let body = format!(
@@ -404,8 +402,7 @@ async fn token_rejects_wrong_pkce_verifier() {
         .await
         .unwrap();
     let challenge = b64url(&sha256(b"the-real-verifier"));
-    store::insert_code(&state.db, "code2", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
-        .await
+    store::insert_code(&state.auth_codes, "code2", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
         .unwrap();
 
     let body = "grant_type=authorization_code&code=code2&client_id=c&redirect_uri=http://x/cb&code_verifier=WRONG";
@@ -433,8 +430,7 @@ async fn authorization_code_is_single_use() {
         .unwrap();
     let verifier = "verifier-value-with-sufficient-length-aaaaaaaaaaaaaaaaaaaa";
     let challenge = b64url(&sha256(verifier.as_bytes()));
-    store::insert_code(&state.db, "once", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
-        .await
+    store::insert_code(&state.auth_codes, "once", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
         .unwrap();
 
     let mk = || {
@@ -567,8 +563,7 @@ async fn refresh_token_reuse_revokes_the_family() {
     // Mint an initial refresh token via the authorization_code grant.
     let verifier = "reuse-verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let challenge = b64url(&sha256(verifier.as_bytes()));
-    store::insert_code(&state.db, "rc", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
-        .await
+    store::insert_code(&state.auth_codes, "rc", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
         .unwrap();
     let _ = user;
     let tok = app(state.clone())

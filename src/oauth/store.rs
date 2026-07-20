@@ -95,9 +95,29 @@ pub struct AuthCode {
     pub resource: Option<String>,
 }
 
+/// A pending authorization code with its expiry. Codes are 10-minute,
+/// single-use handshake state, worthless across a restart, so they live in
+/// process memory (the hub is single-process by design — the backend pool,
+/// reload epochs and sessions already assume it).
+pub struct PendingCode {
+    auth: AuthCode,
+    expires_at: i64,
+}
+
+/// In-memory store of authorization codes awaiting exchange, on
+/// [`crate::AppState`]. Follows the webauthn ceremony-store pattern
+/// (`auth::webauthn::insert_ceremony`): expired entries are evicted on
+/// insert, and a capacity bound keeps an authorize-spammer from growing
+/// memory unboundedly.
+pub type AuthCodeStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingCode>>>;
+
+/// Bound on codes awaiting exchange; far above any legitimate number of
+/// simultaneously in-flight logins.
+const AUTH_CODE_CAP: usize = 512;
+
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_code(
-    pool: &SqlitePool,
+pub fn insert_code(
+    store: &AuthCodeStore,
     code: &str,
     client_id: &str,
     user_id: &str,
@@ -107,91 +127,39 @@ pub async fn insert_code(
     resource: Option<&str>,
     ttl_secs: i64,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO oauth_auth_codes
-         (code, client_id, user_id, redirect_uri, code_challenge, code_challenge_method, scope, resource, expires_at)
-         VALUES (?, ?, ?, ?, ?, 'S256', ?, ?, ?)",
-    )
-    .bind(code)
-    .bind(client_id)
-    .bind(user_id)
-    .bind(redirect_uri)
-    .bind(code_challenge)
-    .bind(scope)
-    .bind(resource)
-    .bind(now_unix() + ttl_secs)
-    .execute(pool)
-    .await
-    .context("inserting auth code")?;
+    let now = now_unix();
+    let mut map = store.lock().map_err(|_| anyhow::anyhow!("auth code store poisoned"))?;
+    map.retain(|_, c| c.expires_at > now);
+    if map.len() >= AUTH_CODE_CAP {
+        anyhow::bail!("too many authorizations in progress");
+    }
+    map.insert(
+        code.to_string(),
+        PendingCode {
+            auth: AuthCode {
+                client_id: client_id.to_string(),
+                user_id: user_id.to_string(),
+                redirect_uri: redirect_uri.to_string(),
+                code_challenge: code_challenge.to_string(),
+                scope: scope.to_string(),
+                resource: resource.map(str::to_string),
+            },
+            expires_at: now + ttl_secs,
+        },
+    );
     Ok(())
 }
 
-/// Columns selected from `oauth_auth_codes`.
-type AuthCodeRow = (String, String, String, String, String, Option<String>, i64);
-
-/// Atomically consume an authorization code (one-time use). Returns the row if
-/// it existed and had not expired.
-pub async fn take_code(pool: &SqlitePool, code: &str) -> Result<Option<AuthCode>> {
-    retry_busy(|| take_code_once(pool, code)).await
-}
-
-/// One attempt at [`take_code`]. Uses `BEGIN IMMEDIATE` (like
-/// `users::create_admin_if_first`) so the read-then-delete takes the write
-/// lock up front: a deferred transaction upgrading to a writer mid-flight
-/// fails instantly with SQLITE_BUSY_SNAPSHOT, which `busy_timeout` never
-/// waits on.
-async fn take_code_once(pool: &SqlitePool, code: &str) -> Result<Option<AuthCode>> {
-    let mut conn = pool.acquire().await?;
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .context("starting immediate transaction")?;
-
-    let result: Result<Option<AuthCodeRow>> = async {
-        let row: Option<AuthCodeRow> = sqlx::query_as(
-            "SELECT client_id, user_id, redirect_uri, code_challenge, scope, resource, expires_at
-             FROM oauth_auth_codes WHERE code = ?",
-        )
-        .bind(code)
-        .fetch_optional(&mut *conn)
-        .await?;
-        if row.is_some() {
-            // Delete regardless of expiry so a replay cannot reuse it.
-            sqlx::query("DELETE FROM oauth_auth_codes WHERE code = ?")
-                .bind(code)
-                .execute(&mut *conn)
-                .await?;
-        }
-        Ok(row)
-    }
-    .await;
-
-    let row = match result {
-        Ok(row) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
-            row
-        }
-        Err(e) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-            return Err(e);
-        }
-    };
-
-    let Some((client_id, user_id, redirect_uri, code_challenge, scope, resource, expires_at)) = row
-    else {
-        return Ok(None);
-    };
-    if expires_at < now_unix() {
-        return Ok(None);
-    }
-    Ok(Some(AuthCode {
-        client_id,
-        user_id,
-        redirect_uri,
-        code_challenge,
-        scope,
-        resource,
-    }))
+/// Atomically consume an authorization code (one-time use). Returns the code
+/// if it existed and had not expired. The remove happens regardless of
+/// expiry so a replay cannot reuse it; single-use is guaranteed by
+/// `HashMap::remove` under the store's mutex.
+pub fn take_code(store: &AuthCodeStore, code: &str) -> Result<Option<AuthCode>> {
+    let mut map = store.lock().map_err(|_| anyhow::anyhow!("auth code store poisoned"))?;
+    Ok(map
+        .remove(code)
+        .filter(|c| c.expires_at >= now_unix())
+        .map(|c| c.auth))
 }
 
 /// A refresh token record (only the hash is stored).
@@ -580,31 +548,27 @@ mod tests {
         cleanup(&path);
     }
 
+    fn code_store() -> AuthCodeStore {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn seed_code(store: &AuthCodeStore, code: &str, ttl_secs: i64) {
+        insert_code(store, code, "c1", "u1", "https://x/cb", "chal", "", None, ttl_secs).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_take_code_hands_out_each_code_once() {
-        let (pool, path) = pool("codes").await;
+        let store = code_store();
         for i in 0..8 {
-            insert_code(
-                &pool,
-                &format!("code{i}"),
-                "c1",
-                "u1",
-                "https://x/cb",
-                "chal",
-                "",
-                None,
-                300,
-            )
-            .await
-            .unwrap();
+            seed_code(&store, &format!("code{i}"), 300);
         }
 
         // All codes exchanged concurrently, each twice — exactly one winner per code.
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..8 {
             for _ in 0..2 {
-                let pool = pool.clone();
-                tasks.spawn(async move { take_code(&pool, &format!("code{i}")).await });
+                let store = store.clone();
+                tasks.spawn(async move { take_code(&store, &format!("code{i}")) });
             }
         }
         let mut won = 0;
@@ -618,8 +582,34 @@ mod tests {
             }
         }
         assert_eq!(won, 8, "each code must be exchangeable exactly once");
+    }
 
-        pool.close().await;
-        cleanup(&path);
+    #[test]
+    fn expired_code_is_not_exchangeable_and_is_consumed() {
+        let store = code_store();
+        seed_code(&store, "old", -1);
+        assert!(take_code(&store, "old").unwrap().is_none());
+        // The remove-regardless-of-expiry rule: the entry is gone either way.
+        assert!(store.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_evicts_expired_and_enforces_the_cap() {
+        let store = code_store();
+        // Fill to the cap with live codes; the next insert must be refused.
+        for i in 0..512 {
+            seed_code(&store, &format!("live{i}"), 300);
+        }
+        assert!(
+            insert_code(&store, "overflow", "c1", "u1", "https://x/cb", "chal", "", None, 300)
+                .is_err(),
+            "insert past the cap must be refused"
+        );
+        // But expired entries are evicted on insert, making room again.
+        store.lock().unwrap().retain(|k, _| k == "live0");
+        seed_code(&store, "expired", -1);
+        seed_code(&store, "fresh", 300);
+        assert!(take_code(&store, "fresh").unwrap().is_some());
+        assert!(take_code(&store, "expired").unwrap().is_none());
     }
 }

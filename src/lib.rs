@@ -49,6 +49,10 @@ pub struct AppState {
     pub signer: Arc<Signer>,
     pub reg_states: RegStore,
     pub auth_states: AuthStore,
+    /// OAuth authorization codes awaiting exchange. In-memory: codes are
+    /// 10-minute single-use handshake state; a restart just voids in-flight
+    /// logins.
+    pub auth_codes: crate::oauth::store::AuthCodeStore,
     pub cookie_key: Key,
     /// Caps the total number of concurrently running backend connections.
     pub backend_slots: Arc<Semaphore>,
@@ -110,6 +114,7 @@ impl AppState {
             signer,
             reg_states: Arc::new(Mutex::new(HashMap::new())),
             auth_states: Arc::new(Mutex::new(HashMap::new())),
+            auth_codes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cookie_key,
             backend_slots,
             backend_pool: Arc::new(crate::proxy::pool::BackendPool::default()),

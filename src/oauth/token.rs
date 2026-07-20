@@ -106,8 +106,7 @@ async fn authorization_code(
 
     authenticate_client(state, client_id, form.client_secret.as_deref()).await?;
 
-    let row = store::take_code(&state.db, code)
-        .await?
+    let row = store::take_code(&state.auth_codes, code)?
         .ok_or_else(|| OAuthError::invalid_grant("authorization code is invalid or expired"))?;
 
     if row.client_id != client_id {

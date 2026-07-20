@@ -262,7 +262,7 @@ pub async fn decision(
 
     let code = random_token();
     if let Err(e) = store::insert_code(
-        &state.db,
+        &state.auth_codes,
         &code,
         &pending.client_id,
         &user.id,
@@ -271,9 +271,7 @@ pub async fn decision(
         &pending.scope,
         pending.resource.as_deref(),
         AUTH_CODE_TTL_SECS,
-    )
-    .await
-    {
+    ) {
         return (jar, crate::oauth::OAuthError::from(e).into_response()).into_response();
     }
 
