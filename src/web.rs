@@ -3,8 +3,8 @@
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum_extra::extract::cookie::SignedCookieJar;
 use axum::Form;
+use axum_extra::extract::cookie::SignedCookieJar;
 use serde::Deserialize;
 
 use crate::auth::session;
@@ -54,7 +54,10 @@ static ASSET_VER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             h.update(&bytes);
         }
     }
-    h.finalize()[..4].iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 });
 
 fn page_with(title: &str, body: &str, class: &str) -> Html<String> {
@@ -259,7 +262,11 @@ async fn groups_section(
             Some(t) => format!(r#"<span class="muted">~{t} tools</span>"#),
             None => r#"<span class="muted">tool count unknown (probe servers via "Test connection")</span>"#.to_string(),
         };
-        let title = if g.name.is_empty() { g.slug.clone() } else { g.name.clone() };
+        let title = if g.name.is_empty() {
+            g.slug.clone()
+        } else {
+            g.name.clone()
+        };
         cards.push_str(&format!(
             r#"<div class="group-card">
   <div class="group-head"><strong>{title}</strong> {count_line}
@@ -473,7 +480,13 @@ async fn apply_config_file(
 /// Build a `ServerDef` + env map from submitted command/url/repo/env fields.
 fn def_from_form(
     form: &CreateServerForm,
-) -> Result<(instances::ServerDef, std::collections::BTreeMap<String, String>), String> {
+) -> Result<
+    (
+        instances::ServerDef,
+        std::collections::BTreeMap<String, String>,
+    ),
+    String,
+> {
     let transport = form.transport.trim();
     if !matches!(transport, "stdio" | "http") {
         return Err("transport must be stdio or http".into());
@@ -489,8 +502,7 @@ fn def_from_form(
         instances::validate_remote_url(&url).map_err(|e| e.to_string())?;
         (None, Vec::new(), Some(url), None, None)
     } else {
-        let (command, args) =
-            instances::parse_command(&form.command).map_err(|e| e.to_string())?;
+        let (command, args) = instances::parse_command(&form.command).map_err(|e| e.to_string())?;
         if command.is_none() {
             return Err("a command line is required for a stdio server".into());
         }
@@ -555,7 +567,11 @@ pub async fn server_detail(
     Path(id): Path<String>,
 ) -> Response {
     let csrf = session::csrf_field(&jar, &state.config.master_key);
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let def = match instances::resolve_def(&state.db, &inst).await {
@@ -576,8 +592,11 @@ pub async fn server_detail(
     let secret_names = instances::secret_names(&state.db, &inst.id)
         .await
         .unwrap_or_default();
-    let argv_warning =
-        argv_secret_banner(&instances::secret_refs_in_argv(&def.command, &def.args, &secret_names));
+    let argv_warning = argv_secret_banner(&instances::secret_refs_in_argv(
+        &def.command,
+        &def.args,
+        &secret_names,
+    ));
 
     let fields = server_fields(
         &def.transport,
@@ -729,7 +748,13 @@ fn command_line(
 
 /// Two-tab nav for the server pages; the active tab is just a styled link.
 fn server_tabs(id: &str, active: &str) -> String {
-    let cls = |t: &str| if t == active { r#" class="active""# } else { "" };
+    let cls = |t: &str| {
+        if t == active {
+            r#" class="active""#
+        } else {
+            ""
+        }
+    };
     format!(
         r#"<nav class="tabs"><a href="/servers/{id}"{a}>Configuration</a><a href="/servers/{id}/capabilities"{b}>Capabilities</a></nav>"#,
         id = esc(id),
@@ -755,7 +780,11 @@ fn argv_secret_banner(refs: &[String]) -> String {
     format!(
         r#"<div class="status status-warn">{names} {verb} referenced on the command line, where the value is visible to other processes via <code>/proc</code>. Pass it to the server as an environment variable instead.</div>"#,
         names = names,
-        verb = if refs.len() == 1 { "is a stored secret" } else { "are stored secrets" },
+        verb = if refs.len() == 1 {
+            "is a stored secret"
+        } else {
+            "are stored secrets"
+        },
     )
 }
 
@@ -763,7 +792,10 @@ fn runtime_banner(rs: Option<&crate::status::RuntimeStatus>) -> String {
     // No entry means no connection attempt since this hub process started —
     // same silence as the old 'unknown' before the first connection.
     let Some(rs) = rs else { return String::new() };
-    let when = format!(" · checked {}", ago(crate::util::now_unix() - rs.checked_at));
+    let when = format!(
+        " · checked {}",
+        ago(crate::util::now_unix() - rs.checked_at)
+    );
     let (class, label) = match rs.state {
         crate::status::RuntimeState::Ok => ("ok", "running".to_string()),
         crate::status::RuntimeState::Error => ("danger", "error".to_string()),
@@ -801,7 +833,11 @@ pub async fn save_config(
         audit_denied("server.edit", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let existing = match instances::resolve_def(&state.db, &inst).await {
@@ -837,7 +873,11 @@ async fn set_enabled_and_redirect(
     id: &str,
     enabled: bool,
 ) -> Response {
-    let Some(inst) = instances::get_owned(&state.db, id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let _ = instances::set_enabled(&state.db, id, enabled).await;
@@ -849,7 +889,11 @@ async fn set_enabled_and_redirect(
     // connected clients know their tool list moved.
     state.backend_pool.mark_dirty(&user.id);
     state.notify_tools_changed(&user.id);
-    let action = if enabled { "server.enable" } else { "server.disable" };
+    let action = if enabled {
+        "server.enable"
+    } else {
+        "server.disable"
+    };
     audit_ok(action, user, headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
@@ -901,7 +945,11 @@ pub async fn restart_server(
         audit_denied("server.restart", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     state.bump_reload(&inst.id);
@@ -925,7 +973,11 @@ pub async fn delete_server(
         audit_denied("server.remove", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let _ = instances::delete(&state.db, &id).await;
@@ -953,7 +1005,11 @@ pub async fn update_server(
         audit_denied("server.update", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let def = match instances::resolve_def(&state.db, &inst).await {
@@ -1005,18 +1061,30 @@ pub async fn test_server(
         audit_denied("server.test", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let (status, detail, snapshot) = probe_instance(&state, &user.id, &inst).await;
-    state.runtime_status.set(&inst.id, status, detail.as_deref());
+    state
+        .runtime_status
+        .set(&inst.id, status, detail.as_deref());
     if let Some(snap) = &snapshot {
         let _ = instances::set_capabilities_snapshot(&state.db, &inst.id, snap).await;
     }
     if status == crate::status::RuntimeState::Ok {
         audit_ok("server.test", &user, &headers, &inst.namespace);
     } else {
-        audit_denied("server.test", &user, &headers, &inst.namespace, status.as_str());
+        audit_denied(
+            "server.test",
+            &user,
+            &headers,
+            &inst.namespace,
+            status.as_str(),
+        );
     }
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
@@ -1035,22 +1103,42 @@ async fn probe_instance(
 ) {
     let mut def = match instances::resolve_def(&state.db, inst).await {
         Ok(d) => d,
-        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("resolve failed: {e:#}")), None),
+        Err(e) => {
+            return (
+                crate::status::RuntimeState::Error,
+                Some(format!("resolve failed: {e:#}")),
+                None,
+            )
+        }
     };
     if def.transport == "http" {
         let url = def.url.as_deref().unwrap_or("").trim();
         if url.is_empty() {
-            return (crate::status::RuntimeState::Error, Some("no remote URL set".into()), None);
+            return (
+                crate::status::RuntimeState::Error,
+                Some("no remote URL set".into()),
+                None,
+            );
         }
         if let Err(e) = instances::check_backend_host(url, state.config.block_private_backend_ips) {
-            return (crate::status::RuntimeState::Error, Some(format!("{e}")), None);
+            return (
+                crate::status::RuntimeState::Error,
+                Some(format!("{e}")),
+                None,
+            );
         }
     }
     // Fail closed: resolve the sandbox identity up front (used for both the
     // self-heal rebuild and the probe spawn) rather than ever running as root.
     let sandbox = match state.sandbox_or_fail(user_id).await {
         Ok(s) => s,
-        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("sandbox unavailable: {e:#}")), None),
+        Err(e) => {
+            return (
+                crate::status::RuntimeState::Error,
+                Some(format!("sandbox unavailable: {e:#}")),
+                None,
+            )
+        }
     };
     // Git-sourced backends run from their prebuilt virtualenv; rewrite to a
     // direct stdio exec, or report that they need building first.
@@ -1078,7 +1166,11 @@ async fn probe_instance(
             )
             .await
             {
-                return (crate::status::RuntimeState::Error, Some(format!("rebuild failed: {e:#}")), None);
+                return (
+                    crate::status::RuntimeState::Error,
+                    Some(format!("rebuild failed: {e:#}")),
+                    None,
+                );
             }
         }
         match crate::gitsrc::launch_command(&state.config.env_dir, &inst.id, &def) {
@@ -1087,18 +1179,36 @@ async fn probe_instance(
                 def.command = Some(program);
                 def.args = args;
             }
-            Err(e) => return (crate::status::RuntimeState::Error, Some(format!("git launch failed: {e:#}")), None),
+            Err(e) => {
+                return (
+                    crate::status::RuntimeState::Error,
+                    Some(format!("git launch failed: {e:#}")),
+                    None,
+                )
+            }
         }
     }
     let env = match instances::resolved_env(&state.db, &state.secrets, inst).await {
         Ok(e) => e,
-        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("config error: {e:#}")), None),
+        Err(e) => {
+            return (
+                crate::status::RuntimeState::Error,
+                Some(format!("config error: {e:#}")),
+                None,
+            )
+        }
     };
-    let config_file = match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await
-    {
-        Ok(c) => c,
-        Err(e) => return (crate::status::RuntimeState::Error, Some(format!("config error: {e:#}")), None),
-    };
+    let config_file =
+        match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    crate::status::RuntimeState::Error,
+                    Some(format!("config error: {e:#}")),
+                    None,
+                )
+            }
+        };
     match crate::proxy::backend::Backend::probe(
         &def,
         &env,
@@ -1112,7 +1222,11 @@ async fn probe_instance(
     .await
     {
         Ok(snap) => (crate::status::RuntimeState::Ok, None, Some(snap)),
-        Err(e) => (crate::status::RuntimeState::Error, Some(format!("failed to start: {e:#}")), None),
+        Err(e) => (
+            crate::status::RuntimeState::Error,
+            Some(format!("failed to start: {e:#}")),
+            None,
+        ),
     }
 }
 
@@ -1126,7 +1240,11 @@ pub async fn server_capabilities(
     Path(id): Path<String>,
 ) -> Response {
     let csrf = session::csrf_field(&jar, &state.config.master_key);
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let def = match instances::resolve_def(&state.db, &inst).await {
@@ -1185,18 +1303,30 @@ pub async fn refresh_capabilities(
         audit_denied("server.capabilities", &user, &headers, &id, "csrf");
         return forbidden();
     }
-    let Some(inst) = instances::get_owned(&state.db, &id, &user.id).await.ok().flatten() else {
+    let Some(inst) = instances::get_owned(&state.db, &id, &user.id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return error_page("server not found");
     };
     let (status, detail, snapshot) = probe_instance(&state, &user.id, &inst).await;
-    state.runtime_status.set(&inst.id, status, detail.as_deref());
+    state
+        .runtime_status
+        .set(&inst.id, status, detail.as_deref());
     if let Some(snap) = &snapshot {
         let _ = instances::set_capabilities_snapshot(&state.db, &inst.id, snap).await;
     }
     if status == crate::status::RuntimeState::Ok {
         audit_ok("server.capabilities", &user, &headers, &inst.namespace);
     } else {
-        audit_denied("server.capabilities", &user, &headers, &inst.namespace, status.as_str());
+        audit_denied(
+            "server.capabilities",
+            &user,
+            &headers,
+            &inst.namespace,
+            status.as_str(),
+        );
     }
     Redirect::to(&format!("/servers/{id}/capabilities")).into_response()
 }
@@ -1269,10 +1399,18 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
         badges.push_str(&format!(r#"<span class="badge">{}</span> "#, esc(&label)));
     };
     if let Some(t) = &caps.tools {
-        badge(if t.list_changed == Some(true) { "tools · listChanged".into() } else { "tools".into() });
+        badge(if t.list_changed == Some(true) {
+            "tools · listChanged".into()
+        } else {
+            "tools".into()
+        });
     }
     if let Some(p) = &caps.prompts {
-        badge(if p.list_changed == Some(true) { "prompts · listChanged".into() } else { "prompts".into() });
+        badge(if p.list_changed == Some(true) {
+            "prompts · listChanged".into()
+        } else {
+            "prompts".into()
+        });
     }
     if let Some(r) = &caps.resources {
         let mut label = "resources".to_string();
@@ -1299,10 +1437,7 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
 
     let info = &snap.server.server_info;
     let title_row = match &info.title {
-        Some(t) if !t.is_empty() => format!(
-            "<tr><th>Title</th><td>{}</td></tr>",
-            esc(t)
-        ),
+        Some(t) if !t.is_empty() => format!("<tr><th>Title</th><td>{}</td></tr>", esc(t)),
         _ => String::new(),
     };
     out.push_str(&format!(
@@ -1323,7 +1458,12 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
         badges = badges,
     ));
 
-    if let Some(instructions) = snap.server.instructions.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(instructions) = snap
+        .server
+        .instructions
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         out.push_str(&format!(
             r#"<section><h2>Instructions</h2><pre class="cmd"><code>{}</code></pre></section>"#,
             esc(instructions)
@@ -1381,7 +1521,10 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
     out.push_str("</section>");
 
     // --- Prompts ---------------------------------------------------------------
-    out.push_str(&format!("<section><h2>Prompts ({})</h2>", snap.prompts.len()));
+    out.push_str(&format!(
+        "<section><h2>Prompts ({})</h2>",
+        snap.prompts.len()
+    ));
     if caps.prompts.is_none() {
         out.push_str(r#"<p class="muted">Not supported by this server.</p>"#);
     } else if snap.prompts.is_empty() {
@@ -1396,7 +1539,11 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
             if let Some(args) = prompt.arguments.as_deref().filter(|a| !a.is_empty()) {
                 body.push_str(r#"<p class="muted">Arguments</p><ul>"#);
                 for arg in args {
-                    let required = if arg.required == Some(true) { " (required)" } else { "" };
+                    let required = if arg.required == Some(true) {
+                        " (required)"
+                    } else {
+                        ""
+                    };
                     let arg_desc = arg
                         .description
                         .as_deref()
@@ -1423,7 +1570,10 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
     out.push_str("</section>");
 
     // --- Resources ---------------------------------------------------------------
-    out.push_str(&format!("<section><h2>Resources ({})</h2>", snap.resources.len()));
+    out.push_str(&format!(
+        "<section><h2>Resources ({})</h2>",
+        snap.resources.len()
+    ));
     if caps.resources.is_none() {
         out.push_str(r#"<p class="muted">Not supported by this server.</p>"#);
     } else if snap.resources.is_empty() {
@@ -1462,8 +1612,14 @@ fn render_snapshot(snap: &instances::CapabilitiesSnapshot, namespace: &str) -> S
 }
 
 fn error_page(msg: &str) -> Response {
-    page("Error", &format!(r#"<h1>Something went wrong</h1><p>{}</p><p><a href="/">← Back</a></p>"#, esc(msg)))
-        .into_response()
+    page(
+        "Error",
+        &format!(
+            r#"<h1>Something went wrong</h1><p>{}</p><p><a href="/">← Back</a></p>"#,
+            esc(msg)
+        ),
+    )
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,7 +1652,9 @@ pub async fn invites_page(
 
     let mut rows = String::new();
     if list.is_empty() {
-        rows.push_str(r#"<p class="muted">No invites yet. Generate one above to let someone register.</p>"#);
+        rows.push_str(
+            r#"<p class="muted">No invites yet. Generate one above to let someone register.</p>"#,
+        );
     } else {
         rows.push_str("<table class=\"invites\"><thead><tr><th>ID</th><th>Note</th><th>Status</th><th></th></tr></thead><tbody>");
         for inv in &list {
@@ -1563,11 +1721,23 @@ pub async fn create_recovery(
     Form(form): Form<RecoveryForm>,
 ) -> Response {
     if !user.is_admin {
-        audit_denied("recovery.create", &user, &headers, form.handle.trim(), "not_admin");
+        audit_denied(
+            "recovery.create",
+            &user,
+            &headers,
+            form.handle.trim(),
+            "not_admin",
+        );
         return admin_forbidden();
     }
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("recovery.create", &user, &headers, form.handle.trim(), "csrf");
+        audit_denied(
+            "recovery.create",
+            &user,
+            &headers,
+            form.handle.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     let target = match crate::users::find_by_handle(&state.db, form.handle.trim()).await {
@@ -1651,11 +1821,23 @@ pub async fn revoke_invite(
     Form(form): Form<RevokeInviteForm>,
 ) -> Response {
     if !user.is_admin {
-        audit_denied("invite.revoke", &user, &headers, form.short_id.trim(), "not_admin");
+        audit_denied(
+            "invite.revoke",
+            &user,
+            &headers,
+            form.short_id.trim(),
+            "not_admin",
+        );
         return admin_forbidden();
     }
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("invite.revoke", &user, &headers, form.short_id.trim(), "csrf");
+        audit_denied(
+            "invite.revoke",
+            &user,
+            &headers,
+            form.short_id.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     let _ = invites::revoke(&state.db, form.short_id.trim()).await;
@@ -1683,7 +1865,11 @@ pub async fn account_page(
     let mut rows = String::new();
     rows.push_str("<ul class=\"servers\">");
     for c in &creds {
-        let name = if c.name.is_empty() { "passkey" } else { &c.name };
+        let name = if c.name.is_empty() {
+            "passkey"
+        } else {
+            &c.name
+        };
         // Removing the last passkey would lock the account out, so it is refused.
         let remove = if only_one {
             r#"<span class="muted">only key</span>"#.to_string()
@@ -1753,13 +1939,10 @@ pub async fn account_page(
             }
 
             // Which backends this client may use (a checkbox per backend).
-            let denied = crate::access::denied_instances(
-                &state.db,
-                crate::access::OAUTH,
-                &c.client_id,
-            )
-            .await
-            .unwrap_or_default();
+            let denied =
+                crate::access::denied_instances(&state.db, crate::access::OAUTH, &c.client_id)
+                    .await
+                    .unwrap_or_default();
             let access = access_form(
                 "/account/connections/access",
                 "client_id",
@@ -2029,7 +2212,13 @@ pub async fn revoke_connection(
     Form(form): Form<RevokeConnectionForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("connection.revoke", &user, &headers, form.client_id.trim(), "csrf");
+        audit_denied(
+            "connection.revoke",
+            &user,
+            &headers,
+            form.client_id.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     let _ =
@@ -2060,7 +2249,13 @@ pub async fn update_connection_label(
     Form(form): Form<LabelConnectionForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("client.label", &user, &headers, form.client_id.trim(), "csrf");
+        audit_denied(
+            "client.label",
+            &user,
+            &headers,
+            form.client_id.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     let client_id = form.client_id.trim();
@@ -2118,8 +2313,14 @@ pub async fn update_connection_access(
         return error_page("no such connected client");
     }
     let denied = denied_from_form(&state, &user.id, &form).await;
-    let _ = crate::access::set_denials(&state.db, &user.id, crate::access::OAUTH, client_id, &denied)
-        .await;
+    let _ = crate::access::set_denials(
+        &state.db,
+        &user.id,
+        crate::access::OAUTH,
+        client_id,
+        &denied,
+    )
+    .await;
     audit_ok("client.access", &user, &headers, client_id);
     Redirect::to("/account").into_response()
 }
@@ -2321,17 +2522,20 @@ pub async fn revoke_token(
     Form(form): Form<RevokeTokenForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("token.revoke", &user, &headers, form.token_id.trim(), "csrf");
+        audit_denied(
+            "token.revoke",
+            &user,
+            &headers,
+            form.token_id.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     let _ = crate::tokens::revoke(&state.db, &user.id, form.token_id.trim()).await;
     // Drop any backend-access denials for the now-deleted token.
-    let _ = crate::access::clear_for_credential(
-        &state.db,
-        crate::access::PAT,
-        form.token_id.trim(),
-    )
-    .await;
+    let _ =
+        crate::access::clear_for_credential(&state.db, crate::access::PAT, form.token_id.trim())
+            .await;
     audit_ok("token.revoke", &user, &headers, form.token_id.trim());
     Redirect::to("/account").into_response()
 }
@@ -2359,7 +2563,13 @@ pub async fn save_git_credential(
     Form(form): Form<SaveGitCredentialForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("git_credential.set", &user, &headers, form.host.trim(), "csrf");
+        audit_denied(
+            "git_credential.set",
+            &user,
+            &headers,
+            form.host.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     match crate::gitcreds::upsert(
@@ -2457,7 +2667,11 @@ fn access_form(
     }
     let mut boxes = String::new();
     for i in instances {
-        let checked = if denied.contains(&i.id) { "" } else { " checked" };
+        let checked = if denied.contains(&i.id) {
+            ""
+        } else {
+            " checked"
+        };
         boxes.push_str(&format!(
             r#"<label class="checkbox"><input type="checkbox" name="allow_{id}" value="on"{checked}> <code>{ns}</code></label>"#,
             id = esc(&i.id),
@@ -2503,7 +2717,13 @@ pub async fn remove_passkey(
     Form(form): Form<RemovePasskeyForm>,
 ) -> Response {
     if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
-        audit_denied("passkey.remove", &user, &headers, form.cred_id.trim(), "csrf");
+        audit_denied(
+            "passkey.remove",
+            &user,
+            &headers,
+            form.cred_id.trim(),
+            "csrf",
+        );
         return forbidden();
     }
     // Never let a user remove their last passkey — that is an unrecoverable
@@ -2830,7 +3050,9 @@ async fn resolve_admin_target(
         return Err(error_page("you cannot act on your own account here"));
     }
     if target.is_admin && users::count_admins(&state.db).await.unwrap_or(0) <= 1 {
-        return Err(error_page("cannot disable or delete the last administrator"));
+        return Err(error_page(
+            "cannot disable or delete the last administrator",
+        ));
     }
     Ok(target)
 }
@@ -2843,10 +3065,11 @@ pub async fn disable_user(
     headers: HeaderMap,
     Form(form): Form<UserActionForm>,
 ) -> Response {
-    let target = match resolve_admin_target(&state, &admin, &jar, &headers, "user.disable", &form).await {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
+    let target =
+        match resolve_admin_target(&state, &admin, &jar, &headers, "user.disable", &form).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
     if let Err(e) = deactivate_user(&state, &target.id).await {
         audit_denied("user.disable", &admin, &headers, &target.handle, "error");
         return error_page(&e.to_string());
@@ -2863,10 +3086,11 @@ pub async fn enable_user(
     headers: HeaderMap,
     Form(form): Form<UserActionForm>,
 ) -> Response {
-    let target = match resolve_admin_target(&state, &admin, &jar, &headers, "user.enable", &form).await {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
+    let target =
+        match resolve_admin_target(&state, &admin, &jar, &headers, "user.enable", &form).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
     let _ = users::set_disabled(&state.db, &target.id, false).await;
     audit_ok("user.enable", &admin, &headers, &target.handle);
     Redirect::to("/users").into_response()
@@ -2880,10 +3104,11 @@ pub async fn delete_user(
     headers: HeaderMap,
     Form(form): Form<UserActionForm>,
 ) -> Response {
-    let target = match resolve_admin_target(&state, &admin, &jar, &headers, "user.delete", &form).await {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
+    let target =
+        match resolve_admin_target(&state, &admin, &jar, &headers, "user.delete", &form).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
     if let Err(e) = purge_user(&state, &target.id).await {
         audit_denied("user.delete", &admin, &headers, &target.handle, "error");
         return error_page(&e.to_string());
@@ -2998,17 +3223,14 @@ mod tests {
             .build();
         let mut schema = serde_json::Map::new();
         schema.insert("type".into(), serde_json::Value::String("object".into()));
-        let tool = rmcp::model::Tool::new(
-            "search",
-            "Find <things> fast",
-            std::sync::Arc::new(schema),
-        )
-        .annotate(
-            rmcp::model::ToolAnnotations::new()
-                .read_only(true)
-                .idempotent(true)
-                .open_world(false),
-        );
+        let tool =
+            rmcp::model::Tool::new("search", "Find <things> fast", std::sync::Arc::new(schema))
+                .annotate(
+                    rmcp::model::ToolAnnotations::new()
+                        .read_only(true)
+                        .idempotent(true)
+                        .open_world(false),
+                );
         let snap = CapabilitiesSnapshot {
             fetched_at: 0,
             server,
@@ -3019,18 +3241,36 @@ mod tests {
         };
 
         let html = render_snapshot(&snap, "demo");
-        assert!(html.contains("demo &lt;server&gt;"), "server name escaped: {html}");
+        assert!(
+            html.contains("demo &lt;server&gt;"),
+            "server name escaped: {html}"
+        );
         assert!(html.contains("1.2.3"));
         assert!(html.contains("Use the tools wisely."));
         assert!(html.contains("Tools (1)"));
         assert!(html.contains("<code>search</code>"));
         assert!(html.contains("Find &lt;things&gt; fast"));
-        assert!(html.contains("&quot;type&quot;: &quot;object&quot;"), "schema rendered: {html}");
-        assert!(html.contains("<code>demo__&lt;name&gt;</code>"), "namespacing note present");
+        assert!(
+            html.contains("&quot;type&quot;: &quot;object&quot;"),
+            "schema rendered: {html}"
+        );
+        assert!(
+            html.contains("<code>demo__&lt;name&gt;</code>"),
+            "namespacing note present"
+        );
         // Annotation hints render as color-coded chips in the tool summary.
-        assert!(html.contains(r#"<span class="badge ann-safe">read-only</span>"#), "read-only chip: {html}");
-        assert!(html.contains(r#"<span class="badge ann-neutral">idempotent</span>"#), "idempotent chip: {html}");
-        assert!(html.contains(r#"<span class="badge ann-neutral">closed world</span>"#), "closed-world chip: {html}");
+        assert!(
+            html.contains(r#"<span class="badge ann-safe">read-only</span>"#),
+            "read-only chip: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="badge ann-neutral">idempotent</span>"#),
+            "idempotent chip: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="badge ann-neutral">closed world</span>"#),
+            "closed-world chip: {html}"
+        );
         // Prompts/resources capabilities are absent → marked unsupported.
         assert!(html.contains("Prompts (0)"));
         assert!(html.contains("Not supported by this server."));

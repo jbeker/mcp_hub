@@ -26,7 +26,10 @@ const RES_URI: &str = "mock://greeting";
 
 /// Sleep for the number of milliseconds named by `var`, if set and non-zero.
 async fn env_delay(var: &str) {
-    let ms = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let ms = std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     if ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
@@ -56,7 +59,10 @@ impl Mock {
     }
 
     #[tool(description = "Echo a message back, optionally prefixed by MOCK_PREFIX")]
-    async fn echo(&self, Parameters(args): Parameters<EchoArgs>) -> Result<CallToolResult, McpError> {
+    async fn echo(
+        &self,
+        Parameters(args): Parameters<EchoArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let prefix = std::env::var("MOCK_PREFIX").unwrap_or_default();
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{prefix}{}",
@@ -64,8 +70,13 @@ impl Mock {
         ))]))
     }
 
-    #[tool(description = "Sleep for `ms` milliseconds before replying (used to test call timeouts)")]
-    async fn sleep(&self, Parameters(args): Parameters<SleepArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Sleep for `ms` milliseconds before replying (used to test call timeouts)"
+    )]
+    async fn sleep(
+        &self,
+        Parameters(args): Parameters<SleepArgs>,
+    ) -> Result<CallToolResult, McpError> {
         tokio::time::sleep(std::time::Duration::from_millis(args.ms)).await;
         Ok(CallToolResult::success(vec![ContentBlock::text("slept")]))
     }
@@ -151,13 +162,11 @@ impl ServerHandler for Mock {
         if request.name != "hello" {
             return Err(McpError::invalid_params("no such prompt", None));
         }
-        Ok(
-            GetPromptResult::new(vec![PromptMessage::new_text(
-                Role::User,
-                "Say hello to the user.",
-            )])
-            .with_description("A greeting prompt"),
-        )
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            Role::User,
+            "Say hello to the user.",
+        )])
+        .with_description("A greeting prompt"))
     }
 }
 

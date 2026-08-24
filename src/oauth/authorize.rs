@@ -66,7 +66,10 @@ fn error_page(msg: &str) -> Response {
 /// the base `/mcp` endpoint, `Ok(Some(slug))` for a syntactically valid group
 /// endpoint `/mcp/<slug>`, `Err(())` for anything else. A trailing slash is
 /// tolerated (some clients normalize URLs that way).
-fn resource_group_slug(resource: &str, config: &crate::config::Config) -> Result<Option<String>, ()> {
+fn resource_group_slug(
+    resource: &str,
+    config: &crate::config::Config,
+) -> Result<Option<String>, ()> {
     let resource = resource.trim_end_matches('/');
     if resource == config.mcp_url() {
         return Ok(None);
@@ -202,7 +205,12 @@ pub async fn authorize(
     let csrf = crate::auth::session::csrf_field(&jar, &state.config.master_key);
     (
         jar,
-        Html(consent_html(&client_name, &pending.scope, &user.handle, &csrf)),
+        Html(consent_html(
+            &client_name,
+            &pending.scope,
+            &user.handle,
+            &csrf,
+        )),
     )
         .into_response()
 }
@@ -255,7 +263,10 @@ pub async fn decision(
             .denied("declined");
         return (
             jar,
-            redirect_with(&pending.redirect_uri, &[("error", "access_denied"), ("state", st)]),
+            redirect_with(
+                &pending.redirect_uri,
+                &[("error", "access_denied"), ("state", st)],
+            ),
         )
             .into_response();
     }
@@ -326,7 +337,9 @@ fn urlencode(s: &str) -> String {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn consent_html(client_name: &str, scope: &str, handle: &str, csrf: &str) -> String {

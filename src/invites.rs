@@ -57,14 +57,16 @@ pub async fn create(pool: &SqlitePool, created_by: &str, note: &str) -> Result<(
     let code = generate_code();
     let code_hash = token_hash(&code);
     let created_at = now_unix();
-    sqlx::query("INSERT INTO invites (code_hash, note, created_by, created_at) VALUES (?, ?, ?, ?)")
-        .bind(&code_hash)
-        .bind(note)
-        .bind(created_by)
-        .bind(created_at)
-        .execute(pool)
-        .await
-        .context("inserting invite")?;
+    sqlx::query(
+        "INSERT INTO invites (code_hash, note, created_by, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&code_hash)
+    .bind(note)
+    .bind(created_by)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .context("inserting invite")?;
     Ok((
         code,
         Invite {
@@ -134,11 +136,7 @@ pub async fn is_redeemable(pool: &SqlitePool, code: &str) -> Result<bool> {
 }
 
 /// Whether a code is an unused recovery code for `user_id` specifically.
-pub async fn is_recovery_redeemable(
-    pool: &SqlitePool,
-    code: &str,
-    user_id: &str,
-) -> Result<bool> {
+pub async fn is_recovery_redeemable(pool: &SqlitePool, code: &str, user_id: &str) -> Result<bool> {
     let hash = token_hash(code.trim());
     let (n,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM invites \
@@ -215,14 +213,13 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<Invite>> {
 pub async fn revoke(pool: &SqlitePool, short_id: &str) -> Result<bool> {
     // Match on the hash prefix via substr so base64url characters (`-`, `_`)
     // are compared literally rather than as LIKE wildcards.
-    let res = sqlx::query(
-        "DELETE FROM invites WHERE used_at IS NULL AND substr(code_hash, 1, ?) = ?",
-    )
-    .bind(short_id.len() as i64)
-    .bind(short_id)
-    .execute(pool)
-    .await
-    .context("revoking invite")?;
+    let res =
+        sqlx::query("DELETE FROM invites WHERE used_at IS NULL AND substr(code_hash, 1, ?) = ?")
+            .bind(short_id.len() as i64)
+            .bind(short_id)
+            .execute(pool)
+            .await
+            .context("revoking invite")?;
     Ok(res.rows_affected() >= 1)
 }
 
@@ -281,12 +278,18 @@ mod tests {
         // A recovery code is not usable as a registration invite...
         assert!(!is_redeemable(&pool, &code).await.unwrap());
         // ...and only for its target user, not anyone else.
-        assert!(is_recovery_redeemable(&pool, &code, &target.id).await.unwrap());
-        assert!(!is_recovery_redeemable(&pool, &code, &admin.id).await.unwrap());
+        assert!(is_recovery_redeemable(&pool, &code, &target.id)
+            .await
+            .unwrap());
+        assert!(!is_recovery_redeemable(&pool, &code, &admin.id)
+            .await
+            .unwrap());
 
         // Single use.
         redeem(&pool, &code, &target.id).await.unwrap();
-        assert!(!is_recovery_redeemable(&pool, &code, &target.id).await.unwrap());
+        assert!(!is_recovery_redeemable(&pool, &code, &target.id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -300,7 +303,9 @@ mod tests {
             .unwrap();
         let (code, _) = create(&pool, &admin.id, "").await.unwrap();
         assert!(is_redeemable(&pool, &code).await.unwrap());
-        assert!(!is_recovery_redeemable(&pool, &code, &user.id).await.unwrap());
+        assert!(!is_recovery_redeemable(&pool, &code, &user.id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -323,6 +328,8 @@ mod tests {
         assert!(!revoke(&pool, spent_inv.short_id()).await.unwrap());
 
         let all = list(&pool).await.unwrap();
-        assert!(all.iter().any(|i| i.used() && i.code_hash == spent_inv.code_hash));
+        assert!(all
+            .iter()
+            .any(|i| i.used() && i.code_hash == spent_inv.code_hash));
     }
 }

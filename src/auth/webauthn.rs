@@ -25,8 +25,8 @@ use webauthn_rs::prelude::{
 
 use crate::auth::session;
 use crate::auth::AuthUser;
-use crate::{invites, users};
 use crate::AppState;
+use crate::{invites, users};
 
 /// Name of the short-lived signed cookie tracking an in-flight ceremony.
 const CEREMONY_COOKIE: &str = "hub_ceremony";
@@ -465,9 +465,14 @@ pub async fn register_finish(
         .await
         .map_err(ApiError::from)?;
 
-    let sid = session::create(&state.db, &user_id, &info, state.config.session_idle_ttl_secs)
-        .await
-        .map_err(ApiError::from)?;
+    let sid = session::create(
+        &state.db,
+        &user_id,
+        &info,
+        state.config.session_idle_ttl_secs,
+    )
+    .await
+    .map_err(ApiError::from)?;
     let secure = state.config.cookie_secure();
     let redirect = session::take_next(&jar);
     let jar = jar
@@ -577,12 +582,7 @@ pub async fn login_finish(
     }
 
     // Record where this passkey was last used (best-effort; failure is non-fatal).
-    let _ = users::touch_credential(
-        &state.db,
-        result.cred_id().as_ref(),
-        &info,
-    )
-    .await;
+    let _ = users::touch_credential(&state.db, result.cred_id().as_ref(), &info).await;
 
     let sid = session::create(
         &state.db,
@@ -591,7 +591,7 @@ pub async fn login_finish(
         state.config.session_idle_ttl_secs,
     )
     .await
-        .map_err(ApiError::from)?;
+    .map_err(ApiError::from)?;
     let handle = users::find_by_id(&state.db, &ceremony.user_id)
         .await
         .ok()
@@ -630,9 +630,15 @@ pub async fn logout(
         return (StatusCode::FORBIDDEN, "invalid security token").into_response();
     }
     let info = super::RequestInfo::from_headers(&headers);
-    if let Some(sid) = jar.get(session::SESSION_COOKIE).map(|c| c.value().to_string()) {
+    if let Some(sid) = jar
+        .get(session::SESSION_COOKIE)
+        .map(|c| c.value().to_string())
+    {
         // Resolve the actor before deleting the session, for the audit log.
-        let user = session::user_for_session(&state.db, &sid).await.ok().flatten();
+        let user = session::user_for_session(&state.db, &sid)
+            .await
+            .ok()
+            .flatten();
         let _ = session::delete(&state.db, &sid).await;
         if let Some(u) = user {
             crate::audit::event("auth.logout")

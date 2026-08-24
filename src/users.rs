@@ -29,12 +29,11 @@ pub async fn count(pool: &SqlitePool) -> Result<i64> {
 }
 
 pub async fn find_by_handle(pool: &SqlitePool, handle: &str) -> Result<Option<User>> {
-    let user = sqlx::query_as::<_, User>(&format!(
-        "SELECT {USER_COLS} FROM users WHERE handle = ?"
-    ))
-    .bind(handle)
-    .fetch_optional(pool)
-    .await?;
+    let user =
+        sqlx::query_as::<_, User>(&format!("SELECT {USER_COLS} FROM users WHERE handle = ?"))
+            .bind(handle)
+            .fetch_optional(pool)
+            .await?;
     Ok(user)
 }
 
@@ -65,11 +64,10 @@ pub async fn count_admins(pool: &SqlitePool) -> Result<i64> {
 
 /// The user's sandbox slot (a small stable per-user integer), if assigned.
 pub async fn sandbox_slot(pool: &SqlitePool, user_id: &str) -> Result<Option<i64>> {
-    let row: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT sandbox_uid FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT sandbox_uid FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.and_then(|(slot,)| slot))
 }
 
@@ -303,7 +301,11 @@ pub async fn count_credentials(pool: &SqlitePool, user_id: &str) -> Result<i64> 
 
 /// Delete one of a user's passkeys by its row id. Scoped to `user_id` so a user
 /// can only remove their own credentials. Returns whether a row was deleted.
-pub async fn delete_credential(pool: &SqlitePool, user_id: &str, cred_row_id: &str) -> Result<bool> {
+pub async fn delete_credential(
+    pool: &SqlitePool,
+    user_id: &str,
+    cred_row_id: &str,
+) -> Result<bool> {
     let res = sqlx::query("DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?")
         .bind(cred_row_id)
         .bind(user_id)
@@ -371,7 +373,9 @@ mod tests {
         assert_eq!(list_credentials(&pool, &u.id).await.unwrap().len(), 2);
 
         // Delete is scoped to the owner: another user cannot remove it.
-        assert!(!delete_credential(&pool, "someone-else", "c1").await.unwrap());
+        assert!(!delete_credential(&pool, "someone-else", "c1")
+            .await
+            .unwrap());
         assert_eq!(count_credentials(&pool, &u.id).await.unwrap(), 2);
 
         assert!(delete_credential(&pool, &u.id, "c1").await.unwrap());

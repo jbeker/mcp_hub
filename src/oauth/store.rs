@@ -109,7 +109,8 @@ pub struct PendingCode {
 /// (`auth::webauthn::insert_ceremony`): expired entries are evicted on
 /// insert, and a capacity bound keeps an authorize-spammer from growing
 /// memory unboundedly.
-pub type AuthCodeStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingCode>>>;
+pub type AuthCodeStore =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingCode>>>;
 
 /// Bound on codes awaiting exchange; far above any legitimate number of
 /// simultaneously in-flight logins.
@@ -128,7 +129,9 @@ pub fn insert_code(
     ttl_secs: i64,
 ) -> Result<()> {
     let now = now_unix();
-    let mut map = store.lock().map_err(|_| anyhow::anyhow!("auth code store poisoned"))?;
+    let mut map = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("auth code store poisoned"))?;
     map.retain(|_, c| c.expires_at > now);
     if map.len() >= AUTH_CODE_CAP {
         anyhow::bail!("too many authorizations in progress");
@@ -155,7 +158,9 @@ pub fn insert_code(
 /// expiry so a replay cannot reuse it; single-use is guaranteed by
 /// `HashMap::remove` under the store's mutex.
 pub fn take_code(store: &AuthCodeStore, code: &str) -> Result<Option<AuthCode>> {
-    let mut map = store.lock().map_err(|_| anyhow::anyhow!("auth code store poisoned"))?;
+    let mut map = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("auth code store poisoned"))?;
     Ok(map
         .remove(code)
         .filter(|c| c.expires_at >= now_unix())
@@ -553,7 +558,18 @@ mod tests {
     }
 
     fn seed_code(store: &AuthCodeStore, code: &str, ttl_secs: i64) {
-        insert_code(store, code, "c1", "u1", "https://x/cb", "chal", "", None, ttl_secs).unwrap();
+        insert_code(
+            store,
+            code,
+            "c1",
+            "u1",
+            "https://x/cb",
+            "chal",
+            "",
+            None,
+            ttl_secs,
+        )
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -601,8 +617,18 @@ mod tests {
             seed_code(&store, &format!("live{i}"), 300);
         }
         assert!(
-            insert_code(&store, "overflow", "c1", "u1", "https://x/cb", "chal", "", None, 300)
-                .is_err(),
+            insert_code(
+                &store,
+                "overflow",
+                "c1",
+                "u1",
+                "https://x/cb",
+                "chal",
+                "",
+                None,
+                300
+            )
+            .is_err(),
             "insert past the cap must be refused"
         );
         // But expired entries are evicted on insert, making room again.

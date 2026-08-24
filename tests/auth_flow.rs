@@ -19,7 +19,10 @@ fn test_config() -> Config {
         rp_id: "localhost".into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         db_path: String::new(),
-        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        env_dir: std::env::temp_dir()
+            .join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
         master_key: [7u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
@@ -107,9 +110,7 @@ async fn first_user_registration_issues_challenge() {
         .oneshot(
             Request::post("/auth/register/start")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"handle":"alice","display_name":"Alice"}"#,
-                ))
+                .body(Body::from(r#"{"handle":"alice","display_name":"Alice"}"#))
                 .unwrap(),
         )
         .await

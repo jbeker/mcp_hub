@@ -7,8 +7,8 @@
 //! endpoints at `/mcp/<slug>`. Tests that exercise backends create a group
 //! (slug "g" by convention) and connect there with a matching-audience token.
 
-use mcp_hub::instances::ServerDef;
 use mcp_hub::config::{Config, Limits};
+use mcp_hub::instances::ServerDef;
 use mcp_hub::oauth::store;
 use mcp_hub::{build_router, db, instances, users, AppState};
 use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
@@ -44,7 +44,10 @@ async fn spawn_hub_with_limits(limits: Limits) -> (String, AppState) {
         rp_id: "localhost".into(),
         listen: addr,
         db_path: String::new(),
-        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        env_dir: std::env::temp_dir()
+            .join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
         master_key: [1u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
@@ -118,7 +121,14 @@ async fn make_group(state: &AppState, user_id: &str, slug: &str, instance_ids: &
 fn group_token(state: &AppState, base: &str, user_id: &str, client: &str) -> String {
     state
         .signer
-        .issue_access_token(user_id, client, &format!("{base}/mcp/g"), "mcp", false, 3600)
+        .issue_access_token(
+            user_id,
+            client,
+            &format!("{base}/mcp/g"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap()
         .0
 }
@@ -161,7 +171,10 @@ async fn unbuilt_git_backend_is_skipped() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.iter().any(|n| n.starts_with("git__")), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("git__")),
+        "got {names:?}"
+    );
 
     // ...and it is reported as unbuilt (on the management endpoint) so the user
     // knows to run hub__update_server.
@@ -171,7 +184,11 @@ async fn unbuilt_git_backend_is_skipped() {
         .unwrap();
     let client = connect(&base, token).await;
     let listed = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -239,19 +256,35 @@ async fn git_credential_tools_never_echo_the_token() {
 
     let listed = call("hub__list_git_credentials", None).await;
     assert!(listed.contains("github.com"), "got {listed}");
-    assert!(listed.contains("x-access-token"), "blank username should default: {listed}");
+    assert!(
+        listed.contains("x-access-token"),
+        "blank username should default: {listed}"
+    );
     assert!(!listed.contains(TOKEN), "list leaked the token: {listed}");
 
     // The server listing names the matching host so a failed build is
     // diagnosable, but still carries no secret.
     let servers = call("hub__list_my_servers", None).await;
-    assert!(servers.contains("\"git_credential_host\":\"github.com\""), "got {servers}");
-    assert!(!servers.contains(TOKEN), "server list leaked the token: {servers}");
+    assert!(
+        servers.contains("\"git_credential_host\":\"github.com\""),
+        "got {servers}"
+    );
+    assert!(
+        !servers.contains(TOKEN),
+        "server list leaked the token: {servers}"
+    );
 
-    let deleted = call("hub__delete_git_credential", args(serde_json::json!({"host": "github.com"}))).await;
+    let deleted = call(
+        "hub__delete_git_credential",
+        args(serde_json::json!({"host": "github.com"})),
+    )
+    .await;
     assert!(deleted.contains("\"deleted\":true"), "got {deleted}");
     let listed = call("hub__list_git_credentials", None).await;
-    assert!(!listed.contains("github.com"), "credential survived deletion: {listed}");
+    assert!(
+        !listed.contains("github.com"),
+        "credential survived deletion: {listed}"
+    );
 
     let _ = client.cancel().await;
 }
@@ -295,17 +328,28 @@ async fn proxy_aggregates_a_stdio_backend() {
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
     // Management tools live on the base endpoint, not on groups.
-    assert!(!names.iter().any(|n| n.starts_with("hub__")), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("hub__")),
+        "got {names:?}"
+    );
 
     let result = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hello" })); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("mock__echo");
+            __p.arguments = args(serde_json::json!({ "msg": "hello" }));
+            __p
+        })
         .await
         .unwrap();
     let rendered = serde_json::to_string(&result.content).unwrap();
     assert!(rendered.contains("PFX:hello"), "got {rendered}");
 
     let bad = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("nope__tool"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("nope__tool");
+            __p.arguments = None;
+            __p
+        })
         .await;
     assert!(bad.is_err());
 
@@ -316,7 +360,11 @@ async fn proxy_aggregates_a_stdio_backend() {
         .unwrap();
     let mclient = connect(&base, token).await;
     let listed = mclient
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -368,7 +416,11 @@ async fn slow_backend_call_times_out() {
 
     // A 5s sleep under a 1s cap must come back as an error to the client.
     let result = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("mock__sleep"); __p.arguments = args(serde_json::json!({ "ms": 5000 })); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("mock__sleep");
+            __p.arguments = args(serde_json::json!({ "ms": 5000 }));
+            __p
+        })
         .await;
     assert!(result.is_err(), "slow call should time out, got {result:?}");
     assert!(
@@ -378,10 +430,16 @@ async fn slow_backend_call_times_out() {
 
     // A fast call on the same backend still succeeds (the cap is per-call).
     let ok = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("mock__sleep"); __p.arguments = args(serde_json::json!({ "ms": 0 })); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("mock__sleep");
+            __p.arguments = args(serde_json::json!({ "ms": 0 }));
+            __p
+        })
         .await
         .unwrap();
-    assert!(serde_json::to_string(&ok.content).unwrap().contains("slept"));
+    assert!(serde_json::to_string(&ok.content)
+        .unwrap()
+        .contains("slept"));
 
     let _ = client.cancel().await;
 }
@@ -427,7 +485,11 @@ async fn restart_reloads_backend_config_in_a_live_session() {
 
     async fn echo(client: &RunningService<RoleClient, ()>) -> String {
         let result = client
-            .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hi" })); __p })
+            .call_tool({
+                let mut __p = CallToolRequestParams::new("mock__echo");
+                __p.arguments = args(serde_json::json!({ "msg": "hi" }));
+                __p
+            })
             .await
             .unwrap();
         serde_json::to_string(&result.content).unwrap()
@@ -442,13 +504,19 @@ async fn restart_reloads_backend_config_in_a_live_session() {
         .await
         .unwrap();
     let still_old = echo(&client).await;
-    assert!(still_old.contains("PFX:hi"), "should not auto-reload: {still_old}");
+    assert!(
+        still_old.contains("PFX:hi"),
+        "should not auto-reload: {still_old}"
+    );
 
     // Bump the reload epoch (the Restart button) — the next request respawns
     // just this backend with the new config, over the same MCP session.
     state.bump_reload(&inst.id);
     let reloaded = echo(&client).await;
-    assert!(reloaded.contains("NEW:hi"), "should reload after restart: {reloaded}");
+    assert!(
+        reloaded.contains("NEW:hi"),
+        "should reload after restart: {reloaded}"
+    );
 
     let _ = client.cancel().await;
 }
@@ -497,7 +565,11 @@ async fn failed_backend_reports_error_status() {
         .unwrap();
     let mclient = connect(&base, token).await;
     let listed = mclient
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -510,7 +582,10 @@ async fn failed_backend_reports_error_status() {
 #[tokio::test]
 async fn proxy_aggregates_resources_and_prompts() {
     let exe = mock_server_path();
-    assert!(std::path::Path::new(&exe).exists(), "build mock_mcp_server first");
+    assert!(
+        std::path::Path::new(&exe).exists(),
+        "build mock_mcp_server first"
+    );
 
     let (base, state) = spawn_hub().await;
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
@@ -570,7 +645,11 @@ async fn proxy_aggregates_resources_and_prompts() {
     );
 
     let got = client
-        .get_prompt({ let mut __p = GetPromptRequestParams::new("mock__hello"); __p.arguments = None; __p })
+        .get_prompt({
+            let mut __p = GetPromptRequestParams::new("mock__hello");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let got_json = serde_json::to_string(&got.messages).unwrap();
@@ -588,7 +667,14 @@ async fn management_tools_over_mcp() {
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client", &format!("{base}/mcp"), "mcp", true, 3600)
+        .issue_access_token(
+            &user.id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            true,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
@@ -605,24 +691,36 @@ async fn management_tools_over_mcp() {
 
     // whoami returns the structured identity.
     let who = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__whoami"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__whoami");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     assert_eq!(who.structured_content.unwrap()["handle"], "alice");
 
     // Add a user-defined stdio server, set its env, then list it back.
     let added = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__add_server");
+            __p.arguments = args(serde_json::json!({
                 "namespace": "zbx", "transport": "stdio",
                 "command": "uvx zabbix-mcp-server", "display_name": "My Zabbix",
                 "env": {"ZABBIX_TOKEN": "s3cr3t"}
-            })); __p })
+            }));
+            __p
+        })
         .await
         .unwrap();
     assert_eq!(added.structured_content.unwrap()["added"], true);
 
     let listed = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -633,11 +731,21 @@ async fn management_tools_over_mcp() {
 
     // Replacing the env keeps only the new keys.
     client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__set_env"); __p.arguments = args(serde_json::json!({"namespace": "zbx", "env": {"ZABBIX_URL": "https://z/api"}})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__set_env");
+            __p.arguments = args(
+                serde_json::json!({"namespace": "zbx", "env": {"ZABBIX_URL": "https://z/api"}}),
+            );
+            __p
+        })
         .await
         .unwrap();
     let relisted = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let relisted_json = serde_json::to_string(&relisted.structured_content).unwrap();
@@ -646,7 +754,12 @@ async fn management_tools_over_mcp() {
 
     // Reserved namespace cannot be claimed via the management interface.
     let reserved = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({"namespace": "hub", "transport": "stdio", "command": "x"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__add_server");
+            __p.arguments =
+                args(serde_json::json!({"namespace": "hub", "transport": "stdio", "command": "x"}));
+            __p
+        })
         .await;
     let rejected = match reserved {
         Err(_) => true,
@@ -665,13 +778,24 @@ async fn admin_invite_tools_round_trip() {
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client", &format!("{base}/mcp"), "mcp", true, 3600)
+        .issue_access_token(
+            &user.id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            true,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
     // Generate an invite; the plaintext code is returned exactly once.
     let created = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_invite"); __p.arguments = args(serde_json::json!({"note": "for bob"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__create_invite");
+            __p.arguments = args(serde_json::json!({"note": "for bob"}));
+            __p
+        })
         .await
         .unwrap();
     let created = created.structured_content.unwrap();
@@ -684,7 +808,11 @@ async fn admin_invite_tools_round_trip() {
         .await
         .unwrap());
     let listed = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_invites"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_invites");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -695,7 +823,11 @@ async fn admin_invite_tools_round_trip() {
 
     // Revoke it; afterwards it is no longer redeemable.
     client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__revoke_invite"); __p.arguments = args(serde_json::json!({"id": id})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__revoke_invite");
+            __p.arguments = args(serde_json::json!({"id": id}));
+            __p
+        })
         .await
         .unwrap();
     assert!(!mcp_hub::invites::is_redeemable(&state.db, &code)
@@ -713,7 +845,14 @@ async fn personal_access_token_tools_round_trip() {
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user.id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
@@ -722,7 +861,11 @@ async fn personal_access_token_tools_round_trip() {
         .await
         .unwrap();
     let listed = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_tokens"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_tokens");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let listed_json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -733,7 +876,11 @@ async fn personal_access_token_tools_round_trip() {
 
     // Revoke it over MCP; afterwards it no longer authenticates.
     let revoked = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__revoke_token"); __p.arguments = args(serde_json::json!({"token_id": pat.id})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__revoke_token");
+            __p.arguments = args(serde_json::json!({"token_id": pat.id}));
+            __p
+        })
         .await
         .unwrap();
     assert_eq!(revoked.structured_content.unwrap()["revoked"], true);
@@ -789,14 +936,25 @@ async fn client_can_label_only_itself() {
     // Connect as client-a.
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client-a", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user.id,
+            "client-a",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
     // get_my_client returns client-a's own (empty) label + its registered name,
     // and never leaks client-b's label.
     let got = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__get_my_client"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__get_my_client");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let g = got.structured_content.unwrap();
@@ -807,7 +965,11 @@ async fn client_can_label_only_itself() {
 
     // set_my_client updates only client-a.
     let set = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__set_my_client"); __p.arguments = args(serde_json::json!({"name": "My Laptop", "note": "personal"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__set_my_client");
+            __p.arguments = args(serde_json::json!({"name": "My Laptop", "note": "personal"}));
+            __p
+        })
         .await
         .unwrap();
     assert_eq!(set.structured_content.unwrap()["name"], "My Laptop");
@@ -815,11 +977,15 @@ async fn client_can_label_only_itself() {
     // client-a's label changed; client-b's is untouched. The tool exposes no
     // argument to target another client, so client-b is unreachable from here.
     assert_eq!(
-        store::get_client_label(&state.db, &user.id, "client-a").await.unwrap(),
+        store::get_client_label(&state.db, &user.id, "client-a")
+            .await
+            .unwrap(),
         ("My Laptop".to_string(), "personal".to_string())
     );
     assert_eq!(
-        store::get_client_label(&state.db, &user.id, "client-b").await.unwrap(),
+        store::get_client_label(&state.db, &user.id, "client-b")
+            .await
+            .unwrap(),
         ("B custom".to_string(), "b note".to_string())
     );
 
@@ -839,13 +1005,20 @@ async fn self_service_client_tools_reject_personal_access_tokens() {
     let client = connect(&base, secret).await;
 
     let res = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__set_my_client"); __p.arguments = args(serde_json::json!({"name": "x"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__set_my_client");
+            __p.arguments = args(serde_json::json!({"name": "x"}));
+            __p
+        })
         .await;
     let rejected = match res {
         Err(_) => true,
         Ok(r) => r.is_error == Some(true),
     };
-    assert!(rejected, "a personal access token must not set a client label");
+    assert!(
+        rejected,
+        "a personal access token must not set a client label"
+    );
 
     let _ = client.cancel().await;
 }
@@ -854,7 +1027,10 @@ async fn self_service_client_tools_reject_personal_access_tokens() {
 /// connector group with slug "g"; returns (base, state, user_id, instance_id).
 async fn hub_with_mock_backend() -> (String, AppState, String, String) {
     let exe = mock_server_path();
-    assert!(std::path::Path::new(&exe).exists(), "build the mock example first");
+    assert!(
+        std::path::Path::new(&exe).exists(),
+        "build the mock example first"
+    );
     let (base, state) = spawn_hub().await;
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
@@ -884,7 +1060,14 @@ async fn denied_backend_is_hidden_from_oauth_client() {
     let (base, state, user_id, inst_id) = hub_with_mock_backend().await;
     let token = state
         .signer
-        .issue_access_token(&user_id, "client-x", &format!("{base}/mcp/g"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client-x",
+            &format!("{base}/mcp/g"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap()
         .0;
     let client = connect_at(&base, "/mcp/g", token).await;
@@ -900,9 +1083,15 @@ async fn denied_backend_is_hidden_from_oauth_client() {
     assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
 
     // Deny this client the mock backend.
-    mcp_hub::access::set_denials(&state.db, &user_id, mcp_hub::access::OAUTH, "client-x", &[inst_id])
-        .await
-        .unwrap();
+    mcp_hub::access::set_denials(
+        &state.db,
+        &user_id,
+        mcp_hub::access::OAUTH,
+        "client-x",
+        &[inst_id],
+    )
+    .await
+    .unwrap();
 
     // The backend's tool is now gone even though it is still a group member
     // (denials compose with group scoping).
@@ -913,11 +1102,18 @@ async fn denied_backend_is_hidden_from_oauth_client() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+    assert!(
+        !names.contains(&"mock__echo".to_string()),
+        "still listed: {names:?}"
+    );
 
     // And a direct call is refused.
     let blocked = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({ "msg": "hi" })); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("mock__echo");
+            __p.arguments = args(serde_json::json!({ "msg": "hi" }));
+            __p
+        })
         .await;
     assert!(blocked.is_err(), "denied backend call should fail");
 
@@ -943,9 +1139,15 @@ async fn denied_backend_is_hidden_from_pat() {
     assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
 
     // Deny this PAT the mock backend (exercises the pat_id credential path).
-    mcp_hub::access::set_denials(&state.db, &user_id, mcp_hub::access::PAT, &pat.id, &[inst_id])
-        .await
-        .unwrap();
+    mcp_hub::access::set_denials(
+        &state.db,
+        &user_id,
+        mcp_hub::access::PAT,
+        &pat.id,
+        &[inst_id],
+    )
+    .await
+    .unwrap();
 
     let names: Vec<String> = client
         .list_all_tools()
@@ -954,7 +1156,10 @@ async fn denied_backend_is_hidden_from_pat() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+    assert!(
+        !names.contains(&"mock__echo".to_string()),
+        "still listed: {names:?}"
+    );
 
     let _ = client.cancel().await;
 }
@@ -987,17 +1192,28 @@ async fn admin_can_disable_and_delete_users() {
 
     // The admin cannot disable themselves (last admin + self guard).
     let self_disable = admin_client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable_user"); __p.arguments = args(serde_json::json!({"handle": "alice"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__disable_user");
+            __p.arguments = args(serde_json::json!({"handle": "alice"}));
+            __p
+        })
         .await;
     let blocked = match self_disable {
         Err(_) => true,
         Ok(r) => r.is_error == Some(true),
     };
-    assert!(blocked, "admin must not disable their own/last-admin account");
+    assert!(
+        blocked,
+        "admin must not disable their own/last-admin account"
+    );
 
     // Disabling Bob revokes his proxy access immediately.
     admin_client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable_user"); __p.arguments = args(serde_json::json!({"handle": "bob"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__disable_user");
+            __p.arguments = args(serde_json::json!({"handle": "bob"}));
+            __p
+        })
         .await
         .unwrap();
     assert!(
@@ -1007,14 +1223,22 @@ async fn admin_can_disable_and_delete_users() {
 
     // Re-enabling restores access.
     admin_client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__enable_user"); __p.arguments = args(serde_json::json!({"handle": "bob"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__enable_user");
+            __p.arguments = args(serde_json::json!({"handle": "bob"}));
+            __p
+        })
         .await
         .unwrap();
     assert!(try_connect(&base, bob_token).await.is_ok());
 
     // Deleting Bob removes the account.
     admin_client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__delete_user"); __p.arguments = args(serde_json::json!({"handle": "bob"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__delete_user");
+            __p.arguments = args(serde_json::json!({"handle": "bob"}));
+            __p
+        })
         .await
         .unwrap();
     assert!(users::find_by_handle(&state.db, "bob")
@@ -1039,27 +1263,47 @@ async fn http_server_add_and_edit() {
 
     // Add an http server with its own URL — a bad URL is rejected.
     let bad = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({"namespace": "mem", "transport": "http", "url": "not-a-url"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__add_server");
+            __p.arguments = args(
+                serde_json::json!({"namespace": "mem", "transport": "http", "url": "not-a-url"}),
+            );
+            __p
+        })
         .await;
     assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
 
     client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__add_server"); __p.arguments = args(serde_json::json!({
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__add_server");
+            __p.arguments = args(serde_json::json!({
                 "namespace": "mem", "transport": "http",
                 "url": "https://memory.example.net/mcp",
                 "env": {"AUTHORIZATION": "Bearer t"}
-            })); __p })
+            }));
+            __p
+        })
         .await
         .unwrap();
 
     // Edit the URL.
     client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__edit_server"); __p.arguments = args(serde_json::json!({"namespace": "mem", "url": "https://other.example.net/mcp"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__edit_server");
+            __p.arguments = args(
+                serde_json::json!({"namespace": "mem", "url": "https://other.example.net/mcp"}),
+            );
+            __p
+        })
         .await
         .unwrap();
 
     let listed = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -1090,7 +1334,11 @@ fn mock_def() -> ServerDef {
 /// client, which is what proves (non-)reuse across sessions.
 async fn mock_pid(client: &RunningService<RoleClient, ()>, tool: &str) -> String {
     let result = client
-        .call_tool({ let mut __p = CallToolRequestParams::new(tool.to_string()); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new(tool.to_string());
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     serde_json::to_string(&result.content).unwrap()
@@ -1109,7 +1357,10 @@ async fn backend_pool_is_shared_across_sessions() {
 
     let b = connect_at(&base, "/mcp/g", token("client-b")).await;
     let pid_b = mock_pid(&b, "mock__pid").await;
-    assert_eq!(pid_a, pid_b, "second session should reuse the pooled backend");
+    assert_eq!(
+        pid_a, pid_b,
+        "second session should reuse the pooled backend"
+    );
     let _ = b.cancel().await;
 }
 
@@ -1159,7 +1410,10 @@ async fn hung_initialize_is_timed_out_and_skipped() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.iter().any(|n| n.starts_with("hang__")), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("hang__")),
+        "got {names:?}"
+    );
 
     let (token, _) = state
         .signer
@@ -1167,7 +1421,11 @@ async fn hung_initialize_is_timed_out_and_skipped() {
         .unwrap();
     let mclient = connect(&base, token).await;
     let listed = mclient
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_my_servers"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_my_servers");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -1189,9 +1447,16 @@ async fn hung_tools_list_is_skipped_not_fatal() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let inst = instances::create(&state.db, &user.id, None, Some(&mock_def()), "slowlist", "SlowList")
-        .await
-        .unwrap();
+    let inst = instances::create(
+        &state.db,
+        &user.id,
+        None,
+        Some(&mock_def()),
+        "slowlist",
+        "SlowList",
+    )
+    .await
+    .unwrap();
     instances::set_config_value(&state.db, &inst.id, "MOCK_LIST_DELAY_MS", "30000")
         .await
         .unwrap();
@@ -1207,7 +1472,10 @@ async fn hung_tools_list_is_skipped_not_fatal() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.iter().any(|n| n.starts_with("slowlist__")), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("slowlist__")),
+        "got {names:?}"
+    );
     assert!(
         t0.elapsed() < std::time::Duration::from_secs(10),
         "list should be cut off by the list timeout, took {:?}",
@@ -1222,15 +1490,27 @@ async fn hung_tools_list_is_skipped_not_fatal() {
 #[tokio::test]
 async fn idle_reap_retires_backends_and_next_request_rebinds() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
-    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+    let client = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
 
     let pid_before = mock_pid(&client, "mock__pid").await;
     let (users, backends) = state.backend_pool.reap_idle(std::time::Duration::ZERO);
-    assert_eq!((users, backends), (1, 1), "one pooled user with one backend");
+    assert_eq!(
+        (users, backends),
+        (1, 1),
+        "one pooled user with one backend"
+    );
 
     // Same live session: the next request rebinds against a fresh subprocess.
     let pid_after = mock_pid(&client, "mock__pid").await;
-    assert_ne!(pid_before, pid_after, "reap should have retired the old process");
+    assert_ne!(
+        pid_before, pid_after,
+        "reap should have retired the old process"
+    );
 
     let _ = client.cancel().await;
 }
@@ -1242,10 +1522,22 @@ async fn disable_and_enable_converge_in_live_sessions() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
     // Backend visibility is observed on the group endpoint; the disable/enable
     // management calls go through the base endpoint.
-    let gclient = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+    let gclient = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
     let (token, _) = state
         .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let mclient = connect(&base, token).await;
 
@@ -1261,18 +1553,32 @@ async fn disable_and_enable_converge_in_live_sessions() {
     assert!(list(&gclient).await.contains(&"mock__echo".to_string()));
 
     mclient
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__disable"); __p.arguments = args(serde_json::json!({"namespace": "mock"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__disable");
+            __p.arguments = args(serde_json::json!({"namespace": "mock"}));
+            __p
+        })
         .await
         .unwrap();
     let names = list(&gclient).await;
-    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+    assert!(
+        !names.contains(&"mock__echo".to_string()),
+        "still listed: {names:?}"
+    );
 
     mclient
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__enable"); __p.arguments = args(serde_json::json!({"namespace": "mock"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__enable");
+            __p.arguments = args(serde_json::json!({"namespace": "mock"}));
+            __p
+        })
         .await
         .unwrap();
     let names = list(&gclient).await;
-    assert!(names.contains(&"mock__echo".to_string()), "not back: {names:?}");
+    assert!(
+        names.contains(&"mock__echo".to_string()),
+        "not back: {names:?}"
+    );
 
     let _ = gclient.cancel().await;
     let _ = mclient.cancel().await;
@@ -1284,20 +1590,38 @@ async fn disable_and_enable_converge_in_live_sessions() {
 async fn warm_all_prewarms_backends_before_any_connection() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
     // A second user with no servers must not be warmed into an empty entry.
-    users::create(&state.db, "u2", "bob", "Bob", false).await.unwrap();
+    users::create(&state.db, "u2", "bob", "Bob", false)
+        .await
+        .unwrap();
 
     let (users, backends) = mcp_hub::proxy::pool::warm_all(&state).await;
-    assert_eq!((users, backends), (1, 1), "one user with one enabled server");
-    assert_eq!(state.backend_pool.counts(), (1, 1), "backend live before any client");
+    assert_eq!(
+        (users, backends),
+        (1, 1),
+        "one user with one enabled server"
+    );
+    assert_eq!(
+        state.backend_pool.counts(),
+        (1, 1),
+        "backend live before any client"
+    );
 
     // The pre-warmed subprocess is exactly what a new connection is handed…
-    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+    let client = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
     let pid_before = mock_pid(&client, "mock__pid").await;
 
     // …and a re-warm pass leaves the healthy backend untouched.
     let _ = mcp_hub::proxy::pool::warm_all(&state).await;
     let pid_after = mock_pid(&client, "mock__pid").await;
-    assert_eq!(pid_before, pid_after, "re-warm must not respawn a healthy backend");
+    assert_eq!(
+        pid_before, pid_after,
+        "re-warm must not respawn a healthy backend"
+    );
 
     let _ = client.cancel().await;
 }
@@ -1383,12 +1707,26 @@ async fn heartbeat_drops_wedged_backend_after_three_strikes() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    instances::create(&state.db, &user.id, None, Some(&mock_def()), "healthy", "Healthy")
-        .await
-        .unwrap();
-    let wedged = instances::create(&state.db, &user.id, None, Some(&mock_def()), "wedged", "Wedged")
-        .await
-        .unwrap();
+    instances::create(
+        &state.db,
+        &user.id,
+        None,
+        Some(&mock_def()),
+        "healthy",
+        "Healthy",
+    )
+    .await
+    .unwrap();
+    let wedged = instances::create(
+        &state.db,
+        &user.id,
+        None,
+        Some(&mock_def()),
+        "wedged",
+        "Wedged",
+    )
+    .await
+    .unwrap();
     // Initializes fine, but never answers tools/list inside the 1s cap.
     instances::set_config_value(&state.db, &wedged.id, "MOCK_LIST_DELAY_MS", "30000")
         .await
@@ -1408,7 +1746,11 @@ async fn heartbeat_drops_wedged_backend_after_three_strikes() {
     // The third strike drops it; the healthy backend is untouched.
     let (ok, failed) = mcp_hub::proxy::pool::exercise_all(&state).await;
     assert_eq!((ok, failed), (1, 1));
-    assert_eq!(state.backend_pool.counts(), (1, 1), "wedged backend dropped");
+    assert_eq!(
+        state.backend_pool.counts(),
+        (1, 1),
+        "wedged backend dropped"
+    );
 }
 
 /// The base `/mcp` endpoint serves only `hub__*` tools: no backend tools, no
@@ -1418,7 +1760,14 @@ async fn management_endpoint_serves_only_hub_tools() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
     let (token, _) = state
         .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
@@ -1429,7 +1778,10 @@ async fn management_endpoint_serves_only_hub_tools() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(names.iter().all(|n| n.starts_with("hub__")), "got {names:?}");
+    assert!(
+        names.iter().all(|n| n.starts_with("hub__")),
+        "got {names:?}"
+    );
     assert!(names.contains(&"hub__list_groups".to_string()));
 
     assert!(client.list_all_prompts().await.unwrap().is_empty());
@@ -1437,7 +1789,11 @@ async fn management_endpoint_serves_only_hub_tools() {
 
     // A backend tool call on /mcp is refused with a pointer at the groups.
     let res = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("mock__echo"); __p.arguments = args(serde_json::json!({"msg": "hi"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("mock__echo");
+            __p.arguments = args(serde_json::json!({"msg": "hi"}));
+            __p
+        })
         .await;
     assert!(
         format!("{:?}", res.unwrap_err()).contains("group"),
@@ -1451,7 +1807,12 @@ async fn management_endpoint_serves_only_hub_tools() {
 #[tokio::test]
 async fn group_endpoint_rejects_hub_tools() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
-    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+    let client = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
 
     let names: Vec<String> = client
         .list_all_tools()
@@ -1460,10 +1821,17 @@ async fn group_endpoint_rejects_hub_tools() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.iter().any(|n| n.starts_with("hub__")), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("hub__")),
+        "got {names:?}"
+    );
 
     let res = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__whoami"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__whoami");
+            __p.arguments = None;
+            __p
+        })
         .await;
     assert!(
         format!("{:?}", res.unwrap_err()).contains("/mcp"),
@@ -1479,12 +1847,24 @@ async fn group_endpoint_rejects_hub_tools() {
 async fn group_endpoint_scopes_to_members() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
     // A second backend NOT in group "g".
-    let other = instances::create(&state.db, &user_id, None, Some(&mock_def()), "other", "Other")
-        .await
-        .unwrap();
+    let other = instances::create(
+        &state.db,
+        &user_id,
+        None,
+        Some(&mock_def()),
+        "other",
+        "Other",
+    )
+    .await
+    .unwrap();
     make_group(&state, &user_id, "g2", &[other.id]).await;
 
-    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user_id, "client")).await;
+    let client = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
     let names: Vec<String> = client
         .list_all_tools()
         .await
@@ -1493,12 +1873,22 @@ async fn group_endpoint_scopes_to_members() {
         .map(|t| t.name.to_string())
         .collect();
     assert!(names.contains(&"mock__echo".to_string()), "got {names:?}");
-    assert!(!names.iter().any(|n| n.starts_with("other__")), "got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("other__")),
+        "got {names:?}"
+    );
 
     let blocked = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("other__echo"); __p.arguments = args(serde_json::json!({"msg": "hi"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("other__echo");
+            __p.arguments = args(serde_json::json!({"msg": "hi"}));
+            __p
+        })
         .await;
-    assert!(blocked.is_err(), "non-member backend must be uncallable via this group");
+    assert!(
+        blocked.is_err(),
+        "non-member backend must be uncallable via this group"
+    );
 
     let _ = client.cancel().await;
 }
@@ -1511,20 +1901,40 @@ async fn group_tokens_are_audience_isolated() {
     let g = group_token(&state, &base, &user_id, "client");
 
     assert!(try_connect_at(&base, "/mcp/g", g.clone()).await.is_ok());
-    assert!(try_connect_at(&base, "/mcp", g.clone()).await.is_err(), "group token on /mcp");
+    assert!(
+        try_connect_at(&base, "/mcp", g.clone()).await.is_err(),
+        "group token on /mcp"
+    );
     // "other" doesn't even exist — but the audience check already rejects it.
     assert!(try_connect_at(&base, "/mcp/other", g).await.is_err());
 
     let (m, _) = state
         .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
-    assert!(try_connect_at(&base, "/mcp/g", m.clone()).await.is_err(), "/mcp token on a group");
+    assert!(
+        try_connect_at(&base, "/mcp/g", m.clone()).await.is_err(),
+        "/mcp token on a group"
+    );
 
     // Right audience, but the slug doesn't exist for this user → 404 at bind.
     let (ghost, _) = state
         .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp/ghost"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp/ghost"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     assert!(try_connect_at(&base, "/mcp/ghost", ghost).await.is_err());
 }
@@ -1537,12 +1947,24 @@ async fn group_crud_round_trip_over_mcp() {
     let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
     let (token, _) = state
         .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
     let created = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_group"); __p.arguments = args(serde_json::json!({"slug": "work", "name": "Work", "servers": ["mock"]})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__create_group");
+            __p.arguments =
+                args(serde_json::json!({"slug": "work", "name": "Work", "servers": ["mock"]}));
+            __p
+        })
         .await
         .unwrap();
     let created = created.structured_content.unwrap();
@@ -1551,16 +1973,28 @@ async fn group_crud_round_trip_over_mcp() {
 
     // A bad slug and an unknown server namespace are rejected.
     let bad = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_group"); __p.arguments = args(serde_json::json!({"slug": "Bad Slug"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__create_group");
+            __p.arguments = args(serde_json::json!({"slug": "Bad Slug"}));
+            __p
+        })
         .await;
     assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
     let bad = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__create_group"); __p.arguments = args(serde_json::json!({"slug": "x1", "servers": ["nope"]})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__create_group");
+            __p.arguments = args(serde_json::json!({"slug": "x1", "servers": ["nope"]}));
+            __p
+        })
         .await;
     assert!(bad.is_err() || bad.unwrap().is_error == Some(true));
 
     let listed = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_groups"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_groups");
+            __p.arguments = None;
+            __p
+        })
         .await
         .unwrap();
     let json = serde_json::to_string(&listed.structured_content).unwrap();
@@ -1570,7 +2004,14 @@ async fn group_crud_round_trip_over_mcp() {
     // The new endpoint works with a matching-audience token.
     let (wt, _) = state
         .signer
-        .issue_access_token(&user_id, "client", &format!("{base}/mcp/work"), "mcp", false, 3600)
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp/work"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let wclient = connect_at(&base, "/mcp/work", wt.clone()).await;
     let names: Vec<String> = wclient
@@ -1584,7 +2025,11 @@ async fn group_crud_round_trip_over_mcp() {
 
     // Emptying the member set removes the backend from the live endpoint.
     client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__update_group"); __p.arguments = args(serde_json::json!({"slug": "work", "servers": []})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__update_group");
+            __p.arguments = args(serde_json::json!({"slug": "work", "servers": []}));
+            __p
+        })
         .await
         .unwrap();
     let names: Vec<String> = wclient
@@ -1594,11 +2039,18 @@ async fn group_crud_round_trip_over_mcp() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(!names.contains(&"mock__echo".to_string()), "still listed: {names:?}");
+    assert!(
+        !names.contains(&"mock__echo".to_string()),
+        "still listed: {names:?}"
+    );
 
     // Delete: the endpoint 404s for new work afterwards.
     client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__delete_group"); __p.arguments = args(serde_json::json!({"slug": "work"})); __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__delete_group");
+            __p.arguments = args(serde_json::json!({"slug": "work"}));
+            __p
+        })
         .await
         .unwrap();
     let _ = wclient.cancel().await;
@@ -1618,7 +2070,14 @@ async fn non_admin_cannot_use_admin_tools() {
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user.id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
     let client = connect(&base, token).await;
 
@@ -1634,7 +2093,11 @@ async fn non_admin_cannot_use_admin_tools() {
 
     // And invoking one directly is refused.
     let res = client
-        .call_tool({ let mut __p = CallToolRequestParams::new("hub__list_users"); __p.arguments = None; __p })
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__list_users");
+            __p.arguments = None;
+            __p
+        })
         .await;
     let refused = match res {
         Err(_) => true,

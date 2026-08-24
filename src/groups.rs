@@ -34,9 +34,7 @@ pub fn valid_slug(s: &str) -> bool {
         return false;
     }
     let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    alnum(bytes[0])
-        && alnum(bytes[bytes.len() - 1])
-        && bytes.iter().all(|&b| alnum(b) || b == b'-')
+    alnum(bytes[0]) && alnum(bytes[bytes.len() - 1]) && bytes.iter().all(|&b| alnum(b) || b == b'-')
 }
 
 /// All of a user's groups, in slug order.
@@ -198,7 +196,8 @@ mod tests {
     use crate::{db, instances, users};
 
     async fn pool() -> SqlitePool {
-        let path = std::env::temp_dir().join(format!("mcp_hub_groups_{}.db", crate::util::new_id()));
+        let path =
+            std::env::temp_dir().join(format!("mcp_hub_groups_{}.db", crate::util::new_id()));
         db::connect(path.to_str().unwrap()).await.unwrap()
     }
 
@@ -227,7 +226,17 @@ mod tests {
         for ok in ["a", "zabbix", "my-group-2", "0x", &"a".repeat(64)] {
             assert!(valid_slug(ok), "{ok} should be valid");
         }
-        for bad in ["", "-a", "a-", "A", "a_b", "a b", "a/b", "a.b", &"a".repeat(65)] {
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "A",
+            "a_b",
+            "a b",
+            "a/b",
+            "a.b",
+            &"a".repeat(65),
+        ] {
             assert!(!valid_slug(bad), "{bad} should be invalid");
         }
     }
@@ -235,37 +244,62 @@ mod tests {
     #[tokio::test]
     async fn crud_round_trip() {
         let pool = pool().await;
-        let u = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
+        let u = users::create(&pool, "u1", "alice", "Alice", false)
+            .await
+            .unwrap();
         let a = make_instance(&pool, &u.id, "a").await;
         let b = make_instance(&pool, &u.id, "b").await;
 
-        let g = create(&pool, &u.id, "monitoring", "Monitoring").await.unwrap();
-        assert_eq!(find_by_slug(&pool, &u.id, "monitoring").await.unwrap().unwrap().id, g.id);
+        let g = create(&pool, &u.id, "monitoring", "Monitoring")
+            .await
+            .unwrap();
+        assert_eq!(
+            find_by_slug(&pool, &u.id, "monitoring")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            g.id
+        );
         assert!(create(&pool, &u.id, "monitoring", "dup").await.is_err());
         assert!(create(&pool, &u.id, "Bad Slug", "").await.is_err());
 
-        set_members(&pool, &u.id, &g.id, &[a.clone(), b.clone()]).await.unwrap();
+        set_members(&pool, &u.id, &g.id, &[a.clone(), b.clone()])
+            .await
+            .unwrap();
         let members = member_instance_ids(&pool, &g.id).await.unwrap();
         assert!(members.contains(&a) && members.contains(&b));
 
         // Replacement semantics.
-        set_members(&pool, &u.id, &g.id, std::slice::from_ref(&b)).await.unwrap();
+        set_members(&pool, &u.id, &g.id, std::slice::from_ref(&b))
+            .await
+            .unwrap();
         let members = member_instance_ids(&pool, &g.id).await.unwrap();
         assert!(!members.contains(&a) && members.contains(&b));
 
         assert!(rename(&pool, &u.id, &g.id, "Renamed").await.unwrap());
-        assert_eq!(list_for_user(&pool, &u.id).await.unwrap()[0].name, "Renamed");
+        assert_eq!(
+            list_for_user(&pool, &u.id).await.unwrap()[0].name,
+            "Renamed"
+        );
 
         assert!(delete(&pool, &u.id, &g.id).await.unwrap());
-        assert!(find_by_slug(&pool, &u.id, "monitoring").await.unwrap().is_none());
+        assert!(find_by_slug(&pool, &u.id, "monitoring")
+            .await
+            .unwrap()
+            .is_none());
         assert!(member_instance_ids(&pool, &g.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn ownership_guards_and_per_user_slugs() {
         let pool = pool().await;
-        let u1 = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
-        let u2 = users::create(&pool, "u2", "bob", "Bob", false).await.unwrap();
+        let u1 = users::create(&pool, "u1", "alice", "Alice", false)
+            .await
+            .unwrap();
+        let u2 = users::create(&pool, "u2", "bob", "Bob", false)
+            .await
+            .unwrap();
         let mine = make_instance(&pool, &u1.id, "mine").await;
         let theirs = make_instance(&pool, &u2.id, "theirs").await;
 
@@ -273,14 +307,34 @@ mod tests {
         let g1 = create(&pool, &u1.id, "shared", "").await.unwrap();
         let g2 = create(&pool, &u2.id, "shared", "").await.unwrap();
         assert_ne!(g1.id, g2.id);
-        assert_eq!(find_by_slug(&pool, &u1.id, "shared").await.unwrap().unwrap().id, g1.id);
-        assert_eq!(find_by_slug(&pool, &u2.id, "shared").await.unwrap().unwrap().id, g2.id);
+        assert_eq!(
+            find_by_slug(&pool, &u1.id, "shared")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            g1.id
+        );
+        assert_eq!(
+            find_by_slug(&pool, &u2.id, "shared")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            g2.id
+        );
 
         // Foreign instance ids are silently dropped; foreign groups are untouchable.
-        set_members(&pool, &u1.id, &g1.id, &[mine.clone(), theirs.clone()]).await.unwrap();
+        set_members(&pool, &u1.id, &g1.id, &[mine.clone(), theirs.clone()])
+            .await
+            .unwrap();
         let members = member_instance_ids(&pool, &g1.id).await.unwrap();
         assert!(members.contains(&mine) && !members.contains(&theirs));
-        assert!(set_members(&pool, &u2.id, &g1.id, std::slice::from_ref(&theirs)).await.is_err());
+        assert!(
+            set_members(&pool, &u2.id, &g1.id, std::slice::from_ref(&theirs))
+                .await
+                .is_err()
+        );
         assert!(!rename(&pool, &u2.id, &g1.id, "hacked").await.unwrap());
         assert!(!delete(&pool, &u2.id, &g1.id).await.unwrap());
 

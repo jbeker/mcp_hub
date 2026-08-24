@@ -250,7 +250,8 @@ impl UserBackends {
         // drop the rest, and claim (connecting + slot permit) what to spawn.
         let per_user_cap = state.config.limits.max_backends_per_user;
         let enabled_ids: HashSet<&str> = enabled.iter().map(|i| i.id.as_str()).collect();
-        let mut to_spawn: Vec<(instances::Instance, tokio::sync::OwnedSemaphorePermit)> = Vec::new();
+        let mut to_spawn: Vec<(instances::Instance, tokio::sync::OwnedSemaphorePermit)> =
+            Vec::new();
         let mut skipped: Vec<(instances::Instance, &'static str)> = Vec::new();
         {
             let mut inner = self.inner.lock().unwrap();
@@ -272,10 +273,7 @@ impl UserBackends {
                 }
                 let cur = state.reload_epoch(&inst.id);
                 let epoch_ok = inner.applied_epochs.get(&inst.id) == Some(&cur);
-                let pos = inner
-                    .backends
-                    .iter()
-                    .position(|b| b.instance_id == inst.id);
+                let pos = inner.backends.iter().position(|b| b.instance_id == inst.id);
                 if epoch_ok && pos.is_some_and(|p| !inner.backends[p].is_closed()) {
                     continue; // healthy and current
                 }
@@ -315,7 +313,12 @@ impl UserBackends {
             }
         }
         for (inst, reason) in &skipped {
-            mark_status(state, inst, crate::status::RuntimeState::Skipped, Some(reason));
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Skipped,
+                Some(reason),
+            );
         }
 
         // Spawn concurrently as detached tasks: each pushes itself into the
@@ -359,7 +362,10 @@ impl UserBackends {
         let wait = futures::future::join_all(handles);
         if budget == 0 {
             let _ = wait.await;
-        } else if tokio::time::timeout(Duration::from_secs(budget), wait).await.is_err() {
+        } else if tokio::time::timeout(Duration::from_secs(budget), wait)
+            .await
+            .is_err()
+        {
             late.store(true, Ordering::SeqCst); // stragglers announce themselves
         }
 
@@ -404,22 +410,35 @@ async fn spawn_one(
     let mut def = match instances::resolve_def(&state.db, inst).await {
         Ok(d) => d,
         Err(e) => {
-            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("resolve failed: {e:#}")));
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Error,
+                Some(&format!("resolve failed: {e:#}")),
+            );
             return None;
         }
     };
     if def.transport == "http" {
         let url = def.url.as_deref().unwrap_or("").trim();
         if url.is_empty() {
-            mark_status(state, inst, crate::status::RuntimeState::Error, Some("no remote URL set"));
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Error,
+                Some("no remote URL set"),
+            );
             return None;
         }
         // Re-resolve the host at connect time (not just at save) so the
         // SSRF guard also defeats DNS rebinding.
-        if let Err(e) =
-            instances::check_backend_host(url, state.config.block_private_backend_ips)
-        {
-            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("{e}")));
+        if let Err(e) = instances::check_backend_host(url, state.config.block_private_backend_ips) {
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Error,
+                Some(&format!("{e}")),
+            );
             return None;
         }
     }
@@ -449,19 +468,34 @@ async fn spawn_one(
                     def.args = args;
                 }
                 Err(e) => {
-                    mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("git launch failed: {e:#}")));
+                    mark_status(
+                        state,
+                        inst,
+                        crate::status::RuntimeState::Error,
+                        Some(&format!("git launch failed: {e:#}")),
+                    );
                     return None;
                 }
             }
         } else {
-            mark_status(state, inst, crate::status::RuntimeState::Unbuilt, Some("not built yet; run hub__update_server"));
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Unbuilt,
+                Some("not built yet; run hub__update_server"),
+            );
             return None;
         }
     }
     let env = match instances::resolved_env(&state.db, &state.secrets, inst).await {
         Ok(e) => e,
         Err(e) => {
-            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("config error: {e:#}")));
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Error,
+                Some(&format!("config error: {e:#}")),
+            );
             return None;
         }
     };
@@ -469,7 +503,12 @@ async fn spawn_one(
         match instances::resolved_config_file(&state.db, &state.secrets, &inst.id).await {
             Ok(c) => c,
             Err(e) => {
-                mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("config error: {e:#}")));
+                mark_status(
+                    state,
+                    inst,
+                    crate::status::RuntimeState::Error,
+                    Some(&format!("config error: {e:#}")),
+                );
                 return None;
             }
         };
@@ -508,7 +547,12 @@ async fn spawn_one(
                 error = %format!("{e:#}"),
                 "backend connect failed"
             );
-            mark_status(state, inst, crate::status::RuntimeState::Error, Some(&format!("failed to start: {e:#}")));
+            mark_status(
+                state,
+                inst,
+                crate::status::RuntimeState::Error,
+                Some(&format!("failed to start: {e:#}")),
+            );
             None
         }
     }
@@ -658,6 +702,11 @@ fn mark_status(
 /// Mark a run of instances skipped (capacity or sandbox kept them down).
 fn mark_skipped(state: &AppState, insts: &[instances::Instance], reason: &str) {
     for inst in insts {
-        mark_status(state, inst, crate::status::RuntimeState::Skipped, Some(reason));
+        mark_status(
+            state,
+            inst,
+            crate::status::RuntimeState::Skipped,
+            Some(reason),
+        );
     }
 }

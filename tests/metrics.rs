@@ -14,7 +14,10 @@ fn test_config() -> Config {
         rp_id: "localhost".into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         db_path: String::new(),
-        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        env_dir: std::env::temp_dir()
+            .join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
         master_key: [3u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
@@ -47,13 +50,18 @@ fn get_metrics(bearer: Option<&str>) -> Request<Body> {
 }
 
 async fn body_string(resp: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
 #[tokio::test]
 async fn metrics_without_key_is_401() {
-    let resp = app(test_state().await).oneshot(get_metrics(None)).await.unwrap();
+    let resp = app(test_state().await)
+        .oneshot(get_metrics(None))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -74,7 +82,10 @@ fn app(state: AppState) -> axum::Router {
 async fn metrics_with_key_serves_gauges_and_counters() {
     let state = test_state().await;
     let key = state.metrics_key.read().unwrap().clone();
-    assert!(key.starts_with("mcphub_metrics_"), "auto-generated on first start");
+    assert!(
+        key.starts_with("mcphub_metrics_"),
+        "auto-generated on first start"
+    );
 
     state.metrics.record_call(
         "alice",
@@ -93,9 +104,9 @@ async fn metrics_with_key_serves_gauges_and_counters() {
     let body = body_string(resp).await;
     assert!(body.contains("mcp_hub_backend_slots_total"));
     assert!(body.contains("mcp_hub_active_sessions"));
-    assert!(body.contains(
-        r#"mcp_hub_tool_calls_total{user="alice",server="github",tool="get_me"} 1"#
-    ));
+    assert!(
+        body.contains(r#"mcp_hub_tool_calls_total{user="alice",server="github",tool="get_me"} 1"#)
+    );
     assert!(body.contains(
         r#"mcp_hub_tool_call_duration_seconds_total{user="alice",server="github",tool="get_me"} 0.250000"#
     ));
@@ -115,8 +126,18 @@ async fn key_survives_restart_and_regenerate_invalidates_old() {
     let new_key = mcp_hub::metrics::regenerate_key(&state).await.unwrap();
     assert_ne!(key, new_key);
 
-    let resp = app(state.clone()).oneshot(get_metrics(Some(&key))).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "old key must stop working");
-    let resp = app(state).oneshot(get_metrics(Some(&new_key))).await.unwrap();
+    let resp = app(state.clone())
+        .oneshot(get_metrics(Some(&key)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "old key must stop working"
+    );
+    let resp = app(state)
+        .oneshot(get_metrics(Some(&new_key)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }

@@ -82,7 +82,10 @@ async fn idle_expired_session_is_rejected_and_deleted() {
         .await
         .unwrap();
     assert!(user.is_none(), "idle-expired session must not authenticate");
-    assert!(stamps(&pool, &sid).await.is_none(), "expired row is deleted");
+    assert!(
+        stamps(&pool, &sid).await.is_none(),
+        "expired row is deleted"
+    );
 }
 
 #[tokio::test]
@@ -99,8 +102,14 @@ async fn absolute_cap_rejects_session_older_than_the_cap() {
     let user = session::load_and_touch(&pool, &sid, IDLE, ABSOLUTE)
         .await
         .unwrap();
-    assert!(user.is_none(), "session past its absolute cap must not authenticate");
-    assert!(stamps(&pool, &sid).await.is_none(), "expired row is deleted");
+    assert!(
+        user.is_none(),
+        "session past its absolute cap must not authenticate"
+    );
+    assert!(
+        stamps(&pool, &sid).await.is_none(),
+        "expired row is deleted"
+    );
 }
 
 #[tokio::test]
@@ -116,7 +125,10 @@ async fn legacy_long_session_is_capped_down_on_first_use() {
     let user = session::load_and_touch(&pool, &sid, IDLE, ABSOLUTE)
         .await
         .unwrap();
-    assert!(user.is_some(), "a recent-login legacy session is still valid");
+    assert!(
+        user.is_some(),
+        "a recent-login legacy session is still valid"
+    );
 
     let (_, expires_after) = stamps(&pool, &sid).await.unwrap();
     assert!(

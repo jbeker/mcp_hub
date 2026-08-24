@@ -102,7 +102,8 @@ mod tests {
     use crate::{db, instances, users};
 
     async fn pool() -> SqlitePool {
-        let path = std::env::temp_dir().join(format!("mcp_hub_access_{}.db", crate::util::new_id()));
+        let path =
+            std::env::temp_dir().join(format!("mcp_hub_access_{}.db", crate::util::new_id()));
         db::connect(path.to_str().unwrap()).await.unwrap()
     }
 
@@ -129,31 +130,49 @@ mod tests {
     #[tokio::test]
     async fn set_get_clear_round_trip() {
         let pool = pool().await;
-        let u = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
+        let u = users::create(&pool, "u1", "alice", "Alice", false)
+            .await
+            .unwrap();
         let a = make_instance(&pool, &u.id, "a").await;
         let b = make_instance(&pool, &u.id, "b").await;
 
         // Default: nothing denied.
-        assert!(denied_instances(&pool, OAUTH, "client-1").await.unwrap().is_empty());
+        assert!(denied_instances(&pool, OAUTH, "client-1")
+            .await
+            .unwrap()
+            .is_empty());
 
-        set_denials(&pool, &u.id, OAUTH, "client-1", std::slice::from_ref(&a)).await.unwrap();
+        set_denials(&pool, &u.id, OAUTH, "client-1", std::slice::from_ref(&a))
+            .await
+            .unwrap();
         let denied = denied_instances(&pool, OAUTH, "client-1").await.unwrap();
         assert!(denied.contains(&a) && !denied.contains(&b));
 
         // Replacing overwrites the prior set.
-        set_denials(&pool, &u.id, OAUTH, "client-1", std::slice::from_ref(&b)).await.unwrap();
+        set_denials(&pool, &u.id, OAUTH, "client-1", std::slice::from_ref(&b))
+            .await
+            .unwrap();
         let denied = denied_instances(&pool, OAUTH, "client-1").await.unwrap();
         assert!(denied.contains(&b) && !denied.contains(&a));
 
-        clear_for_credential(&pool, OAUTH, "client-1").await.unwrap();
-        assert!(denied_instances(&pool, OAUTH, "client-1").await.unwrap().is_empty());
+        clear_for_credential(&pool, OAUTH, "client-1")
+            .await
+            .unwrap();
+        assert!(denied_instances(&pool, OAUTH, "client-1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn ignores_instances_not_owned_by_user() {
         let pool = pool().await;
-        let u1 = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
-        let u2 = users::create(&pool, "u2", "bob", "Bob", false).await.unwrap();
+        let u1 = users::create(&pool, "u1", "alice", "Alice", false)
+            .await
+            .unwrap();
+        let u2 = users::create(&pool, "u2", "bob", "Bob", false)
+            .await
+            .unwrap();
         let mine = make_instance(&pool, &u1.id, "mine").await;
         let theirs = make_instance(&pool, &u2.id, "theirs").await;
 

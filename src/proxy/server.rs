@@ -90,9 +90,10 @@ impl HubProxy {
     /// and the case for any request without a recognizable credential). Looked up
     /// per request so a user's toggle on the Account page takes effect immediately.
     async fn denied_instances(&self, ctx: &RequestContext<RoleServer>) -> HashSet<String> {
-        let cred = Self::authed(ctx)
-            .ok()
-            .and_then(|a| a.credential().map(|(t, id)| (t.to_string(), id.to_string())));
+        let cred = Self::authed(ctx).ok().and_then(|a| {
+            a.credential()
+                .map(|(t, id)| (t.to_string(), id.to_string()))
+        });
         match cred {
             Some((t, id)) => crate::access::denied_instances(&self.state.db, &t, &id)
                 .await
@@ -216,14 +217,16 @@ impl HubProxy {
         if let Ok(bytes) = serde_json::to_vec(value) {
             if bytes.len() > cap {
                 return Err(McpError::internal_error(
-                    format!("backend response of {} bytes exceeds the {mb} MB limit", bytes.len()),
+                    format!(
+                        "backend response of {} bytes exceeds the {mb} MB limit",
+                        bytes.len()
+                    ),
                     None,
                 ));
             }
         }
         Ok(())
     }
-
 }
 
 impl ServerHandler for HubProxy {
@@ -362,7 +365,9 @@ impl ServerHandler for HubProxy {
                     Ok(_) => None,
                 };
                 let user = if handle.is_empty() { &user_id } else { &handle };
-                self.state.metrics.record_call(user, "hub", op, t0.elapsed(), kind);
+                self.state
+                    .metrics
+                    .record_call(user, "hub", op, t0.elapsed(), kind);
                 return result;
             }
             McpEndpoint::Group { group_id, .. } => {
@@ -378,10 +383,7 @@ impl ServerHandler for HubProxy {
         let backends = self.group_backends(&context, &group_id).await?;
 
         let (ns, original) = request.name.split_once("__").ok_or_else(|| {
-            McpError::invalid_params(
-                "tool name must be namespaced as <server>__<tool>",
-                None,
-            )
+            McpError::invalid_params("tool name must be namespaced as <server>__<tool>", None)
         })?;
 
         let denied = self.denied_instances(&context).await;
@@ -402,16 +404,28 @@ impl ServerHandler for HubProxy {
             let guard = self.bound.lock().await;
             guard
                 .as_ref()
-                .map(|b| if b.handle.is_empty() { b.user_id.clone() } else { b.handle.clone() })
+                .map(|b| {
+                    if b.handle.is_empty() {
+                        b.user_id.clone()
+                    } else {
+                        b.handle.clone()
+                    }
+                })
                 .unwrap_or_default()
         };
         let t0 = std::time::Instant::now();
         let outcome = self
-            .with_call_timeout(&request.name, backend.call_tool(original.to_string(), request.arguments))
+            .with_call_timeout(
+                &request.name,
+                backend.call_tool(original.to_string(), request.arguments),
+            )
             .await;
         let elapsed = t0.elapsed();
-        let record =
-            |kind| self.state.metrics.record_call(&user, ns, original, elapsed, kind);
+        let record = |kind| {
+            self.state
+                .metrics
+                .record_call(&user, ns, original, elapsed, kind)
+        };
         let result = match outcome {
             // with_call_timeout's own error is always the call timeout.
             Err(e) => {
@@ -471,7 +485,10 @@ impl ServerHandler for HubProxy {
                 .iter()
                 .filter(|b| !denied.contains(&b.instance_id))
                 .map(|b| async move {
-                    (&b.namespace, self.with_list_timeout(b.list_namespaced_resources()).await)
+                    (
+                        &b.namespace,
+                        self.with_list_timeout(b.list_namespaced_resources()).await,
+                    )
                 }),
         )
         .await;
@@ -516,7 +533,8 @@ impl ServerHandler for HubProxy {
                 .map(|b| async move {
                     (
                         &b.namespace,
-                        self.with_list_timeout(b.list_namespaced_resource_templates()).await,
+                        self.with_list_timeout(b.list_namespaced_resource_templates())
+                            .await,
                     )
                 }),
         )
@@ -611,7 +629,10 @@ impl ServerHandler for HubProxy {
                 .iter()
                 .filter(|b| !denied.contains(&b.instance_id))
                 .map(|b| async move {
-                    (&b.namespace, self.with_list_timeout(b.list_namespaced_prompts()).await)
+                    (
+                        &b.namespace,
+                        self.with_list_timeout(b.list_namespaced_prompts()).await,
+                    )
                 }),
         )
         .await;
@@ -657,7 +678,10 @@ impl ServerHandler for HubProxy {
             })?;
         let t0 = std::time::Instant::now();
         let result = self
-            .with_call_timeout(&request.name, backend.get_prompt(original.to_string(), request.arguments))
+            .with_call_timeout(
+                &request.name,
+                backend.get_prompt(original.to_string(), request.arguments),
+            )
             .await?
             .map_err(|e| {
                 tracing::warn!(

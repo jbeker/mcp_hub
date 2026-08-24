@@ -16,7 +16,10 @@ fn test_config() -> Config {
         rp_id: "localhost".into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         db_path: String::new(),
-        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        env_dir: std::env::temp_dir()
+            .join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
         master_key: [9u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
@@ -58,8 +61,10 @@ fn signed_session_cookie(state: &AppState, sid: &str) -> String {
     use cookie::{Cookie, CookieJar};
     let key: cookie::Key = state.cookie_key.clone();
     let mut jar = CookieJar::new();
-    jar.signed_mut(&key)
-        .add(Cookie::new(session::SESSION_COOKIE.to_string(), sid.to_string()));
+    jar.signed_mut(&key).add(Cookie::new(
+        session::SESSION_COOKIE.to_string(),
+        sid.to_string(),
+    ));
     let c = jar.get(session::SESSION_COOKIE).unwrap();
     format!("{}={}", session::SESSION_COOKIE, c.value())
 }
@@ -72,7 +77,9 @@ fn set_cookie(resp: &axum::response::Response, name: &str) -> Option<String> {
         .filter_map(|v| v.to_str().ok())
         .find_map(|s| {
             let first = s.split(';').next()?;
-            first.starts_with(&format!("{name}=")).then(|| first.to_string())
+            first
+                .starts_with(&format!("{name}="))
+                .then(|| first.to_string())
         })
 }
 
@@ -92,7 +99,10 @@ async fn metadata_documents() {
     )
     .await;
     assert_eq!(as_meta["issuer"], BASE);
-    assert_eq!(as_meta["authorization_endpoint"], format!("{BASE}/authorize"));
+    assert_eq!(
+        as_meta["authorization_endpoint"],
+        format!("{BASE}/authorize")
+    );
     assert_eq!(as_meta["code_challenge_methods_supported"][0], "S256");
 
     let pr_meta = json_body(
@@ -163,8 +173,17 @@ async fn authorize_validates_group_resource_ownership() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    mcp_hub::groups::create(&state.db, &user.id, "work", "").await.unwrap();
-    let sid = session::create(&state.db, &user.id, &Default::default(), state.config.session_idle_ttl_secs).await.unwrap();
+    mcp_hub::groups::create(&state.db, &user.id, "work", "")
+        .await
+        .unwrap();
+    let sid = session::create(
+        &state.db,
+        &user.id,
+        &Default::default(),
+        state.config.session_idle_ttl_secs,
+    )
+    .await
+    .unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,
@@ -207,7 +226,10 @@ async fn authorize_validates_group_resource_ownership() {
         .await
         .unwrap();
     assert_eq!(bad.status(), StatusCode::SEE_OTHER);
-    assert!(bad.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+    assert!(bad.headers()["location"]
+        .to_str()
+        .unwrap()
+        .contains("error=invalid_target"));
 
     // A resource outside /mcp entirely is rejected as before.
     let alien = app(state.clone())
@@ -220,7 +242,10 @@ async fn authorize_validates_group_resource_ownership() {
         .await
         .unwrap();
     assert_eq!(alien.status(), StatusCode::SEE_OTHER);
-    assert!(alien.headers()["location"].to_str().unwrap().contains("error=invalid_target"));
+    assert!(alien.headers()["location"]
+        .to_str()
+        .unwrap()
+        .contains("error=invalid_target"));
 }
 
 /// A code minted for a group resource yields a token with the group audience.
@@ -230,9 +255,15 @@ async fn token_carries_group_resource_audience() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    store::create_client(&state.db, "c", None, &["http://x/cb".into()], &serde_json::json!({}))
-        .await
-        .unwrap();
+    store::create_client(
+        &state.db,
+        "c",
+        None,
+        &["http://x/cb".into()],
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
     let verifier = "group-audience-verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let challenge = b64url(&sha256(verifier.as_bytes()));
     store::insert_code(
@@ -262,7 +293,10 @@ async fn token_carries_group_resource_audience() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let access = json_body(resp).await["access_token"].as_str().unwrap().to_string();
+    let access = json_body(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // Verifies against the group audience, not the base endpoint's.
     state
         .signer
@@ -398,12 +432,28 @@ async fn token_rejects_wrong_pkce_verifier() {
     users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    store::create_client(&state.db, "c", None, &["http://x/cb".into()], &serde_json::json!({}))
-        .await
-        .unwrap();
+    store::create_client(
+        &state.db,
+        "c",
+        None,
+        &["http://x/cb".into()],
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
     let challenge = b64url(&sha256(b"the-real-verifier"));
-    store::insert_code(&state.auth_codes, "code2", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
-        .unwrap();
+    store::insert_code(
+        &state.auth_codes,
+        "code2",
+        "c",
+        "u1",
+        "http://x/cb",
+        &challenge,
+        "mcp",
+        None,
+        600,
+    )
+    .unwrap();
 
     let body = "grant_type=authorization_code&code=code2&client_id=c&redirect_uri=http://x/cb&code_verifier=WRONG";
     let resp = app(state)
@@ -425,13 +475,29 @@ async fn authorization_code_is_single_use() {
     users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    store::create_client(&state.db, "c", None, &["http://x/cb".into()], &serde_json::json!({}))
-        .await
-        .unwrap();
+    store::create_client(
+        &state.db,
+        "c",
+        None,
+        &["http://x/cb".into()],
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
     let verifier = "verifier-value-with-sufficient-length-aaaaaaaaaaaaaaaaaaaa";
     let challenge = b64url(&sha256(verifier.as_bytes()));
-    store::insert_code(&state.auth_codes, "once", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
-        .unwrap();
+    store::insert_code(
+        &state.auth_codes,
+        "once",
+        "c",
+        "u1",
+        "http://x/cb",
+        &challenge,
+        "mcp",
+        None,
+        600,
+    )
+    .unwrap();
 
     let mk = || {
         Request::post("/token")
@@ -454,7 +520,14 @@ async fn full_consent_flow_issues_and_exchanges_code() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let sid = session::create(&state.db, &user.id, &Default::default(), state.config.session_idle_ttl_secs).await.unwrap();
+    let sid = session::create(
+        &state.db,
+        &user.id,
+        &Default::default(),
+        state.config.session_idle_ttl_secs,
+    )
+    .await
+    .unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,
@@ -497,7 +570,10 @@ async fn full_consent_flow_issues_and_exchanges_code() {
             Request::post("/authorize/decision")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("cookie", format!("{session_header}; {authreq}"))
-                .body(Body::from(format!("decision=approve&csrf={}", urlencoding(&csrf))))
+                .body(Body::from(format!(
+                    "decision=approve&csrf={}",
+                    urlencoding(&csrf)
+                )))
                 .unwrap(),
         )
         .await
@@ -556,15 +632,31 @@ async fn refresh_token_reuse_revokes_the_family() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    store::create_client(&state.db, "c", None, &["http://x/cb".into()], &serde_json::json!({}))
-        .await
-        .unwrap();
+    store::create_client(
+        &state.db,
+        "c",
+        None,
+        &["http://x/cb".into()],
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
 
     // Mint an initial refresh token via the authorization_code grant.
     let verifier = "reuse-verifier-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let challenge = b64url(&sha256(verifier.as_bytes()));
-    store::insert_code(&state.auth_codes, "rc", "c", "u1", "http://x/cb", &challenge, "mcp", None, 600)
-        .unwrap();
+    store::insert_code(
+        &state.auth_codes,
+        "rc",
+        "c",
+        "u1",
+        "http://x/cb",
+        &challenge,
+        "mcp",
+        None,
+        600,
+    )
+    .unwrap();
     let _ = user;
     let tok = app(state.clone())
         .oneshot(
@@ -577,7 +669,10 @@ async fn refresh_token_reuse_revokes_the_family() {
         )
         .await
         .unwrap();
-    let r1 = json_body(tok).await["refresh_token"].as_str().unwrap().to_string();
+    let r1 = json_body(tok).await["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // First rotation succeeds and yields r2.
     let refresh = |rt: String| {
@@ -593,7 +688,10 @@ async fn refresh_token_reuse_revokes_the_family() {
     };
     let resp1 = refresh(r1.clone()).await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
-    let r2 = json_body(resp1).await["refresh_token"].as_str().unwrap().to_string();
+    let r2 = json_body(resp1).await["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Replaying the now-consumed r1 must be rejected (reuse detected)...
     let replay = refresh(r1).await.unwrap();
@@ -611,7 +709,14 @@ async fn consent_without_csrf_is_rejected() {
     let user = users::create(&state.db, "u1", "alice", "Alice", false)
         .await
         .unwrap();
-    let sid = session::create(&state.db, &user.id, &Default::default(), state.config.session_idle_ttl_secs).await.unwrap();
+    let sid = session::create(
+        &state.db,
+        &user.id,
+        &Default::default(),
+        state.config.session_idle_ttl_secs,
+    )
+    .await
+    .unwrap();
     let session_header = signed_session_cookie(&state, &sid);
     store::create_client(
         &state.db,

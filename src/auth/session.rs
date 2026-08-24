@@ -2,11 +2,11 @@
 //! authenticated user from them.
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, SameSite, SignedCookieJar};
+use base64::Engine;
 use sqlx::SqlitePool;
 use time::Duration as TimeDuration;
 
@@ -331,7 +331,10 @@ impl IntoResponse for LoginRedirect {
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = LoginRedirect;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, LoginRedirect> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, LoginRedirect> {
         let Some(sid) = session_id_from_parts(parts, state) else {
             return Err(LoginRedirect);
         };
@@ -382,7 +385,10 @@ mod tests {
     #[test]
     fn accepts_local_paths() {
         assert_eq!(safe_next("/").as_deref(), Some("/"));
-        assert_eq!(safe_next("/authorize?x=1").as_deref(), Some("/authorize?x=1"));
+        assert_eq!(
+            safe_next("/authorize?x=1").as_deref(),
+            Some("/authorize?x=1")
+        );
         assert_eq!(safe_next("/servers/abc").as_deref(), Some("/servers/abc"));
     }
 

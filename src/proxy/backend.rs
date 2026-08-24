@@ -110,8 +110,15 @@ impl Backend {
     ) -> Result<crate::instances::CapabilitiesSnapshot> {
         match def.transport.as_str() {
             "stdio" => {
-                let cmd =
-                    stdio_command(def, env, sandbox, env_dir, instance_id, config_file, child_limits)?;
+                let cmd = stdio_command(
+                    def,
+                    env,
+                    sandbox,
+                    env_dir,
+                    instance_id,
+                    config_file,
+                    child_limits,
+                )?;
                 // Pipe stderr so we can surface the child's own error output if
                 // it dies before answering `initialize`.
                 let (transport, stderr) = TokioChildProcess::builder(cmd)
@@ -327,10 +334,12 @@ async fn capture_snapshot(
                 tracing::warn!(error = %e, "listing resources for snapshot");
                 Vec::new()
             }),
-            peer.list_all_resource_templates().await.unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "listing resource templates for snapshot");
-                Vec::new()
-            }),
+            peer.list_all_resource_templates()
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "listing resource templates for snapshot");
+                    Vec::new()
+                }),
         )
     } else {
         (Vec::new(), Vec::new())
@@ -493,7 +502,9 @@ fn apply_child_limits(limits: crate::config::ChildLimits) -> std::io::Result<()>
 
 /// The per-instance working directory used to host a config file.
 fn workdir_path(env_dir: &str, instance_id: &str) -> std::path::PathBuf {
-    std::path::Path::new(env_dir).join("workdir").join(instance_id)
+    std::path::Path::new(env_dir)
+        .join("workdir")
+        .join(instance_id)
 }
 
 /// The per-instance HOME directory. Unlike [`workdir_path`] (recreated on every
@@ -694,7 +705,10 @@ mod tests {
         .await
         .expect_err("the probe command always exits 1");
         let msg = format!("{err:#}");
-        assert!(msg.contains("CONFIG_OK"), "config file/env not wired: {msg}");
+        assert!(
+            msg.contains("CONFIG_OK"),
+            "config file/env not wired: {msg}"
+        );
 
         // The file landed in the per-instance working directory.
         let file = env_dir.join("workdir").join("cfg-inst").join("config");
@@ -741,7 +755,10 @@ mod tests {
         .await
         .expect_err("the probe command always exits 1");
         let msg = format!("{err:#}");
-        assert!(msg.contains("ENVEXPAND_OK"), "env values not expanded: {msg}");
+        assert!(
+            msg.contains("ENVEXPAND_OK"),
+            "env values not expanded: {msg}"
+        );
         std::fs::remove_dir_all(&env_dir).ok();
     }
 
@@ -776,7 +793,10 @@ mod tests {
         .await
         .expect_err("the probe command always exits 1");
         let msg = format!("{err:#}");
-        assert!(msg.contains("RLIMIT_F="), "child did not report its limit: {msg}");
+        assert!(
+            msg.contains("RLIMIT_F="),
+            "child did not report its limit: {msg}"
+        );
         assert!(
             !msg.contains("RLIMIT_F=unlimited"),
             "file-size limit was not applied: {msg}"
@@ -811,8 +831,20 @@ mod tests {
         );
         // Each child saw a HOME under <env_dir>/home/<its own id> — and the two
         // differ, which is the whole point.
-        assert!(a.contains(&format!("HOME={}", env_dir.join("home").join("inst-a").display())), "{a}");
-        assert!(b.contains(&format!("HOME={}", env_dir.join("home").join("inst-b").display())), "{b}");
+        assert!(
+            a.contains(&format!(
+                "HOME={}",
+                env_dir.join("home").join("inst-a").display()
+            )),
+            "{a}"
+        );
+        assert!(
+            b.contains(&format!(
+                "HOME={}",
+                env_dir.join("home").join("inst-b").display()
+            )),
+            "{b}"
+        );
         // The directories are created and persist (not wiped between spawns).
         assert!(env_dir.join("home").join("inst-a").is_dir());
         assert!(env_dir.join("home").join("inst-b").is_dir());

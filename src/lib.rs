@@ -37,9 +37,9 @@ use webauthn_rs::Webauthn;
 
 use crate::auth::webauthn::{self as wa, AuthStore, RegStore};
 use crate::config::Config;
-use crate::oauth::{authorize, metadata, register, token};
 use crate::crypto::SecretBox;
 use crate::oauth::keys::Signer;
+use crate::oauth::{authorize, metadata, register, token};
 
 /// Shared application state handed to every request handler.
 #[derive(Clone)]
@@ -205,7 +205,10 @@ impl AppState {
     /// The absolute sandbox UID a given user's stdio subprocesses run as, or
     /// `None` if sandboxing is off (no base, not root, or no slot).
     pub async fn sandbox_uid(&self, user_id: &str) -> Option<u32> {
-        let slot = crate::users::sandbox_slot(&self.db, user_id).await.ok().flatten();
+        let slot = crate::users::sandbox_slot(&self.db, user_id)
+            .await
+            .ok()
+            .flatten();
         crate::sandbox::uid_for(self.config.sandbox_uid_base, slot)
     }
 
@@ -225,8 +228,10 @@ impl AppState {
         let slot = crate::users::sandbox_slot(&self.db, user_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("sandbox is required but the user has no UID slot"))?;
-        let uid = crate::sandbox::uid_for(self.config.sandbox_uid_base, Some(slot))
-            .ok_or_else(|| anyhow::anyhow!("sandbox is required but its UID could not be derived"))?;
+        let uid =
+            crate::sandbox::uid_for(self.config.sandbox_uid_base, Some(slot)).ok_or_else(|| {
+                anyhow::anyhow!("sandbox is required but its UID could not be derived")
+            })?;
         crate::sandbox::prepare(uid, &self.config.env_dir)
             .map(Some)
             .map_err(|e| anyhow::anyhow!("sandbox is required but could not be prepared: {e}"))
@@ -256,19 +261,37 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account", get(web::account_page))
         .route("/account/passkeys/add/start", post(wa::add_passkey_start))
         .route("/account/passkeys/remove", post(web::remove_passkey))
-        .route("/account/sessions/revoke-others", post(web::revoke_other_sessions))
+        .route(
+            "/account/sessions/revoke-others",
+            post(web::revoke_other_sessions),
+        )
         .route("/account/connections/revoke", post(web::revoke_connection))
-        .route("/account/connections/label", post(web::update_connection_label))
-        .route("/account/connections/access", post(web::update_connection_access))
+        .route(
+            "/account/connections/label",
+            post(web::update_connection_label),
+        )
+        .route(
+            "/account/connections/access",
+            post(web::update_connection_access),
+        )
         .route("/account/tokens/create", post(web::create_token))
         .route("/account/tokens/revoke", post(web::revoke_token))
         .route("/account/tokens/access", post(web::update_token_access))
-        .route("/account/git-credentials/save", post(web::save_git_credential))
-        .route("/account/git-credentials/delete", post(web::delete_git_credential))
+        .route(
+            "/account/git-credentials/save",
+            post(web::save_git_credential),
+        )
+        .route(
+            "/account/git-credentials/delete",
+            post(web::delete_git_credential),
+        )
         // User administration (admin)
         .route("/users", get(web::users_page))
         .route("/stats", get(web::stats_page))
-        .route("/stats/metrics-key/regenerate", post(web::regenerate_metrics_key))
+        .route(
+            "/stats/metrics-key/regenerate",
+            post(web::regenerate_metrics_key),
+        )
         .route("/users/disable", post(web::disable_user))
         .route("/users/enable", post(web::enable_user))
         .route("/users/delete", post(web::delete_user))
@@ -277,7 +300,10 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/servers/create", post(web::create_server))
         .route("/servers/{id}", get(web::server_detail))
         .route("/servers/{id}/capabilities", get(web::server_capabilities))
-        .route("/servers/{id}/capabilities/refresh", post(web::refresh_capabilities))
+        .route(
+            "/servers/{id}/capabilities/refresh",
+            post(web::refresh_capabilities),
+        )
         .route("/servers/{id}/config", post(web::save_config))
         .route("/servers/{id}/test", post(web::test_server))
         .route("/servers/{id}/enable", post(web::enable_server))

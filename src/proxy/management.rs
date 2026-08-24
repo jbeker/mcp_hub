@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 
 use crate::auth::RequestInfo;
 use crate::instances::{self, ServerDef};
-use crate::{invites, users};
 use crate::AppState;
+use crate::{invites, users};
 
 /// Who is making a management call, for authorization and audit logging.
 pub struct Caller<'a> {
@@ -28,7 +28,11 @@ pub struct Caller<'a> {
 /// Build the list of management tools available to the caller.
 pub fn tools(admin: bool) -> Vec<Tool> {
     let mut t = vec![
-        tool("hub__whoami", "Show the current user and their configured servers.", schema(json!({}), &[])),
+        tool(
+            "hub__whoami",
+            "Show the current user and their configured servers.",
+            schema(json!({}), &[]),
+        ),
         tool(
             "hub__list_my_servers",
             "List your configured servers, their launch command and status.",
@@ -303,27 +307,49 @@ pub fn tools(admin: bool) -> Vec<Tool> {
 fn annotations_for(name: &str) -> ToolAnnotations {
     let a = ToolAnnotations::new();
     match name {
-        "hub__whoami" | "hub__list_my_servers" | "hub__list_tokens"
-        | "hub__get_my_client" | "hub__runtime_stats" | "hub__list_users"
-        | "hub__list_invites" | "hub__list_groups" | "hub__list_git_credentials" => {
-            a.read_only(true).destructive(false).idempotent(true).open_world(false)
-        }
+        "hub__whoami"
+        | "hub__list_my_servers"
+        | "hub__list_tokens"
+        | "hub__get_my_client"
+        | "hub__runtime_stats"
+        | "hub__list_users"
+        | "hub__list_invites"
+        | "hub__list_groups"
+        | "hub__list_git_credentials" => a
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
         // Build from external git repos → open world.
-        "hub__add_server" | "hub__update_server" => {
-            a.read_only(false).destructive(false).idempotent(false).open_world(true)
-        }
+        "hub__add_server" | "hub__update_server" => a
+            .read_only(false)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(true),
         // Each returns a fresh one-time code → not idempotent.
-        "hub__create_invite" | "hub__create_recovery" => {
-            a.read_only(false).destructive(false).idempotent(false).open_world(false)
-        }
-        "hub__remove" | "hub__revoke_token" | "hub__revoke_invite"
-        | "hub__delete_user" | "hub__disable_user" | "hub__delete_group"
-        | "hub__delete_git_credential" => {
-            a.read_only(false).destructive(true).idempotent(true).open_world(false)
-        }
+        "hub__create_invite" | "hub__create_recovery" => a
+            .read_only(false)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(false),
+        "hub__remove"
+        | "hub__revoke_token"
+        | "hub__revoke_invite"
+        | "hub__delete_user"
+        | "hub__disable_user"
+        | "hub__delete_group"
+        | "hub__delete_git_credential" => a
+            .read_only(false)
+            .destructive(true)
+            .idempotent(true)
+            .open_world(false),
         // edit_server, set_env, set_config_file, enable, disable,
         // set_my_client, enable_user — and any future tool.
-        _ => a.read_only(false).destructive(false).idempotent(true).open_world(false),
+        _ => a
+            .read_only(false)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
     }
 }
 
@@ -474,7 +500,11 @@ fn action_for(op: &str) -> Option<&'static str> {
 /// the common argument keys.
 fn audit_object(args: &JsonObject) -> String {
     for key in ["namespace", "handle", "token_id", "slug", "host", "id"] {
-        if let Some(v) = args.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(v) = args
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             return v.to_string();
         }
     }
@@ -602,11 +632,13 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
         let def = instances::resolve_def(&state.db, &i).await.ok();
         // The exact launch command for stdio/git backends (None for http).
         let command = def.as_ref().and_then(|def| {
-            crate::gitsrc::resolved_command(&state.config.env_dir, &i, def).map(|(program, args)| {
-                let mut v = vec![program];
-                v.extend(args);
-                v
-            })
+            crate::gitsrc::resolved_command(&state.config.env_dir, &i, def).map(
+                |(program, args)| {
+                    let mut v = vec![program];
+                    v.extend(args);
+                    v
+                },
+            )
         });
         // Connection outcome from the in-memory registry; missing entry means
         // no attempt this process — same shape as the old column defaults.
@@ -644,7 +676,10 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
 fn def_from_args(args: &JsonObject, display_name: &str) -> Result<ServerDef, McpError> {
     let transport = req_str(args, "transport")?;
     if !matches!(transport.as_str(), "stdio" | "http") {
-        return Err(McpError::invalid_params("transport must be stdio or http", None));
+        return Err(McpError::invalid_params(
+            "transport must be stdio or http",
+            None,
+        ));
     }
     if transport == "http" {
         let url = req_str(args, "url")?;
@@ -720,9 +755,16 @@ async fn add_server(
     let def = def_from_args(args, &display_name)?;
     let env = env_from_args(args)?;
 
-    let inst = instances::create(&state.db, user_id, None, Some(&def), &namespace, &display_name)
-        .await
-        .map_err(bad_request)?;
+    let inst = instances::create(
+        &state.db,
+        user_id,
+        None,
+        Some(&def),
+        &namespace,
+        &display_name,
+    )
+    .await
+    .map_err(bad_request)?;
     instances::replace_env(&state.db, &state.secrets, &inst.id, &env)
         .await
         .map_err(internal)?;
@@ -744,7 +786,9 @@ async fn edit_server(
 ) -> Result<CallToolResult, McpError> {
     let namespace = req_str(args, "namespace")?;
     let inst = find_instance(state, user_id, &namespace).await?;
-    let mut def = instances::resolve_def(&state.db, &inst).await.map_err(internal)?;
+    let mut def = instances::resolve_def(&state.db, &inst)
+        .await
+        .map_err(internal)?;
 
     if let Some(line) = opt_str(args, "command") {
         let (command, cmd_args) = instances::parse_command(&line).map_err(bad_request)?;
@@ -923,10 +967,7 @@ async fn revoke_token(
 }
 
 /// `hub__list_git_credentials` — metadata only; the tokens are never returned.
-async fn list_git_credentials(
-    state: &AppState,
-    user_id: &str,
-) -> Result<CallToolResult, McpError> {
+async fn list_git_credentials(state: &AppState, user_id: &str) -> Result<CallToolResult, McpError> {
     let creds = crate::gitcreds::list_for_user(&state.db, user_id)
         .await
         .map_err(internal)?;
@@ -1217,9 +1258,9 @@ async fn instance_ids_from_args(
     let Some(v) = args.get("servers") else {
         return Ok(None);
     };
-    let list = v
-        .as_array()
-        .ok_or_else(|| McpError::invalid_params("'servers' must be an array of namespaces", None))?;
+    let list = v.as_array().ok_or_else(|| {
+        McpError::invalid_params("'servers' must be an array of namespaces", None)
+    })?;
     let mut ids = Vec::new();
     for entry in list {
         let ns = entry
@@ -1318,7 +1359,9 @@ async fn find_instance(
         .map_err(internal)?
         .into_iter()
         .find(|i| i.namespace == namespace)
-        .ok_or_else(|| McpError::invalid_params(format!("no server with namespace '{namespace}'"), None))
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("no server with namespace '{namespace}'"), None)
+        })
 }
 
 fn require_admin(admin: bool) -> Result<(), McpError> {

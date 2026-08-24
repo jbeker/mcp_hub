@@ -15,7 +15,9 @@ use axum::http::{header, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use rmcp::transport::streamable_http_server::tower::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
 
 use crate::proxy::server::HubProxy;
 use crate::AppState;
@@ -145,7 +147,10 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")));
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        });
 
     let Some(token) = token else {
         return reject(&state, &info, "no_bearer", &candidate);
@@ -160,8 +165,18 @@ async fn require_bearer(State(state): State<AppState>, req: Request, next: Next)
             Ok(Some((user_id, token_id))) => {
                 // Best-effort usage bookkeeping; never fail auth on this write.
                 let _ = crate::tokens::touch(&state.db, &token_id).await;
-                authorize(&state, req, next, &user_id, None, None, Some(token_id), info, candidate)
-                    .await
+                authorize(
+                    &state,
+                    req,
+                    next,
+                    &user_id,
+                    None,
+                    None,
+                    Some(token_id),
+                    info,
+                    candidate,
+                )
+                .await
             }
             _ => reject(&state, &info, "bad_token", &candidate),
         };
@@ -232,7 +247,10 @@ async fn authorize(
                 EndpointCandidate::Management => McpEndpoint::Management,
                 EndpointCandidate::GroupSlug(slug) => {
                     match crate::groups::find_by_slug(&state.db, &user.id, &slug).await {
-                        Ok(Some(group)) => McpEndpoint::Group { group_id: group.id, slug },
+                        Ok(Some(group)) => McpEndpoint::Group {
+                            group_id: group.id,
+                            slug,
+                        },
                         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                         Err(e) => {
                             tracing::error!(error = %format!("{e:#}"), "group lookup failed");

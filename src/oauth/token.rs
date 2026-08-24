@@ -110,7 +110,9 @@ async fn authorization_code(
         .ok_or_else(|| OAuthError::invalid_grant("authorization code is invalid or expired"))?;
 
     if row.client_id != client_id {
-        return Err(OAuthError::invalid_grant("code was issued to another client"));
+        return Err(OAuthError::invalid_grant(
+            "code was issued to another client",
+        ));
     }
     // redirect_uri was required at authorization, so it must be supplied here
     // and match exactly (RFC 6749 §4.1.3).
@@ -136,7 +138,17 @@ async fn authorization_code(
 
     // A new authorization starts a fresh refresh-token family.
     let family_id = crate::util::new_id();
-    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &family_id, info).await
+    issue_tokens(
+        state,
+        &user,
+        client_id,
+        &audience,
+        &row.scope,
+        row.resource.as_deref(),
+        &family_id,
+        info,
+    )
+    .await
 }
 
 async fn refresh_token(
@@ -172,11 +184,15 @@ async fn refresh_token(
             ));
         }
         store::RefreshOutcome::Missing => {
-            return Err(OAuthError::invalid_grant("refresh token is invalid or expired"))
+            return Err(OAuthError::invalid_grant(
+                "refresh token is invalid or expired",
+            ))
         }
     };
     if row.client_id != client_id {
-        return Err(OAuthError::invalid_grant("refresh token was issued to another client"));
+        return Err(OAuthError::invalid_grant(
+            "refresh token was issued to another client",
+        ));
     }
 
     let user = users::find_by_id(&state.db, &row.user_id)
@@ -188,7 +204,17 @@ async fn refresh_token(
         .clone()
         .unwrap_or_else(|| state.config.mcp_url());
     // Stay in the same family so the rotation chain is tracked.
-    issue_tokens(state, &user, client_id, &audience, &row.scope, row.resource.as_deref(), &row.family_id, info).await
+    issue_tokens(
+        state,
+        &user,
+        client_id,
+        &audience,
+        &row.scope,
+        row.resource.as_deref(),
+        &row.family_id,
+        info,
+    )
+    .await
 }
 
 /// Mint an access token + a fresh (rotated) refresh token within `family_id`.
@@ -203,9 +229,14 @@ async fn issue_tokens(
     family_id: &str,
     info: &RequestInfo,
 ) -> Result<serde_json::Value, OAuthError> {
-    let (access, ttl) = state
-        .signer
-        .issue_access_token(&user.id, client_id, audience, scope, user.is_admin, ACCESS_TTL_SECS)?;
+    let (access, ttl) = state.signer.issue_access_token(
+        &user.id,
+        client_id,
+        audience,
+        scope,
+        user.is_admin,
+        ACCESS_TTL_SECS,
+    )?;
 
     let refresh = crate::oauth::random_token();
     store::insert_refresh(

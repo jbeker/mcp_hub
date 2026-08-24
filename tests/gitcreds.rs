@@ -15,7 +15,9 @@ async fn pool() -> SqlitePool {
 async fn credential_round_trips_and_stores_no_plaintext() {
     let pool = pool().await;
     let secrets = SecretBox::new(&[3u8; 32]);
-    let user = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
+    let user = users::create(&pool, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
     let token = "ghp_a_very_secret_pat";
 
     let cred = gitcreds::upsert(
@@ -59,26 +61,52 @@ async fn credential_round_trips_and_stores_no_plaintext() {
 async fn credentials_are_scoped_to_their_owner() {
     let pool = pool().await;
     let secrets = SecretBox::new(&[4u8; 32]);
-    let alice = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
-    let bob = users::create(&pool, "u2", "bob", "Bob", false).await.unwrap();
-
-    gitcreds::upsert(&pool, &secrets, &alice.id, "github.com", "", "", "alice-token")
+    let alice = users::create(&pool, "u1", "alice", "Alice", false)
         .await
         .unwrap();
+    let bob = users::create(&pool, "u2", "bob", "Bob", false)
+        .await
+        .unwrap();
+
+    gitcreds::upsert(
+        &pool,
+        &secrets,
+        &alice.id,
+        "github.com",
+        "",
+        "",
+        "alice-token",
+    )
+    .await
+    .unwrap();
     gitcreds::upsert(&pool, &secrets, &bob.id, "github.com", "", "", "bob-token")
         .await
         .unwrap();
 
     let repo = "https://github.com/o/r";
-    let a = gitcreds::for_repo(&pool, &secrets, &alice.id, repo).await.unwrap().unwrap();
-    let b = gitcreds::for_repo(&pool, &secrets, &bob.id, repo).await.unwrap().unwrap();
+    let a = gitcreds::for_repo(&pool, &secrets, &alice.id, repo)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = gitcreds::for_repo(&pool, &secrets, &bob.id, repo)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(a.token, "alice-token");
     assert_eq!(b.token, "bob-token");
 
     // Deleting is ownership-scoped: Bob's survives.
-    assert!(gitcreds::delete(&pool, &alice.id, "github.com").await.unwrap());
-    assert!(gitcreds::for_repo(&pool, &secrets, &alice.id, repo).await.unwrap().is_none());
-    assert!(gitcreds::for_repo(&pool, &secrets, &bob.id, repo).await.unwrap().is_some());
+    assert!(gitcreds::delete(&pool, &alice.id, "github.com")
+        .await
+        .unwrap());
+    assert!(gitcreds::for_repo(&pool, &secrets, &alice.id, repo)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(gitcreds::for_repo(&pool, &secrets, &bob.id, repo)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 /// Deleting an account must take its git credentials with it. This rides on the
@@ -88,9 +116,17 @@ async fn credentials_are_scoped_to_their_owner() {
 async fn deleting_a_user_removes_their_credentials() {
     let pool = pool().await;
     let secrets = SecretBox::new(&[6u8; 32]);
-    let alice = users::create(&pool, "u1", "alice", "Alice", false).await.unwrap();
-    let bob = users::create(&pool, "u2", "bob", "Bob", false).await.unwrap();
-    for (u, host) in [(&alice, "github.com"), (&alice, "gitlab.com"), (&bob, "github.com")] {
+    let alice = users::create(&pool, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let bob = users::create(&pool, "u2", "bob", "Bob", false)
+        .await
+        .unwrap();
+    for (u, host) in [
+        (&alice, "github.com"),
+        (&alice, "gitlab.com"),
+        (&bob, "github.com"),
+    ] {
         gitcreds::upsert(&pool, &secrets, &u.id, host, "", "", "tok")
             .await
             .unwrap();
@@ -98,8 +134,14 @@ async fn deleting_a_user_removes_their_credentials() {
 
     users::delete(&pool, &alice.id).await.unwrap();
 
-    assert!(gitcreds::list_for_user(&pool, &alice.id).await.unwrap().is_empty());
-    assert_eq!(gitcreds::list_for_user(&pool, &bob.id).await.unwrap().len(), 1);
+    assert!(gitcreds::list_for_user(&pool, &alice.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        gitcreds::list_for_user(&pool, &bob.id).await.unwrap().len(),
+        1
+    );
     let (remaining,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM git_credentials")
         .fetch_one(&pool)
         .await

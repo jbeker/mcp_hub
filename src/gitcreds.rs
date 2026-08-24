@@ -333,7 +333,10 @@ mod tests {
             "https://ghp_secret@github.com/o/r",
             "not a host",
         ] {
-            assert!(normalize_host(bad).is_err(), "expected {bad:?} to be rejected");
+            assert!(
+                normalize_host(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 
@@ -342,7 +345,10 @@ mod tests {
         // git's credential protocol is line-oriented: a newline in a token
         // would inject a field into the helper's reply.
         for bad in ["", "ghp_a\nb", "ghp_a\rb", "ghp_a\tb", "ghp_a\0b"] {
-            assert!(validate_token(bad).is_err(), "expected {bad:?} to be rejected");
+            assert!(
+                validate_token(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
         }
         assert!(validate_token(&"x".repeat(MAX_TOKEN_LEN + 1)).is_err());
         assert!(validate_token(&"x".repeat(MAX_TOKEN_LEN)).is_ok());
@@ -355,9 +361,17 @@ mod tests {
         let sb = secrets();
         let token = "ghp_super_secret_value";
 
-        let cred = upsert(&pool, &sb, "u1", "https://github.com/o/r", "", "laptop", token)
-            .await
-            .unwrap();
+        let cred = upsert(
+            &pool,
+            &sb,
+            "u1",
+            "https://github.com/o/r",
+            "",
+            "laptop",
+            token,
+        )
+        .await
+        .unwrap();
         assert_eq!(cred.host, "github.com");
         assert_eq!(cred.username, "");
         assert_eq!(cred.label, "laptop");
@@ -373,9 +387,17 @@ mod tests {
         assert_eq!(nonce.len(), crate::crypto::NONCE_LEN);
 
         // Re-saving the same host replaces rather than duplicating.
-        upsert(&pool, &sb, "u1", "github.com", "oauth2", "rotated", "ghp_new")
-            .await
-            .unwrap();
+        upsert(
+            &pool,
+            &sb,
+            "u1",
+            "github.com",
+            "oauth2",
+            "rotated",
+            "ghp_new",
+        )
+        .await
+        .unwrap();
         let all = list_for_user(&pool, "u1").await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].username, "oauth2");
@@ -413,11 +435,19 @@ mod tests {
 
         let repo = "https://github.com/o/r";
         assert_eq!(
-            for_repo(&pool, &sb, "u1", repo).await.unwrap().unwrap().token,
+            for_repo(&pool, &sb, "u1", repo)
+                .await
+                .unwrap()
+                .unwrap()
+                .token,
             "token-alice"
         );
         assert_eq!(
-            for_repo(&pool, &sb, "u2", repo).await.unwrap().unwrap().token,
+            for_repo(&pool, &sb, "u2", repo)
+                .await
+                .unwrap()
+                .unwrap()
+                .token,
             "token-bob"
         );
 
@@ -432,7 +462,9 @@ mod tests {
     async fn for_repo_matches_only_the_exact_host() {
         let pool = pool().await;
         let sb = secrets();
-        upsert(&pool, &sb, "u1", "github.com", "", "", "tok").await.unwrap();
+        upsert(&pool, &sb, "u1", "github.com", "", "", "tok")
+            .await
+            .unwrap();
 
         for repo in [
             "https://github.com/o/r",
@@ -472,8 +504,14 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("github.com"), "message should name the host: {err}");
-        assert!(err.contains("re-enter"), "message should say what to do: {err}");
+        assert!(
+            err.contains("github.com"),
+            "message should name the host: {err}"
+        );
+        assert!(
+            err.contains("re-enter"),
+            "message should say what to do: {err}"
+        );
     }
 
     #[tokio::test]

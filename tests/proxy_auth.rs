@@ -14,7 +14,10 @@ fn test_config() -> Config {
         rp_id: "localhost".into(),
         listen: "127.0.0.1:0".parse().unwrap(),
         db_path: String::new(),
-        env_dir: std::env::temp_dir().join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        env_dir: std::env::temp_dir()
+            .join(format!("mcp_hub_envs_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
         master_key: [3u8; 32],
         bootstrap_admin: None,
         allow_open_registration: false,
@@ -83,7 +86,14 @@ async fn mcp_with_valid_token_passes_auth() {
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user.id,
+            "client",
+            &format!("{BASE}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
 
     let resp = app(state)
@@ -207,7 +217,14 @@ async fn mcp_with_unknown_session_is_404_not_401() {
         .unwrap();
     let (token, _) = state
         .signer
-        .issue_access_token(&user.id, "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            &user.id,
+            "client",
+            &format!("{BASE}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
 
     let resp = app(state)
@@ -284,7 +301,9 @@ async fn group_token_audience_and_ownership() {
     let bob = mcp_hub::users::create(&state.db, "u2", "bob", "Bob", false)
         .await
         .unwrap();
-    mcp_hub::groups::create(&state.db, &alice.id, "g", "").await.unwrap();
+    mcp_hub::groups::create(&state.db, &alice.id, "g", "")
+        .await
+        .unwrap();
 
     let issue = |user_id: &str, aud: &str| {
         state
@@ -307,24 +326,42 @@ async fn group_token_audience_and_ownership() {
 
     // Base token: fine on /mcp, rejected on the group.
     let base_token = issue(&alice.id, "/mcp");
-    let ok = app(state.clone()).oneshot(request("/mcp", &base_token)).await.unwrap();
+    let ok = app(state.clone())
+        .oneshot(request("/mcp", &base_token))
+        .await
+        .unwrap();
     assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
-    let cross = app(state.clone()).oneshot(request("/mcp/g", &base_token)).await.unwrap();
+    let cross = app(state.clone())
+        .oneshot(request("/mcp/g", &base_token))
+        .await
+        .unwrap();
     assert_eq!(cross.status(), StatusCode::UNAUTHORIZED);
 
     // Group token: fine on its slug, rejected on /mcp and on a sibling slug.
     let g_token = issue(&alice.id, "/mcp/g");
-    let ok = app(state.clone()).oneshot(request("/mcp/g", &g_token)).await.unwrap();
+    let ok = app(state.clone())
+        .oneshot(request("/mcp/g", &g_token))
+        .await
+        .unwrap();
     assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(ok.status(), StatusCode::NOT_FOUND);
-    let cross = app(state.clone()).oneshot(request("/mcp", &g_token)).await.unwrap();
+    let cross = app(state.clone())
+        .oneshot(request("/mcp", &g_token))
+        .await
+        .unwrap();
     assert_eq!(cross.status(), StatusCode::UNAUTHORIZED);
-    let sibling = app(state.clone()).oneshot(request("/mcp/other", &g_token)).await.unwrap();
+    let sibling = app(state.clone())
+        .oneshot(request("/mcp/other", &g_token))
+        .await
+        .unwrap();
     assert_eq!(sibling.status(), StatusCode::UNAUTHORIZED);
 
     // Bob's token with the right audience still 404s: the slug is Alice's.
     let bob_token = issue(&bob.id, "/mcp/g");
-    let foreign = app(state.clone()).oneshot(request("/mcp/g", &bob_token)).await.unwrap();
+    let foreign = app(state.clone())
+        .oneshot(request("/mcp/g", &bob_token))
+        .await
+        .unwrap();
     assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
 }
 
@@ -335,7 +372,14 @@ async fn mcp_with_token_for_unknown_user_is_401() {
     let state = test_state().await;
     let (token, _) = state
         .signer
-        .issue_access_token("ghost", "client", &format!("{BASE}/mcp"), "mcp", false, 3600)
+        .issue_access_token(
+            "ghost",
+            "client",
+            &format!("{BASE}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
         .unwrap();
 
     let resp = app(state)

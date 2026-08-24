@@ -111,8 +111,7 @@ pub const CONFIG_FILE_NAME: &str = "config";
 
 /// Validate a user-supplied remote backend URL (http/https only).
 pub fn validate_remote_url(url: &str) -> Result<()> {
-    let parsed =
-        url::Url::parse(url.trim()).map_err(|_| anyhow!("'{url}' is not a valid URL"))?;
+    let parsed = url::Url::parse(url.trim()).map_err(|_| anyhow!("'{url}' is not a valid URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("remote URL must be an http(s) URL");
     }
@@ -156,13 +155,18 @@ pub fn check_backend_host(url: &str, block_private: bool) -> Result<()> {
     if host_is_loopback(&parsed) {
         return Ok(());
     }
-    let host = parsed.host_str().ok_or_else(|| anyhow!("remote URL has no host"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("remote URL has no host"))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
     use std::net::ToSocketAddrs;
     if let Ok(addrs) = (host, port).to_socket_addrs() {
         for addr in addrs {
             if ip_is_private(addr.ip()) {
-                bail!("remote URL host resolves to a non-public address ({})", addr.ip());
+                bail!(
+                    "remote URL host resolves to a non-public address ({})",
+                    addr.ip()
+                );
             }
         }
     }
@@ -331,7 +335,9 @@ pub async fn create(
         }
     })?;
 
-    get(pool, &id).await?.ok_or_else(|| anyhow!("instance vanished after creation"))
+    get(pool, &id)
+        .await?
+        .ok_or_else(|| anyhow!("instance vanished after creation"))
 }
 
 pub async fn set_enabled(pool: &SqlitePool, id: &str, enabled: bool) -> Result<()> {
@@ -441,8 +447,19 @@ pub async fn migrate_catalog_instances(pool: &SqlitePool, secrets: &SecretBox) -
         .bind(&cat_id)
         .fetch_optional(pool)
         .await?;
-        let Some((name, description, transport, command, args_json, url, runtime, repo, git_ref, entry, module)) =
-            cat
+        let Some((
+            name,
+            description,
+            transport,
+            command,
+            args_json,
+            url,
+            runtime,
+            repo,
+            git_ref,
+            entry,
+            module,
+        )) = cat
         else {
             continue; // catalog row already gone; leave the instance as-is
         };
@@ -518,8 +535,15 @@ pub async fn update_def(pool: &SqlitePool, instance_id: &str, def: &ServerDef) -
 // ---------------------------------------------------------------------------
 
 /// Store a non-secret config value.
-pub async fn set_config_value(pool: &SqlitePool, instance_id: &str, key: &str, value: &str) -> Result<()> {
-    let inst = get(pool, instance_id).await?.ok_or_else(|| anyhow!("no such instance"))?;
+pub async fn set_config_value(
+    pool: &SqlitePool,
+    instance_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let inst = get(pool, instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("no such instance"))?;
     let mut config = inst.config;
     config.insert(key.to_string(), value.to_string());
     sqlx::query("UPDATE user_server_instances SET config_json = ? WHERE id = ?")
@@ -591,16 +615,20 @@ pub async fn env_for_edit(
     secrets: &SecretBox,
     instance_id: &str,
 ) -> Result<BTreeMap<String, String>> {
-    let rows: Vec<(String, Vec<u8>, Vec<u8>)> =
-        sqlx::query_as("SELECT key_name, nonce, ciphertext FROM instance_secrets WHERE instance_id = ?")
-            .bind(instance_id)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT key_name, nonce, ciphertext FROM instance_secrets WHERE instance_id = ?",
+    )
+    .bind(instance_id)
+    .fetch_all(pool)
+    .await?;
     let mut out = BTreeMap::new();
     for (key, nonce, ciphertext) in rows {
         match secrets.open(&Sealed { nonce, ciphertext }) {
             Ok(plain) => {
-                out.insert(key, String::from_utf8(plain).context("env value was not UTF-8")?);
+                out.insert(
+                    key,
+                    String::from_utf8(plain).context("env value was not UTF-8")?,
+                );
             }
             // A row sealed under a key/format this binary can't read is omitted
             // so the edit form still loads; the user simply re-enters its value.
@@ -635,7 +663,10 @@ pub fn parse_env(text: &str) -> Result<BTreeMap<String, String>> {
                 }
             });
         if !valid {
-            bail!("line {}: '{key}' is not a valid environment variable name", i + 1);
+            bail!(
+                "line {}: '{key}' is not a valid environment variable name",
+                i + 1
+            );
         }
         map.insert(key.to_string(), value.trim().to_string());
     }
@@ -692,9 +723,7 @@ pub fn secret_refs_in_argv(
             match after.find('}') {
                 Some(end) => {
                     let name = &after[..end];
-                    if secrets.contains(name)
-                        && !found.iter().any(|f: &String| f == name)
-                    {
+                    if secrets.contains(name) && !found.iter().any(|f: &String| f == name) {
                         found.push(name.to_string());
                     }
                     rest = &after[end + 1..];
@@ -730,11 +759,12 @@ pub async fn resolved_env(
     inst: &Instance,
 ) -> Result<BTreeMap<String, String>> {
     let mut env = inst.config.clone();
-    let rows: Vec<(String, Vec<u8>, Vec<u8>)> =
-        sqlx::query_as("SELECT key_name, nonce, ciphertext FROM instance_secrets WHERE instance_id = ?")
-            .bind(&inst.id)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT key_name, nonce, ciphertext FROM instance_secrets WHERE instance_id = ?",
+    )
+    .bind(&inst.id)
+    .fetch_all(pool)
+    .await?;
     let mut undecryptable = Vec::new();
     for (key, nonce, ciphertext) in rows {
         match secrets.open(&Sealed { nonce, ciphertext }) {
@@ -875,11 +905,25 @@ mod tests {
     #[test]
     fn private_ip_classification() {
         use std::net::IpAddr;
-        for s in ["127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.1.1", "::1", "fd00::1", "fe80::1"] {
-            assert!(ip_is_private(s.parse::<IpAddr>().unwrap()), "{s} should be private");
+        for s in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "169.254.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert!(
+                ip_is_private(s.parse::<IpAddr>().unwrap()),
+                "{s} should be private"
+            );
         }
         for s in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
-            assert!(!ip_is_private(s.parse::<IpAddr>().unwrap()), "{s} should be public");
+            assert!(
+                !ip_is_private(s.parse::<IpAddr>().unwrap()),
+                "{s} should be public"
+            );
         }
     }
 
@@ -900,7 +944,10 @@ mod tests {
         // A secret referenced on the command line is flagged.
         let got = secret_refs_in_argv(
             &Some("mcp-remote".into()),
-            &["--header".into(), "Authorization: Bearer ${GITHUB_TOKEN}".into()],
+            &[
+                "--header".into(),
+                "Authorization: Bearer ${GITHUB_TOKEN}".into(),
+            ],
             &secrets,
         );
         assert_eq!(got, vec!["GITHUB_TOKEN".to_string()]);

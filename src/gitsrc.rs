@@ -247,7 +247,11 @@ fn with_auth_hint(e: anyhow::Error, repo: &str, had_credential: bool) -> anyhow:
 /// first token resolves to `<env>/bin/<command>` so console scripts, `python`,
 /// and compiled Go binaries all come from the built environment; the rest of
 /// the command line is passed through unchanged.
-pub fn launch_command(env_dir: &str, instance_id: &str, def: &ServerDef) -> Result<(String, Vec<String>)> {
+pub fn launch_command(
+    env_dir: &str,
+    instance_id: &str,
+    def: &ServerDef,
+) -> Result<(String, Vec<String>)> {
     let bin = env_path(env_dir, instance_id).join("bin");
     let command = def
         .command
@@ -310,7 +314,9 @@ fn detect_lang(checkout: &Path) -> Result<Lang> {
     if checkout.join("pyproject.toml").is_file() || checkout.join("setup.py").is_file() {
         return Ok(Lang::Python);
     }
-    bail!("cannot determine how to build this repo: no go.mod or pyproject.toml/setup.py at its root")
+    bail!(
+        "cannot determine how to build this repo: no go.mod or pyproject.toml/setup.py at its root"
+    )
 }
 
 /// Check out `commit` from `repo` into `dest`. No repo code executes here —
@@ -338,7 +344,11 @@ async fn clone_at_commit(
             cred,
         )
         .await?;
-        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", "FETCH_HEAD"], None).await
+        run_git(
+            &["-C", &dest_s, "checkout", "-q", "--detach", "FETCH_HEAD"],
+            None,
+        )
+        .await
     }
     .await;
     if let Err(e) = shallow {
@@ -427,7 +437,13 @@ async fn build_env(
     //    UID when one is set, so a malicious repo cannot execute code as root.
     //    uv shells out to git for the `git+…` spec, so it inherits `cred`.
     run_uv(
-        &["pip", "install", "--python", &python.to_string_lossy(), &spec],
+        &[
+            "pip",
+            "install",
+            "--python",
+            &python.to_string_lossy(),
+            &spec,
+        ],
         env_dir,
         sandbox,
         cred,
@@ -489,7 +505,14 @@ async fn build_go_env(
         "./...".to_string()
     };
     let out_dir = format!("{}/", bin.to_string_lossy());
-    run_go(&["build", "-o", &out_dir, &target], env_dir, src, sandbox, cred).await?;
+    run_go(
+        &["build", "-o", &out_dir, &target],
+        env_dir,
+        src,
+        sandbox,
+        cred,
+    )
+    .await?;
 
     // 3) The command's first token must name one of the built binaries, or the
     //    launch path resolved by `launch_command` will not exist.
@@ -504,7 +527,11 @@ async fn build_go_env(
         built.sort();
         bail!(
             "command '{entry}' does not name a built binary; the build produced: {}",
-            if built.is_empty() { "(nothing)".to_string() } else { built.join(", ") }
+            if built.is_empty() {
+                "(nothing)".to_string()
+            } else {
+                built.join(", ")
+            }
         );
     }
 
@@ -807,8 +834,12 @@ mod tests {
         assert!(p.ends_with("/envs/abc/bin/my-mcp"));
         assert!(a.is_empty());
 
-        let (p, a) =
-            launch_command("/envs", "abc", &git_def(Some("python"), &["-m", "pkg.server"])).unwrap();
+        let (p, a) = launch_command(
+            "/envs",
+            "abc",
+            &git_def(Some("python"), &["-m", "pkg.server"]),
+        )
+        .unwrap();
         assert!(p.ends_with("/envs/abc/bin/python"));
         assert_eq!(a, vec!["-m".to_string(), "pkg.server".to_string()]);
     }
@@ -913,18 +944,33 @@ mod tests {
             "[project]\nname='echo-mcp'\nversion='0.1.0'\n[project.scripts]\necho-mcp='echo_mcp:main'\n[build-system]\nrequires=['hatchling']\nbuild-backend='hatchling.build'\n",
         )
         .unwrap();
-        std::fs::write(repo.join("echo_mcp/__init__.py"), "def main():\n    print('ok')\n").unwrap();
-        let g = |args: &[&str]| Sync::new("git").args(args).current_dir(&repo).output().unwrap();
+        std::fs::write(
+            repo.join("echo_mcp/__init__.py"),
+            "def main():\n    print('ok')\n",
+        )
+        .unwrap();
+        let g = |args: &[&str]| {
+            Sync::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
         g(&["add", "-A"]);
         g(&["commit", "-qm", "v1"]);
-        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
 
         let repo_url = format!("file://{}", repo.display());
         let env_dir = envs.to_string_lossy().into_owned();
-        build_env(&env_dir, "inst1", &repo_url, &sha, None, None).await.unwrap();
+        build_env(&env_dir, "inst1", &repo_url, &sha, None, None)
+            .await
+            .unwrap();
 
         // The built env survived the relocation and the entry point runs.
         let def = git_def(Some("echo-mcp"), &[]);
@@ -943,7 +989,8 @@ mod tests {
     #[ignore = "needs the Go toolchain"]
     async fn build_go_env_produces_a_runnable_binary() {
         use std::process::Command as Sync;
-        let root = std::env::temp_dir().join(format!("mcp_hub_gobuildtest_{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("mcp_hub_gobuildtest_{}", uuid::Uuid::new_v4()));
         let repo = root.join("repo");
         let envs = root.join("envs");
         std::fs::create_dir_all(repo.join("cmd/echo-mcp")).unwrap();
@@ -953,13 +1000,22 @@ mod tests {
             "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"ok\") }\n",
         )
         .unwrap();
-        let g = |args: &[&str]| Sync::new("git").args(args).current_dir(&repo).output().unwrap();
+        let g = |args: &[&str]| {
+            Sync::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
         g(&["add", "-A"]);
         g(&["commit", "-qm", "v1"]);
-        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
 
         let repo_url = format!("file://{}", repo.display());
         let env_dir = envs.to_string_lossy().into_owned();
@@ -970,11 +1026,18 @@ mod tests {
 
         // The command must name a built binary.
         let bad = git_def(Some("no-such-binary"), &[]);
-        let err = build_go_env(&env_dir, "inst1", &src, &bad, None, None).await.unwrap_err();
-        assert!(err.to_string().contains("does not name a built binary"), "{err}");
+        let err = build_go_env(&env_dir, "inst1", &src, &bad, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not name a built binary"),
+            "{err}"
+        );
 
         let def = git_def(Some("echo-mcp"), &[]);
-        build_go_env(&env_dir, "inst1", &src, &def, None, None).await.unwrap();
+        build_go_env(&env_dir, "inst1", &src, &def, None, None)
+            .await
+            .unwrap();
 
         // A Go env resolves and runs through the same launch path as a venv,
         // and reads as neither Python nor stale.
@@ -994,14 +1057,23 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mcp_hub_clonetest_{}", uuid::Uuid::new_v4()));
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let g = |args: &[&str]| Sync::new("git").args(args).current_dir(&repo).output().unwrap();
+        let g = |args: &[&str]| {
+            Sync::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.email", "t@t"]);
         g(&["config", "user.name", "t"]);
         std::fs::write(repo.join("go.mod"), "module example.com/x\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-qm", "v1"]);
-        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
 
         let url = format!("file://{}", repo.display());
         let dest = root.join("checkout");
@@ -1012,7 +1084,9 @@ mod tests {
         // otherwise succeed: git ignores a helper scoped to a host this URL
         // does not name.
         let dest2 = root.join("checkout2");
-        clone_at_commit(&url, &sha, &dest2, Some(&test_cred())).await.unwrap();
+        clone_at_commit(&url, &sha, &dest2, Some(&test_cred()))
+            .await
+            .unwrap();
         assert!(dest2.join("go.mod").is_file());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1044,7 +1118,9 @@ mod tests {
         let repo = format!("file://{}", dir.display());
         let sha = resolve_commit(&repo, "main", None).await.unwrap();
         assert_eq!(sha, head);
-        let sha = resolve_commit(&repo, "main", Some(&test_cred())).await.unwrap();
+        let sha = resolve_commit(&repo, "main", Some(&test_cred()))
+            .await
+            .unwrap();
         assert_eq!(sha, head);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1084,14 +1160,23 @@ mod tests {
         assert_eq!(get("GIT_CONFIG_COUNT"), vec!["2".to_string()]);
         // Both keys scope the helper to exactly one host, port included.
         for k in ["GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1"] {
-            assert_eq!(get(k), vec!["credential.https://github.com:8443.helper".to_string()]);
+            assert_eq!(
+                get(k),
+                vec!["credential.https://github.com:8443.helper".to_string()]
+            );
         }
         // Index 0 resets any inherited helper.
         assert_eq!(get("GIT_CONFIG_VALUE_0"), vec![String::new()]);
 
         let helper = &get("GIT_CONFIG_VALUE_1")[0];
-        assert!(!helper.contains(TEST_TOKEN), "helper must not embed the token: {helper}");
-        assert!(!helper.contains("x-access-token"), "helper must not embed the username");
+        assert!(
+            !helper.contains(TEST_TOKEN),
+            "helper must not embed the token: {helper}"
+        );
+        assert!(
+            !helper.contains("x-access-token"),
+            "helper must not embed the username"
+        );
         assert!(helper.contains("$MCP_HUB_GIT_TOKEN") && helper.contains("$MCP_HUB_GIT_USER"));
 
         // The secret appears in exactly one entry, and it is an env value.
@@ -1131,18 +1216,27 @@ mod tests {
                 .write_all(format!("url={url}\n\n").as_bytes())
                 .unwrap();
             let out = child.wait_with_output().unwrap();
-            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
         };
 
         let (ok, stdout) = fill("https://github.com/owner/repo.git");
         assert!(ok, "credential fill should succeed for the scoped host");
-        assert!(stdout.contains(&format!("password={TEST_TOKEN}")), "{stdout}");
+        assert!(
+            stdout.contains(&format!("password={TEST_TOKEN}")),
+            "{stdout}"
+        );
         assert!(stdout.contains("username=x-access-token"), "{stdout}");
 
         // Any other host gets nothing, and fails closed instead of prompting.
         let (ok, stdout) = fill("https://other.example/owner/repo.git");
         assert!(!ok, "an unscoped host must not be answered: {stdout}");
-        assert!(!stdout.contains(TEST_TOKEN), "token leaked to another host: {stdout}");
+        assert!(
+            !stdout.contains(TEST_TOKEN),
+            "token leaked to another host: {stdout}"
+        );
     }
 
     /// Repo build code must not inherit the hub's environment, which holds
@@ -1156,7 +1250,10 @@ mod tests {
             .map(|(k, _)| k)
             .filter(|k| !BUILD_ENV_ALLOWLIST.contains(&k.as_str()))
             .collect();
-        assert!(!leaky.is_empty(), "test needs some non-allowlisted parent vars");
+        assert!(
+            !leaky.is_empty(),
+            "test needs some non-allowlisted parent vars"
+        );
         assert!(!BUILD_ENV_ALLOWLIST.contains(&"HUB_MASTER_KEY"));
 
         let out = build_command("env").output().await.unwrap();
@@ -1167,7 +1264,10 @@ mod tests {
             .collect();
 
         for key in &leaky {
-            assert!(!seen.contains(key), "{key} leaked into the build environment");
+            assert!(
+                !seen.contains(key),
+                "{key} leaked into the build environment"
+            );
         }
         // ...while what a toolchain actually needs still comes through.
         assert!(seen.contains(&"PATH".to_string()), "got {seen:?}");

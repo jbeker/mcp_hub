@@ -68,7 +68,10 @@ mod tests {
     #[test]
     fn expands_known_references() {
         let v = vars(&[("TOOL_HOME", "/opt/tool"), ("TOKEN", "abc123")]);
-        assert_eq!(expand_vars("${TOOL_HOME}/bin/server", &v), "/opt/tool/bin/server");
+        assert_eq!(
+            expand_vars("${TOOL_HOME}/bin/server", &v),
+            "/opt/tool/bin/server"
+        );
         assert_eq!(expand_vars("--token=${TOKEN}", &v), "--token=abc123");
         assert_eq!(expand_vars("${TOOL_HOME}:${TOKEN}", &v), "/opt/tool:abc123");
     }

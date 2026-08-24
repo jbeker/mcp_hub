@@ -213,7 +213,8 @@ impl Config {
         }
 
         // A value of 0 means "leave this limit untouched", same as unset.
-        let nonzero = |key| -> Result<Option<u64>> { Ok(opt_parse::<u64>(key)?.filter(|&v| v > 0)) };
+        let nonzero =
+            |key| -> Result<Option<u64>> { Ok(opt_parse::<u64>(key)?.filter(|&v| v > 0)) };
         let child_limits = ChildLimits {
             max_procs: nonzero("HUB_CHILD_MAX_PROCS")?,
             max_mem_mb: nonzero("HUB_CHILD_MAX_MEM_MB")?,
@@ -233,7 +234,12 @@ impl Config {
             allowed_hosts.push(authority);
         }
         if let Some(extra) = opt("HUB_ALLOWED_HOSTS") {
-            allowed_hosts.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            allowed_hosts.extend(
+                extra
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
         }
         allowed_hosts.dedup();
 
@@ -351,9 +357,18 @@ mod tests {
 
     #[test]
     fn derives_host() {
-        assert_eq!(host_of("https://hub.example.com/mcp").as_deref(), Some("hub.example.com"));
-        assert_eq!(host_of("http://localhost:8080").as_deref(), Some("localhost"));
-        assert_eq!(host_of("hub.example.com").as_deref(), Some("hub.example.com"));
+        assert_eq!(
+            host_of("https://hub.example.com/mcp").as_deref(),
+            Some("hub.example.com")
+        );
+        assert_eq!(
+            host_of("http://localhost:8080").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            host_of("hub.example.com").as_deref(),
+            Some("hub.example.com")
+        );
     }
 
     #[test]
