@@ -181,6 +181,81 @@ async fn unbuilt_git_backend_is_skipped() {
     let _ = client.cancel().await;
 }
 
+/// Git credentials are write-only over MCP: storing one echoes the host back,
+/// and nothing — not the set result, the listing, nor the server listing — ever
+/// carries the token. A regression here is a silent secret disclosure.
+#[tokio::test]
+async fn git_credential_tools_never_echo_the_token() {
+    const TOKEN: &str = "ghp_e2e_secret_token_value";
+    let (base, state) = spawn_hub().await;
+    users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    // A git-sourced server on the same host, to exercise git_credential_host.
+    let def = ServerDef {
+        name: "Git Server".into(),
+        description: String::new(),
+        transport: "stdio".into(),
+        command: Some("example-mcp".into()),
+        args: vec![],
+        url: None,
+        runtime: "python".into(),
+        repo: Some("https://github.com/example/private".into()),
+        git_ref: Some("main".into()),
+        entry: None,
+        module: None,
+    };
+    instances::create(&state.db, "u1", None, Some(&def), "git", "Git Server")
+        .await
+        .unwrap();
+
+    let (token, _) = state
+        .signer
+        .issue_access_token("u1", "client", &format!("{base}/mcp"), "mcp", false, 3600)
+        .unwrap();
+    let client = connect(&base, token).await;
+    let call = |name: &'static str, a: Option<serde_json::Map<String, serde_json::Value>>| {
+        let client = &client;
+        async move {
+            let res = client
+                .call_tool({
+                    let mut p = CallToolRequestParams::new(name);
+                    p.arguments = a;
+                    p
+                })
+                .await
+                .unwrap();
+            serde_json::to_string(&res).unwrap()
+        }
+    };
+
+    let stored = call(
+        "hub__set_git_credential",
+        args(serde_json::json!({"host": "https://github.com/example/private", "token": TOKEN, "label": "e2e"})),
+    )
+    .await;
+    assert!(stored.contains("github.com"), "got {stored}");
+    assert!(!stored.contains(TOKEN), "set echoed the token: {stored}");
+
+    let listed = call("hub__list_git_credentials", None).await;
+    assert!(listed.contains("github.com"), "got {listed}");
+    assert!(listed.contains("x-access-token"), "blank username should default: {listed}");
+    assert!(!listed.contains(TOKEN), "list leaked the token: {listed}");
+
+    // The server listing names the matching host so a failed build is
+    // diagnosable, but still carries no secret.
+    let servers = call("hub__list_my_servers", None).await;
+    assert!(servers.contains("\"git_credential_host\":\"github.com\""), "got {servers}");
+    assert!(!servers.contains(TOKEN), "server list leaked the token: {servers}");
+
+    let deleted = call("hub__delete_git_credential", args(serde_json::json!({"host": "github.com"}))).await;
+    assert!(deleted.contains("\"deleted\":true"), "got {deleted}");
+    let listed = call("hub__list_git_credentials", None).await;
+    assert!(!listed.contains("github.com"), "credential survived deletion: {listed}");
+
+    let _ = client.cancel().await;
+}
+
 #[tokio::test]
 async fn proxy_aggregates_a_stdio_backend() {
     let exe = mock_server_path();

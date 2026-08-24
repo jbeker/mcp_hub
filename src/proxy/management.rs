@@ -108,6 +108,39 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             schema(json!({"namespace": {"type": "string"}}), &["namespace"]),
         ),
         tool(
+            "hub__list_git_credentials",
+            "List the git hosts you have stored a credential for (metadata only \
+             — the tokens are never shown again). These are used when building \
+             git-sourced servers from private repositories.",
+            schema(json!({}), &[]),
+        ),
+        tool(
+            "hub__set_git_credential",
+            "Store (or replace) the HTTPS token used to build git-sourced servers \
+             from one git host, e.g. host 'github.com'. The token is encrypted at \
+             rest and never returned. Note it will appear in this client's \
+             transcript — prefer the Account web page if that matters. Use a \
+             read-only, repo-scoped token with an expiry: building runs the \
+             repository's own build code, which can read the token. 'username' \
+             defaults to 'x-access-token' (GitLab: 'oauth2', Bitbucket: \
+             'x-token-auth').",
+            schema(
+                json!({
+                    "host": {"type": "string", "description": "Git host, e.g. 'github.com'; a full repo URL is also accepted"},
+                    "token": {"type": "string", "description": "Personal access token with read access to the repositories"},
+                    "username": {"type": "string", "description": "HTTP basic username (default 'x-access-token')"},
+                    "label": {"type": "string", "description": "Optional note, e.g. which token this is"}
+                }),
+                &["host", "token"],
+            ),
+        ),
+        tool(
+            "hub__delete_git_credential",
+            "Remove the stored git credential for a host. Git-sourced servers on \
+             that host then build with anonymous access only.",
+            schema(json!({"host": {"type": "string"}}), &["host"]),
+        ),
+        tool(
             "hub__enable",
             "Enable one of your servers.",
             schema(json!({"namespace": {"type": "string"}}), &["namespace"]),
@@ -272,7 +305,7 @@ fn annotations_for(name: &str) -> ToolAnnotations {
     match name {
         "hub__whoami" | "hub__list_my_servers" | "hub__list_tokens"
         | "hub__get_my_client" | "hub__runtime_stats" | "hub__list_users"
-        | "hub__list_invites" | "hub__list_groups" => {
+        | "hub__list_invites" | "hub__list_groups" | "hub__list_git_credentials" => {
             a.read_only(true).destructive(false).idempotent(true).open_world(false)
         }
         // Build from external git repos → open world.
@@ -284,7 +317,8 @@ fn annotations_for(name: &str) -> ToolAnnotations {
             a.read_only(false).destructive(false).idempotent(false).open_world(false)
         }
         "hub__remove" | "hub__revoke_token" | "hub__revoke_invite"
-        | "hub__delete_user" | "hub__disable_user" | "hub__delete_group" => {
+        | "hub__delete_user" | "hub__disable_user" | "hub__delete_group"
+        | "hub__delete_git_credential" => {
             a.read_only(false).destructive(true).idempotent(true).open_world(false)
         }
         // edit_server, set_env, set_config_file, enable, disable,
@@ -356,6 +390,9 @@ async fn run(
         "remove" => remove(state, user_id, args).await,
         "list_tokens" => list_tokens(state, user_id).await,
         "revoke_token" => revoke_token(state, user_id, args).await,
+        "list_git_credentials" => list_git_credentials(state, user_id).await,
+        "set_git_credential" => set_git_credential(state, user_id, args).await,
+        "delete_git_credential" => delete_git_credential(state, user_id, args).await,
         "list_groups" => list_groups(state, user_id).await,
         "create_group" => create_group(state, user_id, args).await,
         "update_group" => update_group(state, user_id, args).await,
@@ -416,6 +453,8 @@ fn action_for(op: &str) -> Option<&'static str> {
         "disable" => "server.disable",
         "remove" => "server.remove",
         "revoke_token" => "token.revoke",
+        "set_git_credential" => "git_credential.set",
+        "delete_git_credential" => "git_credential.delete",
         "create_group" => "group.create",
         "update_group" => "group.update",
         "delete_group" => "group.delete",
@@ -434,7 +473,7 @@ fn action_for(op: &str) -> Option<&'static str> {
 /// Best-effort identifier of the object a management call acted on, pulled from
 /// the common argument keys.
 fn audit_object(args: &JsonObject) -> String {
-    for key in ["namespace", "handle", "token_id", "slug", "id"] {
+    for key in ["namespace", "handle", "token_id", "slug", "host", "id"] {
         if let Some(v) = args.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             return v.to_string();
         }
@@ -572,6 +611,15 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
         // Connection outcome from the in-memory registry; missing entry means
         // no attempt this process — same shape as the old column defaults.
         let rs = state.runtime_status.get(&i.id);
+        // Which stored git credential (if any) a build of this server would
+        // use, so a failed build can be diagnosed without a second call.
+        let git_credential_host = match def.as_ref().and_then(|d| d.repo.as_deref()) {
+            Some(repo) => match crate::gitcreds::find(&state.db, user_id, repo).await {
+                Ok(found) => found.map(|c| c.host),
+                Err(_) => None,
+            },
+            None => None,
+        };
         out.push(json!({
             "namespace": i.namespace,
             "display_name": i.display_name,
@@ -583,6 +631,7 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
             "env_keys": env_keys,
             "build_status": i.build_status,
             "built_commit": i.built_commit,
+            "git_credential_host": git_credential_host,
             "runtime_status": rs.as_ref().map_or("unknown", |s| s.state.as_str()),
             "runtime_detail": rs.as_ref().and_then(|s| s.detail.clone()),
             "runtime_checked_at": rs.as_ref().map(|s| s.checked_at),
@@ -781,6 +830,7 @@ async fn update_server(
     let sandbox = state.sandbox_or_fail(user_id).await.map_err(internal)?;
     let report = crate::gitsrc::update_instance(
         &state.db,
+        &state.secrets,
         &state.config.env_dir,
         &inst,
         &def,
@@ -870,6 +920,68 @@ async fn revoke_token(
         .await
         .map_err(internal)?;
     ok(json!({ "revoked": revoked }))
+}
+
+/// `hub__list_git_credentials` — metadata only; the tokens are never returned.
+async fn list_git_credentials(
+    state: &AppState,
+    user_id: &str,
+) -> Result<CallToolResult, McpError> {
+    let creds = crate::gitcreds::list_for_user(&state.db, user_id)
+        .await
+        .map_err(internal)?;
+    let out = creds
+        .into_iter()
+        .map(|c| {
+            json!({
+                "host": c.host,
+                "username": if c.username.is_empty() {
+                    crate::gitcreds::DEFAULT_USERNAME.to_string()
+                } else {
+                    c.username
+                },
+                "label": c.label,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+                "last_used_at": c.last_used_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    ok(json!({ "git_credentials": out }))
+}
+
+async fn set_git_credential(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let host = req_str(args, "host")?;
+    let token = req_str(args, "token")?;
+    let cred = crate::gitcreds::upsert(
+        &state.db,
+        &state.secrets,
+        user_id,
+        &host,
+        &opt_str(args, "username").unwrap_or_default(),
+        &opt_str(args, "label").unwrap_or_default(),
+        &token,
+    )
+    .await
+    .map_err(bad_request)?;
+    // Echo the host only — never the token, and never the username alongside it.
+    ok(json!({ "host": cred.host, "stored": true }))
+}
+
+async fn delete_git_credential(
+    state: &AppState,
+    user_id: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let host = req_str(args, "host")?;
+    let deleted = crate::gitcreds::delete(&state.db, user_id, &host)
+        .await
+        .map_err(bad_request)?;
+    ok(json!({ "host": host, "deleted": deleted }))
 }
 
 /// `hub__runtime_stats` — live backend-slot usage, active session count, the

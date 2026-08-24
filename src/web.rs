@@ -339,7 +339,7 @@ fn server_fields(
         r#"{transport_field}
   <div class="stdio-only {stdio_hidden}">
     <label>Command line<input name="command" value="{cmd}" placeholder="uvx your-mcp-server"></label>
-    <label>Repository (optional — builds a cached venv from a git repo)<input name="repo" value="{repo}" placeholder="https://github.com/you/your-mcp"></label>
+    <label>Repository (optional — builds a cached venv from a git repo; for a private repo, add a token for its host on your <a href="/account">Account</a> page)<input name="repo" value="{repo}" placeholder="https://github.com/you/your-mcp"></label>
     <label>Git ref (branch or tag)<input name="git_ref" value="{git_ref}" placeholder="main"></label>
     <label>Config file (optional — written to the server's working directory; its path is exposed as <code>$MCP_CONFIG_FILE</code>)<textarea name="config_file" rows="6" placeholder="(paste a config file the server needs on disk)">{config_file}</textarea></label>
   </div>
@@ -613,16 +613,41 @@ pub async fn server_detail(
             .as_deref()
             .map(|c| &c[..c.len().min(10)])
             .unwrap_or("—");
+        // Which credential (if any) this repo's host will build with. The
+        // "add one" prompt only appears after a failed build, so a public repo
+        // is never nagged about a token it does not need.
+        let repo = def.repo.as_deref().unwrap_or("");
+        let host = crate::gitcreds::host_of_repo(repo);
+        let stored = match &host {
+            Some(h) => crate::gitcreds::find(&state.db, &user.id, h)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let auth = match (&host, &stored, inst.build_status.as_str()) {
+            (_, Some(_), _) => format!(
+                r#"<p class="muted">Auth: using your git credential for <code>{host}</code>.</p>"#,
+                host = esc(host.as_deref().unwrap_or("")),
+            ),
+            (Some(h), None, "error") => format!(
+                r#"<p class="status status-warn">No git credential for <code>{host}</code>, so builds use anonymous access. If this repository is private, <a href="/account">add a token on your Account page</a> and update again.</p>"#,
+                host = esc(h),
+            ),
+            _ => String::new(),
+        };
         format!(
             r#"<section>
   <h2>Source</h2>
   <p class="muted">Repo <code>{repo}</code> @ <code>{git_ref}</code> · build <code>{status}</code> · commit <code>{commit}</code></p>
+  {auth}
   <form method="post" action="/servers/{id}/update">{csrf}<button>Update from repository</button></form>
 </section>"#,
             repo = esc(def.repo.as_deref().unwrap_or("?")),
             git_ref = esc(def.git_ref.as_deref().unwrap_or("main")),
             status = esc(&inst.build_status),
             commit = esc(commit),
+            auth = auth,
             id = esc(&inst.id),
             csrf = csrf,
         )
@@ -943,7 +968,16 @@ pub async fn update_server(
         Ok(s) => s,
         Err(e) => return error_page(&format!("sandbox unavailable: {e:#}")),
     };
-    match crate::gitsrc::update_instance(&state.db, &state.config.env_dir, &inst, &def, sandbox.as_ref()).await {
+    match crate::gitsrc::update_instance(
+        &state.db,
+        &state.secrets,
+        &state.config.env_dir,
+        &inst,
+        &def,
+        sandbox.as_ref(),
+    )
+    .await
+    {
         Ok(_) => {
             audit_ok("server.update", &user, &headers, &inst.namespace);
             Redirect::to(&format!("/servers/{id}")).into_response()
@@ -1036,6 +1070,7 @@ async fn probe_instance(
             let _guard = state.build_lock.lock().await;
             if let Err(e) = crate::gitsrc::update_instance(
                 &state.db,
+                &state.secrets,
                 &state.config.env_dir,
                 inst,
                 &def,
@@ -1842,6 +1877,48 @@ pub async fn account_page(
         pat_rows.push_str("</ul>");
     }
 
+    // Git credentials used to build git-sourced servers from private repos.
+    let git_creds = crate::gitcreds::list_for_user(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
+    let mut git_rows = String::new();
+    if git_creds.is_empty() {
+        git_rows.push_str(r#"<p class="muted">No git credentials yet.</p>"#);
+    } else {
+        git_rows.push_str("<ul class=\"conns\">");
+        for c in &git_creds {
+            let used = match c.last_used_at {
+                Some(u) => format!("last used {}", ago(now - u)),
+                None => "never used".to_string(),
+            };
+            let username = if c.username.is_empty() {
+                crate::gitcreds::DEFAULT_USERNAME
+            } else {
+                &c.username
+            };
+            let label = if c.label.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", esc(&c.label))
+            };
+            git_rows.push_str(&format!(
+                r#"<li>
+  <div class="conn-head">
+    <span class="conn-title"><code>{host}</code> <span class="muted">· user {username} · updated {updated} · {used}{label}</span></span>
+    <form method="post" action="/account/git-credentials/delete" data-confirm="Remove the credential for {host}?">{csrf}<input type="hidden" name="host" value="{host}"><button class="ghost danger">Remove</button></form>
+  </div>
+</li>"#,
+                host = esc(&c.host),
+                username = esc(username),
+                updated = ago(now - c.updated_at),
+                used = used,
+                label = label,
+                csrf = csrf,
+            ));
+        }
+        git_rows.push_str("</ul>");
+    }
+
     let body = format!(
         r#"<header class="row"><h1>Account</h1><a href="/">← Back</a></header>
 <p>Signed in as <strong>{handle}</strong></p>
@@ -1875,6 +1952,20 @@ pub async fn account_page(
   </form>
 </section>
 <section style="margin-top:18px">
+  <h2>Git credentials</h2>
+  <p class="muted">Tokens the hub uses to build git-sourced servers from private repositories — one per git host. Stored encrypted and never shown again; saving a host again replaces its token. Use a read-only, repo-scoped token with an expiry: building runs the repository's own build code, which can read the token.</p>
+  {git_rows}
+  <form method="post" action="/account/git-credentials/save" class="token-create">
+    {csrf}
+    <label class="name">Host<br><input type="text" name="host" placeholder="github.com" maxlength="200" required></label>
+    <label>Username<br><input type="text" name="username" placeholder="x-access-token" maxlength="100"></label>
+    <label>Token<br><input type="password" name="token" autocomplete="off" required></label>
+    <label class="name">Note<br><input type="text" name="label" placeholder="optional" maxlength="60"></label>
+    <button class="inline" type="submit">Save credential</button>
+  </form>
+  <p class="muted">Leave the username blank for GitHub. GitLab wants <code>oauth2</code>; Bitbucket wants <code>x-token-auth</code>.</p>
+</section>
+<section style="margin-top:18px">
   <h2>Browser sessions</h2>
   <p class="muted">You have {n_sessions} active session(s){other}.</p>
   {session_rows}
@@ -1884,6 +1975,7 @@ pub async fn account_page(
         rows = rows,
         conn_rows = conn_rows,
         pat_rows = pat_rows,
+        git_rows = git_rows,
         session_rows = session_rows,
         n_sessions = sessions.len(),
         other = if other_sessions > 0 {
@@ -2241,6 +2333,78 @@ pub async fn revoke_token(
     )
     .await;
     audit_ok("token.revoke", &user, &headers, form.token_id.trim());
+    Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SaveGitCredentialForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub host: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub label: String,
+    pub token: String,
+}
+
+/// `POST /account/git-credentials/save` — store (or replace) the token used to
+/// build git-sourced servers from one git host. Write-only: the value is never
+/// rendered back, so the form is the only place it exists in plaintext.
+pub async fn save_git_credential(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<SaveGitCredentialForm>,
+) -> Response {
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("git_credential.set", &user, &headers, form.host.trim(), "csrf");
+        return forbidden();
+    }
+    match crate::gitcreds::upsert(
+        &state.db,
+        &state.secrets,
+        &user.id,
+        &form.host,
+        &form.username,
+        &form.label,
+        &form.token,
+    )
+    .await
+    {
+        Ok(cred) => {
+            audit_ok("git_credential.set", &user, &headers, &cred.host);
+            Redirect::to("/account").into_response()
+        }
+        // The error names the host at worst; `upsert` never echoes the token.
+        Err(e) => error_page(&format!("could not save the git credential: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeleteGitCredentialForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub host: String,
+}
+
+/// `POST /account/git-credentials/delete` — remove a host's credential. Servers
+/// on that host then build with anonymous access only.
+pub async fn delete_git_credential(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    jar: SignedCookieJar,
+    headers: HeaderMap,
+    Form(form): Form<DeleteGitCredentialForm>,
+) -> Response {
+    let host = form.host.trim();
+    if !session::check_csrf(&jar, &state.config.master_key, &form.csrf) {
+        audit_denied("git_credential.delete", &user, &headers, host, "csrf");
+        return forbidden();
+    }
+    let _ = crate::gitcreds::delete(&state.db, &user.id, host).await;
+    audit_ok("git_credential.delete", &user, &headers, host);
     Redirect::to("/account").into_response()
 }
 

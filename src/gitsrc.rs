@@ -11,6 +11,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use sqlx::SqlitePool;
 use tokio::process::Command;
 
+use crate::crypto::SecretBox;
+use crate::gitcreds::ResolvedCredential;
 use crate::instances::{self, Instance, ServerDef};
 use crate::sandbox::Sandbox;
 
@@ -94,6 +96,102 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Credentials (private repos)
+// ---------------------------------------------------------------------------
+
+/// Environment that lets git — and anything that shells out to it (uv, go) —
+/// authenticate to exactly one host, without the token ever entering argv.
+///
+/// Uses git's env-based config (`GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`) to
+/// install a `credential.https://<host>.helper` that is an inline shell
+/// function printing the username/token it reads from *its own environment*.
+/// Both the config and the token travel in the environment
+/// (`/proc/<pid>/environ`, readable only by the same UID) and never in
+/// `/proc/<pid>/cmdline`, which is world readable — the hazard
+/// [`crate::instances::secret_refs_in_argv`] exists to warn about. Nothing is
+/// written to disk, so there is nothing to permission or clean up.
+///
+/// The empty helper at index 0 resets any helper inherited from system/global
+/// config, so only ours can answer for this host. The URL-scoped key is what
+/// keeps the token from being offered to any other host — including after a
+/// redirect — and the `GIT_TERMINAL_PROMPT=0` set on every invocation makes
+/// that case fail fast instead of blocking until the build timeout.
+///
+/// Requires git >= 2.31 for `GIT_CONFIG_COUNT`.
+fn credential_env(cred: &ResolvedCredential) -> [(String, String); 7] {
+    let key = format!("credential.https://{}.helper", cred.host);
+    [
+        ("GIT_CONFIG_COUNT".into(), "2".into()),
+        ("GIT_CONFIG_KEY_0".into(), key.clone()),
+        ("GIT_CONFIG_VALUE_0".into(), String::new()),
+        ("GIT_CONFIG_KEY_1".into(), key),
+        // Note the secret is *referenced by name*, never interpolated: this
+        // string is passed to `sh -c` and so appears in that shell's argv.
+        // `case` always exits 0, making git's store/erase calls silent no-ops.
+        (
+            "GIT_CONFIG_VALUE_1".into(),
+            r#"!f() { case "$1" in get) printf "username=%s\npassword=%s\n" "$MCP_HUB_GIT_USER" "$MCP_HUB_GIT_TOKEN";; esac; }; f"#.into(),
+        ),
+        ("MCP_HUB_GIT_USER".into(), cred.username.clone()),
+        ("MCP_HUB_GIT_TOKEN".into(), cred.token.clone()),
+    ]
+}
+
+/// Apply [`credential_env`] to a command, if there is a credential to apply.
+fn apply_credential(cmd: &mut Command, cred: Option<&ResolvedCredential>) {
+    if let Some(c) = cred {
+        for (k, v) in credential_env(c) {
+            cmd.env(k, v);
+        }
+    }
+}
+
+/// Whether a failure from git/uv/go reads like the remote refused us. Private
+/// repos usually 404 rather than 403, so "not found" counts.
+fn looks_like_auth_failure(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "could not read username",
+        "terminal prompts disabled",
+        "authentication failed",
+        "repository not found",
+        "could not read from remote repository",
+        "403 forbidden",
+        "401 unauthorized",
+        "invalid username or token",
+        "access denied",
+    ];
+    let lower = text.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Append an actionable remedy to a build failure that looks like an auth
+/// problem. Only ever names the host — never the credential.
+///
+/// The message is folded into a single error string rather than added as an
+/// `anyhow` context layer because callers render errors with `{e}`, which would
+/// otherwise show the hint and drop git's own explanation.
+fn with_auth_hint(e: anyhow::Error, repo: &str, had_credential: bool) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if !looks_like_auth_failure(&text) {
+        return e;
+    }
+    let host = crate::gitcreds::host_of_repo(repo).unwrap_or_else(|| repo.to_string());
+    let hint = if had_credential {
+        format!(
+            "The stored git credential for {host} was rejected. Check the token grants read \
+             access to this repository and has not expired."
+        )
+    } else {
+        format!(
+            "{host} did not allow anonymous access. If this repository is private, add a git \
+             credential for {host} on your Account page (or with hub__set_git_credential), then \
+             update again."
+        )
+    };
+    anyhow!("{text}\n\n{hint}")
+}
+
 /// Resolve the program and args to launch a built git backend: the command's
 /// first token resolves to `<env>/bin/<command>` so console scripts, `python`,
 /// and compiled Go binaries all come from the built environment; the rest of
@@ -117,17 +215,19 @@ pub fn launch_command(env_dir: &str, instance_id: &str, def: &ServerDef) -> Resu
 
 /// Resolve a branch/tag to a commit SHA via `git ls-remote`. A value that is
 /// already a commit SHA is accepted as-is.
-async fn resolve_commit(repo: &str, git_ref: &str) -> Result<String> {
-    let out = tokio::time::timeout(
-        LS_REMOTE_TIMEOUT,
-        Command::new("git")
-            .args(["ls-remote", repo, git_ref])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output(),
-    )
-    .await
-    .context("git ls-remote timed out")?
-    .context("running git ls-remote")?;
+async fn resolve_commit(
+    repo: &str,
+    git_ref: &str,
+    cred: Option<&ResolvedCredential>,
+) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", repo, git_ref])
+        .env("GIT_TERMINAL_PROMPT", "0");
+    apply_credential(&mut cmd, cred);
+    let out = tokio::time::timeout(LS_REMOTE_TIMEOUT, cmd.output())
+        .await
+        .context("git ls-remote timed out")?
+        .context("running git ls-remote")?;
 
     if !out.status.success() {
         bail!(
@@ -166,36 +266,47 @@ fn detect_lang(checkout: &Path) -> Result<Lang> {
 /// git never runs hooks from a fetched repository. Tries a shallow
 /// fetch-by-SHA first (GitHub and most hosts allow it), falling back to a
 /// full clone for hosts that reject it.
-async fn clone_at_commit(repo: &str, commit: &str, dest: &Path) -> Result<()> {
+///
+/// A private repo authenticates via `cred`, which reaches git through the
+/// environment. Never embed `https://user:token@host/…` here instead: the fetch
+/// path registers no remote at all and the clone fallback would persist the
+/// token into the checkout's `.git/config`.
+async fn clone_at_commit(
+    repo: &str,
+    commit: &str,
+    dest: &Path,
+    cred: Option<&ResolvedCredential>,
+) -> Result<()> {
     let _ = std::fs::remove_dir_all(dest);
     std::fs::create_dir_all(dest).context("creating source checkout dir")?;
     let dest_s = dest.to_string_lossy().into_owned();
     let shallow: Result<()> = async {
-        run_git(&["init", "-q", &dest_s]).await?;
-        run_git(&["-C", &dest_s, "fetch", "-q", "--depth", "1", repo, commit]).await?;
-        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", "FETCH_HEAD"]).await
+        run_git(&["init", "-q", &dest_s], None).await?;
+        run_git(
+            &["-C", &dest_s, "fetch", "-q", "--depth", "1", repo, commit],
+            cred,
+        )
+        .await?;
+        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", "FETCH_HEAD"], None).await
     }
     .await;
     if let Err(e) = shallow {
         tracing::debug!(error = %e, repo, "shallow fetch-by-sha failed; falling back to a full clone");
         let _ = std::fs::remove_dir_all(dest);
-        run_git(&["clone", "-q", repo, &dest_s]).await?;
-        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", commit]).await?;
+        run_git(&["clone", "-q", repo, &dest_s], cred).await?;
+        run_git(&["-C", &dest_s, "checkout", "-q", "--detach", commit], None).await?;
     }
     Ok(())
 }
 
-async fn run_git(args: &[&str]) -> Result<()> {
-    let out = tokio::time::timeout(
-        BUILD_TIMEOUT,
-        Command::new("git")
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output(),
-    )
-    .await
-    .context("git command timed out")?
-    .context("running git")?;
+async fn run_git(args: &[&str], cred: Option<&ResolvedCredential>) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    apply_credential(&mut cmd, cred);
+    let out = tokio::time::timeout(BUILD_TIMEOUT, cmd.output())
+        .await
+        .context("git command timed out")?
+        .context("running git")?;
     if !out.status.success() {
         let verb = args
             .iter()
@@ -223,6 +334,7 @@ async fn build_env(
     repo: &str,
     commit: &str,
     sandbox: Option<&Sandbox>,
+    cred: Option<&ResolvedCredential>,
 ) -> Result<()> {
     std::fs::create_dir_all(env_dir).context("creating env directory")?;
     let final_path = env_path(env_dir, instance_id);
@@ -237,7 +349,13 @@ async fn build_env(
     //    we build under a temp path and rename it into place, and a
     //    non-relocatable venv hardcodes its build-time path into console-script
     //    shebangs, which the move breaks.
-    run_uv(&["venv", "--relocatable", &tmp.to_string_lossy()], env_dir, None).await?;
+    run_uv(
+        &["venv", "--relocatable", &tmp.to_string_lossy()],
+        env_dir,
+        None,
+        None,
+    )
+    .await?;
 
     // The shared interpreter must be readable/executable by the sandbox UID
     // before that UID uses it to install (step 3). Best-effort.
@@ -256,10 +374,12 @@ async fn build_env(
 
     // 3) Install the package + deps — running its build backend — as the sandbox
     //    UID when one is set, so a malicious repo cannot execute code as root.
+    //    uv shells out to git for the `git+…` spec, so it inherits `cred`.
     run_uv(
         &["pip", "install", "--python", &python.to_string_lossy(), &spec],
         env_dir,
         sandbox,
+        cred,
     )
     .await?;
 
@@ -290,6 +410,7 @@ async fn build_go_env(
     src: &Path,
     def: &ServerDef,
     sandbox: Option<&Sandbox>,
+    cred: Option<&ResolvedCredential>,
 ) -> Result<()> {
     std::fs::create_dir_all(env_dir).context("creating env directory")?;
     let final_path = env_path(env_dir, instance_id);
@@ -317,7 +438,7 @@ async fn build_go_env(
         "./...".to_string()
     };
     let out_dir = format!("{}/", bin.to_string_lossy());
-    run_go(&["build", "-o", &out_dir, &target], env_dir, src, sandbox).await?;
+    run_go(&["build", "-o", &out_dir, &target], env_dir, src, sandbox, cred).await?;
 
     // 3) The command's first token must name one of the built binaries, or the
     //    launch path resolved by `launch_command` will not exist.
@@ -357,6 +478,7 @@ async fn run_go(
     env_dir: &str,
     workdir: &Path,
     sandbox: Option<&Sandbox>,
+    cred: Option<&ResolvedCredential>,
 ) -> Result<()> {
     let mut cmd = Command::new("go");
     cmd.args(args)
@@ -371,6 +493,15 @@ async fn run_go(
         // image every time a repo bumps its Go requirement.
         .env("GOTOOLCHAIN", "auto")
         .env("GIT_TERMINAL_PROMPT", "0");
+    // A private dependency on the credential's host would otherwise be fetched
+    // through proxy.golang.org — which 404s on it and never sees our credential.
+    // GOPRIVATE implies GONOPROXY+GONOSUMDB, routing just that host straight to
+    // git. Only set when there is a credential, so public builds keep the
+    // module proxy and checksum database.
+    if let Some(c) = cred {
+        cmd.env("GOPRIVATE", format!("{}/*", c.host));
+    }
+    apply_credential(&mut cmd, cred);
     match sandbox {
         // Run as the owner's unprivileged UID with the module/build caches in
         // that user's own writable sandbox directory (never shared/writable
@@ -462,7 +593,12 @@ fn venv_python_is_shared(env_dir: &str, instance_id: &str) -> bool {
     }
 }
 
-async fn run_uv(args: &[&str], env_dir: &str, sandbox: Option<&Sandbox>) -> Result<()> {
+async fn run_uv(
+    args: &[&str],
+    env_dir: &str,
+    sandbox: Option<&Sandbox>,
+    cred: Option<&ResolvedCredential>,
+) -> Result<()> {
     let mut cmd = Command::new("uv");
     cmd.args(args)
         // Install managed interpreters under the data volume rather than root's
@@ -470,6 +606,7 @@ async fn run_uv(args: &[&str], env_dir: &str, sandbox: Option<&Sandbox>) -> Resu
         // UIDs can traverse and execute.
         .env("UV_PYTHON_INSTALL_DIR", python_install_dir(env_dir))
         .env("GIT_TERMINAL_PROMPT", "0");
+    apply_credential(&mut cmd, cred);
     match sandbox {
         // Run as the owner's unprivileged UID, with HOME and the package cache in
         // that user's own writable sandbox directory (never shared/writable
@@ -501,8 +638,14 @@ async fn run_uv(args: &[&str], env_dir: &str, sandbox: Option<&Sandbox>) -> Resu
 
 /// Resolve the configured ref, and (re)build the environment if the resolved
 /// commit differs from what is currently built. Records build state.
+///
+/// A private repo is authenticated with the owner's credential for the repo's
+/// host, looked up here rather than passed in: that keeps every call site to a
+/// single argument and makes it structurally impossible to hand one user's
+/// credential to another user's build.
 pub async fn update_instance(
     pool: &SqlitePool,
+    secrets: &SecretBox,
     env_dir: &str,
     inst: &Instance,
     def: &ServerDef,
@@ -521,7 +664,12 @@ pub async fn update_instance(
     // Validate the launch target up front so a bad entry fails before building.
     let _ = launch_command(env_dir, &inst.id, def)?;
 
-    let commit = resolve_commit(repo, git_ref).await?;
+    let cred = crate::gitcreds::for_repo(pool, secrets, &inst.user_id, repo).await?;
+    let cred = cred.as_ref();
+
+    let commit = resolve_commit(repo, git_ref, cred)
+        .await
+        .map_err(|e| with_auth_hint(e, repo, cred.is_some()))?;
     let already_built = inst.built_commit.as_deref() == Some(commit.as_str())
         && inst.build_status == "ready"
         && env_path(env_dir, &inst.id).exists()
@@ -543,13 +691,13 @@ pub async fn update_instance(
     std::fs::create_dir_all(env_dir).context("creating env directory")?;
     let src = Path::new(env_dir).join(format!(".{}.src", inst.id));
     let build_result: Result<()> = async {
-        clone_at_commit(repo, &commit, &src).await?;
+        clone_at_commit(repo, &commit, &src, cred).await?;
         match detect_lang(&src)? {
             Lang::Python => {
                 let _ = std::fs::remove_dir_all(&src);
-                build_env(env_dir, &inst.id, repo, &commit, sandbox).await
+                build_env(env_dir, &inst.id, repo, &commit, sandbox, cred).await
             }
-            Lang::Go => build_go_env(env_dir, &inst.id, &src, def, sandbox).await,
+            Lang::Go => build_go_env(env_dir, &inst.id, &src, def, sandbox, cred).await,
         }
     }
     .await;
@@ -558,6 +706,10 @@ pub async fn update_instance(
     match build_result {
         Ok(()) => {
             instances::set_build_state(pool, &inst.id, "ready", Some(&commit)).await?;
+            if let Some(c) = cred {
+                // Best-effort bookkeeping; a build must not fail on it.
+                let _ = crate::gitcreds::touch(pool, &c.id).await;
+            }
             Ok(UpdateReport {
                 changed: true,
                 previous_commit: inst.built_commit.clone(),
@@ -568,7 +720,7 @@ pub async fn update_instance(
             // Keep the previously-built commit (if any) usable.
             instances::set_build_state(pool, &inst.id, "error", inst.built_commit.as_deref())
                 .await?;
-            Err(e)
+            Err(with_auth_hint(e, repo, cred.is_some()))
         }
     }
 }
@@ -721,7 +873,7 @@ mod tests {
 
         let repo_url = format!("file://{}", repo.display());
         let env_dir = envs.to_string_lossy().into_owned();
-        build_env(&env_dir, "inst1", &repo_url, &sha, None).await.unwrap();
+        build_env(&env_dir, "inst1", &repo_url, &sha, None, None).await.unwrap();
 
         // The built env survived the relocation and the entry point runs.
         let def = git_def(Some("echo-mcp"), &[]);
@@ -762,16 +914,16 @@ mod tests {
         let env_dir = envs.to_string_lossy().into_owned();
         let src = envs.join(".inst1.src");
         std::fs::create_dir_all(&envs).unwrap();
-        clone_at_commit(&repo_url, &sha, &src).await.unwrap();
+        clone_at_commit(&repo_url, &sha, &src, None).await.unwrap();
         assert!(matches!(detect_lang(&src), Ok(Lang::Go)));
 
         // The command must name a built binary.
         let bad = git_def(Some("no-such-binary"), &[]);
-        let err = build_go_env(&env_dir, "inst1", &src, &bad, None).await.unwrap_err();
+        let err = build_go_env(&env_dir, "inst1", &src, &bad, None, None).await.unwrap_err();
         assert!(err.to_string().contains("does not name a built binary"), "{err}");
 
         let def = git_def(Some("echo-mcp"), &[]);
-        build_go_env(&env_dir, "inst1", &src, &def, None).await.unwrap();
+        build_go_env(&env_dir, "inst1", &src, &def, None, None).await.unwrap();
 
         // A Go env resolves and runs through the same launch path as a venv,
         // and reads as neither Python nor stale.
@@ -800,11 +952,17 @@ mod tests {
         g(&["commit", "-qm", "v1"]);
         let sha = String::from_utf8(g(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
 
+        let url = format!("file://{}", repo.display());
         let dest = root.join("checkout");
-        clone_at_commit(&format!("file://{}", repo.display()), &sha, &dest)
-            .await
-            .unwrap();
+        clone_at_commit(&url, &sha, &dest, None).await.unwrap();
         assert!(dest.join("go.mod").is_file());
+
+        // Carrying a credential must never break a checkout that would
+        // otherwise succeed: git ignores a helper scoped to a host this URL
+        // does not name.
+        let dest2 = root.join("checkout2");
+        clone_at_commit(&url, &sha, &dest2, Some(&test_cred())).await.unwrap();
+        assert!(dest2.join("go.mod").is_file());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -833,9 +991,139 @@ mod tests {
             .to_string();
 
         let repo = format!("file://{}", dir.display());
-        let sha = resolve_commit(&repo, "main").await.unwrap();
+        let sha = resolve_commit(&repo, "main", None).await.unwrap();
+        assert_eq!(sha, head);
+        let sha = resolve_commit(&repo, "main", Some(&test_cred())).await.unwrap();
         assert_eq!(sha, head);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Credentials
+    // -----------------------------------------------------------------------
+
+    const TEST_TOKEN: &str = "ghp_test_token_value";
+
+    fn test_cred() -> ResolvedCredential {
+        ResolvedCredential {
+            id: "c1".into(),
+            host: "github.com".into(),
+            username: "x-access-token".into(),
+            token: TEST_TOKEN.into(),
+        }
+    }
+
+    /// The whole point of the env-config mechanism: the token reaches git
+    /// through the environment, and the helper — which *is* passed to `sh -c`
+    /// and so lands in that shell's argv — only references it by name.
+    #[test]
+    fn credential_env_keeps_the_token_out_of_argv() {
+        let env = credential_env(&ResolvedCredential {
+            host: "github.com:8443".into(),
+            ..test_cred()
+        });
+        let get = |k: &str| {
+            env.iter()
+                .filter(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(get("GIT_CONFIG_COUNT"), vec!["2".to_string()]);
+        // Both keys scope the helper to exactly one host, port included.
+        for k in ["GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1"] {
+            assert_eq!(get(k), vec!["credential.https://github.com:8443.helper".to_string()]);
+        }
+        // Index 0 resets any inherited helper.
+        assert_eq!(get("GIT_CONFIG_VALUE_0"), vec![String::new()]);
+
+        let helper = &get("GIT_CONFIG_VALUE_1")[0];
+        assert!(!helper.contains(TEST_TOKEN), "helper must not embed the token: {helper}");
+        assert!(!helper.contains("x-access-token"), "helper must not embed the username");
+        assert!(helper.contains("$MCP_HUB_GIT_TOKEN") && helper.contains("$MCP_HUB_GIT_USER"));
+
+        // The secret appears in exactly one entry, and it is an env value.
+        let carrying: Vec<&String> = env
+            .iter()
+            .filter(|(_, v)| v.contains(TEST_TOKEN))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(carrying, vec!["MCP_HUB_GIT_TOKEN"]);
+    }
+
+    /// Offline proof that git hands the credential to the scoped host and to
+    /// nothing else — and that `GIT_TERMINAL_PROMPT=0` makes the miss fail fast
+    /// rather than block. `git credential fill` needs no network and no server.
+    #[test]
+    fn git_offers_the_credential_only_to_the_scoped_host() {
+        use std::io::Write;
+        use std::process::{Command as Sync, Stdio};
+
+        let fill = |url: &str| {
+            let mut child = Sync::new("git")
+                .args(["credential", "fill"])
+                .envs(credential_env(&test_cred()))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                // Ignore whatever the developer running the tests has configured.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("url={url}\n\n").as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+
+        let (ok, stdout) = fill("https://github.com/owner/repo.git");
+        assert!(ok, "credential fill should succeed for the scoped host");
+        assert!(stdout.contains(&format!("password={TEST_TOKEN}")), "{stdout}");
+        assert!(stdout.contains("username=x-access-token"), "{stdout}");
+
+        // Any other host gets nothing, and fails closed instead of prompting.
+        let (ok, stdout) = fill("https://other.example/owner/repo.git");
+        assert!(!ok, "an unscoped host must not be answered: {stdout}");
+        assert!(!stdout.contains(TEST_TOKEN), "token leaked to another host: {stdout}");
+    }
+
+    #[test]
+    fn auth_hint_names_the_host_and_the_remedy() {
+        let repo = "https://github.com/owner/private";
+        let git_err = |s: &str| anyhow!("git ls-remote failed: {s}");
+
+        // Without a credential, say how to add one.
+        let e = with_auth_hint(
+            git_err("fatal: could not read Username for 'https://github.com': terminal prompts disabled"),
+            repo,
+            false,
+        );
+        let text = e.to_string();
+        assert!(text.contains("github.com"), "{text}");
+        assert!(text.contains("Account page"), "{text}");
+        // git's own explanation survives, since callers render with `{e}`.
+        assert!(text.contains("could not read Username"), "{text}");
+
+        // A private repo 404s rather than 403s, so "not found" must count.
+        let e = with_auth_hint(git_err("remote: Repository not found."), repo, true);
+        let text = e.to_string();
+        assert!(text.contains("was rejected"), "{text}");
+        assert!(text.contains("expired"), "{text}");
+        assert!(!text.contains("Account page"), "wrong remedy: {text}");
+
+        // Unrelated failures are passed through untouched.
+        let e = with_auth_hint(git_err("ref 'nope' not found"), repo, true);
+        assert_eq!(e.to_string(), "git ls-remote failed: ref 'nope' not found");
+
+        // The hint is built from the host alone and can never echo a token.
+        let e = with_auth_hint(git_err("Authentication failed"), repo, true);
+        assert!(!e.to_string().contains(TEST_TOKEN));
     }
 }

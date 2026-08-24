@@ -6,6 +6,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod gitcreds;
 pub mod gitsrc;
 pub mod groups;
 pub mod instances;
@@ -262,6 +263,8 @@ pub fn build_router(state: AppState, static_dir: &str) -> Router {
         .route("/account/tokens/create", post(web::create_token))
         .route("/account/tokens/revoke", post(web::revoke_token))
         .route("/account/tokens/access", post(web::update_token_access))
+        .route("/account/git-credentials/save", post(web::save_git_credential))
+        .route("/account/git-credentials/delete", post(web::delete_git_credential))
         // User administration (admin)
         .route("/users", get(web::users_page))
         .route("/stats", get(web::stats_page))

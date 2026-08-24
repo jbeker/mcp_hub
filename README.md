@@ -156,6 +156,7 @@ Three freshness mechanisms, from most to least automatic:
 | `hub__edit_server` | user | Change a server's command / url / repo |
 | `hub__set_env` | user | Replace a server's environment variables |
 | `hub__update_server` | user | (Re)build a git-sourced server from its repo |
+| `hub__list_git_credentials` / `hub__set_git_credential` / `hub__delete_git_credential` | user | Per-host tokens for building private repos |
 | `hub__enable` / `hub__disable` / `hub__remove` | user | Manage your servers |
 | `hub__list_groups` | user | Your connector groups: endpoint URLs, members, tool counts vs the 256 cap |
 | `hub__create_group` / `hub__update_group` / `hub__delete_group` | user | Manage connector groups (slugs are immutable — delete and recreate) |
@@ -273,8 +274,26 @@ Notes:
   `pyproject.toml`) — and **Go** — the repo must have a `go.mod`; it is built with
   `CGO_ENABLED=0`, so pure-Go servers only. The image ships `git`, `uv`, and `go`;
   packages needing C build tools may need a customized image.
-- **Public repos only** for now — a private repo would need a token, which isn't yet handled
-  cleanly.
+- Repo URLs must be `https`. SSH remotes and deploy keys are not handled.
+
+### Private repositories
+
+Store one HTTPS token per git host under **Git credentials** on the Account page (or with
+`hub__set_git_credential`). Any git-sourced server of yours whose repo is on that host builds
+with it — one GitHub PAT covers every private repo you have there, and rotating it is a single
+edit. Leave the username blank for GitHub; GitLab wants `oauth2`, Bitbucket `x-token-auth`.
+
+The token is encrypted at rest with the same key as your other secrets, and is used for all
+three fetches a build makes: the hub's own clone, uv's re-fetch of `git+<repo>@<commit>`, and
+`go`'s private-module fetches (for which `GOPRIVATE` is set to the credential's host, so those
+bypass `proxy.golang.org`). It reaches git through the environment as a URL-scoped credential
+helper, never on a command line — `/proc/<pid>/cmdline` is world readable — and it is never
+written into the checkout's `.git/config`. Git only offers it to the exact host it was stored
+for; anything else fails closed. Requires git ≥ 2.31 (the image ships a newer one).
+
+**Use a read-only, repo-scoped token with an expiry.** Building runs the repository's own build
+backend, which can read the token from its environment. Tokens are never shown again after they
+are saved.
 
 ## Managing access
 
