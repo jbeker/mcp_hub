@@ -97,6 +97,57 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Build process environment
+// ---------------------------------------------------------------------------
+
+/// The only variables a build toolchain inherits from the hub. Everything else
+/// is dropped — see [`build_command`].
+const BUILD_ENV_ALLOWLIST: &[&str] = &[
+    // Finding git/uv/go themselves, and their scratch space.
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    // TLS trust, for a host behind a private CA.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    // Egress proxies.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    // Locale, so toolchain diagnostics come back readable.
+    "LANG",
+    "LC_ALL",
+];
+
+/// Start a build command with a minimal environment.
+///
+/// `uv pip install` and `go build` execute the repository's own build code, and
+/// (when sandboxing is configured) do so as an unprivileged UID that can read
+/// its own `/proc/<pid>/environ`. The hub's environment holds `HUB_MASTER_KEY`,
+/// so inheriting it wholesale would hand repo-supplied code the key that
+/// encrypts every stored secret. Clear everything and re-add only
+/// [`BUILD_ENV_ALLOWLIST`].
+///
+/// Must be used in place of `Command::new` for every build tool: the clear has
+/// to happen before any other `.env()` call on the command.
+fn build_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    for key in BUILD_ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd
+}
+
+// ---------------------------------------------------------------------------
 // Credentials (private repos)
 // ---------------------------------------------------------------------------
 
@@ -220,7 +271,7 @@ async fn resolve_commit(
     git_ref: &str,
     cred: Option<&ResolvedCredential>,
 ) -> Result<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = build_command("git");
     cmd.args(["ls-remote", repo, git_ref])
         .env("GIT_TERMINAL_PROMPT", "0");
     apply_credential(&mut cmd, cred);
@@ -300,7 +351,7 @@ async fn clone_at_commit(
 }
 
 async fn run_git(args: &[&str], cred: Option<&ResolvedCredential>) -> Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = build_command("git");
     cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
     apply_credential(&mut cmd, cred);
     let out = tokio::time::timeout(BUILD_TIMEOUT, cmd.output())
@@ -480,7 +531,7 @@ async fn run_go(
     sandbox: Option<&Sandbox>,
     cred: Option<&ResolvedCredential>,
 ) -> Result<()> {
-    let mut cmd = Command::new("go");
+    let mut cmd = build_command("go");
     cmd.args(args)
         .current_dir(workdir)
         // Static binaries: the runtime image has no C toolchain, and static
@@ -599,7 +650,7 @@ async fn run_uv(
     sandbox: Option<&Sandbox>,
     cred: Option<&ResolvedCredential>,
 ) -> Result<()> {
-    let mut cmd = Command::new("uv");
+    let mut cmd = build_command("uv");
     cmd.args(args)
         // Install managed interpreters under the data volume rather than root's
         // home, so the venv's `bin/python` symlink resolves to a path sandbox
@@ -1092,6 +1143,34 @@ mod tests {
         let (ok, stdout) = fill("https://other.example/owner/repo.git");
         assert!(!ok, "an unscoped host must not be answered: {stdout}");
         assert!(!stdout.contains(TEST_TOKEN), "token leaked to another host: {stdout}");
+    }
+
+    /// Repo build code must not inherit the hub's environment, which holds
+    /// HUB_MASTER_KEY — the key protecting every stored secret. Spawns a real
+    /// child so this tests the environment as exec'd, not as configured.
+    #[tokio::test]
+    async fn build_command_drops_everything_outside_the_allowlist() {
+        // cargo gives this test process a pile of CARGO_* variables, standing
+        // in for the hub's own (HUB_MASTER_KEY et al).
+        let leaky: Vec<String> = std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| !BUILD_ENV_ALLOWLIST.contains(&k.as_str()))
+            .collect();
+        assert!(!leaky.is_empty(), "test needs some non-allowlisted parent vars");
+        assert!(!BUILD_ENV_ALLOWLIST.contains(&"HUB_MASTER_KEY"));
+
+        let out = build_command("env").output().await.unwrap();
+        assert!(out.status.success());
+        let seen: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_string()))
+            .collect();
+
+        for key in &leaky {
+            assert!(!seen.contains(key), "{key} leaked into the build environment");
+        }
+        // ...while what a toolchain actually needs still comes through.
+        assert!(seen.contains(&"PATH".to_string()), "got {seen:?}");
     }
 
     #[test]
