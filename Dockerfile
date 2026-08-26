@@ -82,6 +82,8 @@ RUN set -eux; \
     go version
 
 COPY --from=build /app/target/release/mcp_hub /usr/local/bin/mcp_hub
+# The AGPL text travels with the binary it covers.
+COPY LICENSE /app/LICENSE
 # Static web assets are read at runtime from the working directory.
 COPY static /app/static
 # Entrypoint applies best-effort runtime hardening (proc hidepid + egress) then

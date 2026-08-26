@@ -78,6 +78,7 @@ All configuration is via environment variables:
 | `HUB_DB_PATH` | no | `/data/hub.db` | SQLite database path. |
 | `HUB_ENV_DIR` | no | `/data/envs` | Where prebuilt virtualenvs for git-sourced servers live (keep on the data volume). |
 | `HUB_LISTEN` | no | `0.0.0.0:8080` | Bind address. |
+| `HUB_SOURCE_URL` | no | upstream repo | Where the footer's **Source** link points. Set this to your own repository if you run a *modified* hub — AGPL §13 requires offering your users the corresponding source. Ignored unless it starts with `http://`/`https://`. |
 | `HUB_HIDEPID` | no | `1` (in image) | Remount `/proc` with `hidepid=2` so a sandbox UID can't read another user's process `cmdline`/`environ`. Needs `CAP_SYS_ADMIN`; skipped (logged) without it. `0` disables. |
 | `HUB_EGRESS_HARDENING` | no | `1` (in image) | Install nftables rules dropping sandbox-UID egress to link-local/cloud-metadata and the hub's own loopback port (RFC1918 stays allowed). Needs `CAP_NET_ADMIN`; skipped (logged) without it. `0` disables. |
 | `HUB_MAX_BACKENDS_PER_USER` | no | `16` | Max live backends per user (shared across that user's sessions). |
@@ -375,4 +376,15 @@ cargo run                                     # needs HUB_BASE_URL + HUB_MASTER_
 
 ## License
 
-MIT OR Apache-2.0
+Copyright (C) 2026 Jeremy Beker.
+
+MCP Hub is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. The full text is in [LICENSE](LICENSE).
+
+The AGPL's section 13 matters here: if you run a modified MCP Hub as a network
+service, you must offer its users the modified source.
+
+The hub icon is third-party and separately licensed — see
+[ATTRIBUTION.md](ATTRIBUTION.md).

@@ -16,12 +16,24 @@ body {
   margin: 0;
   min-height: 100vh;
   display: grid;
+  /* Card centers in the space above; the legal footer rides the bottom. */
+  grid-template-rows: 1fr auto;
   place-items: center;
   background: var(--bg);
   color: var(--fg);
   font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
   padding: 24px;
 }
+/* AGPL section 13: every page offers the running hub's source. Quiet enough to
+   ignore, present enough to satisfy the offer. */
+footer.legal {
+  margin-top: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+footer.legal a { color: var(--muted); }
+footer.legal a:hover { color: var(--fg); }
 /* Interaction states are part of the design: quiet 150ms fades on state
    changes, a visible keyboard focus ring, and no motion for those who ask. */
 a, button, input, textarea, select, summary, nav.tabs a {

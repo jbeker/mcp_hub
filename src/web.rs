@@ -60,6 +60,17 @@ static ASSET_VER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .collect()
 });
 
+/// Where the running hub's source lives, for the AGPL §13 offer in the footer.
+/// An operator running a *modified* hub must point `HUB_SOURCE_URL` at their own
+/// corresponding source; unset (or not an http(s) URL) falls back to upstream.
+static SOURCE_URL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    const UPSTREAM: &str = "https://github.com/jbeker/mcp_hub";
+    match std::env::var("HUB_SOURCE_URL") {
+        Ok(url) if url.starts_with("https://") || url.starts_with("http://") => url,
+        _ => UPSTREAM.to_string(),
+    }
+});
+
 fn page_with(title: &str, body: &str, class: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html>
@@ -72,10 +83,16 @@ fn page_with(title: &str, body: &str, class: &str) -> Html<String> {
 </head>
 <body>
   <main class="{class}">{body}</main>
+  <footer class="legal">
+    MCP Hub v{ver} · <a href="{src}" rel="noopener">Source</a> ·
+    <a href="https://www.gnu.org/licenses/agpl-3.0.html" rel="noopener">AGPL-3.0-or-later</a>
+  </footer>
   <script src="/static/auth.js?v={v}"></script>
 </body>
 </html>"#,
         v = &*ASSET_VER,
+        src = esc(&SOURCE_URL),
+        ver = env!("CARGO_PKG_VERSION"),
     ))
 }
 
