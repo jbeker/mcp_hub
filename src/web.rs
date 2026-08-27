@@ -369,6 +369,7 @@ fn server_fields(
   </div>
   <div class="http-only {http_hidden}">
     <label>Remote URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
+    <p class="muted">To authenticate, set <code>AUTHORIZATION</code> below to the credential; it is sent as <code>Authorization: Bearer &lt;value&gt;</code>. For a different scheme, add <code>AUTHORIZATION_METHOD</code> (e.g. <code>Basic</code>) — the credential is sent verbatim after it, so a <code>Basic</code> one must already be base64.</p>
   </div>
   <label>Environment variables (one <code>KEY=VALUE</code> per line; values may reference <code>${{VAR}}</code>, e.g. <code>GOOGLE_APPLICATION_CREDENTIALS=${{MCP_CONFIG_FILE}}</code>)<textarea name="env" rows="6" placeholder="API_TOKEN=...">{env}</textarea></label>"#,
         transport_field = transport_field,

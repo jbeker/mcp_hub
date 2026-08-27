@@ -1313,6 +1313,88 @@ async fn http_server_add_and_edit() {
     let _ = client.cancel().await;
 }
 
+/// An http backend authenticates with the scheme it was configured with: with
+/// `AUTHORIZATION_METHOD=Basic` the credential must reach the remote verbatim as
+/// `Authorization: Basic <credential>`, not re-encoded and not forced onto
+/// `Bearer`. Asserted on the wire because the header is written by the transport,
+/// below anything the hub's own types can show.
+#[tokio::test]
+async fn http_backend_sends_the_configured_auth_scheme() {
+    use std::sync::{Arc, Mutex};
+
+    // A stand-in for the remote MCP server that records what it was sent. It
+    // never completes the handshake — the header lands on the first POST, which
+    // is all this test needs.
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured = seen.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!(
+        "http://127.0.0.1:{}/mcp",
+        listener.local_addr().unwrap().port()
+    );
+    let app =
+        axum::Router::new().fallback(axum::routing::any(move |headers: axum::http::HeaderMap| {
+            let captured = captured.clone();
+            async move {
+                *captured.lock().unwrap() = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|v| v.to_str().unwrap_or_default().to_string());
+                axum::http::StatusCode::UNAUTHORIZED
+            }
+        }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // The stand-in never handshakes, so cap the wait rather than burning the
+    // default 20s connect timeout — the header is already captured by then.
+    let limits = Limits {
+        backend_connect_timeout_secs: 2,
+        ..Limits::default()
+    };
+    let (base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let def = ServerDef {
+        name: "Remote".into(),
+        description: String::new(),
+        transport: "http".into(),
+        command: None,
+        args: vec![],
+        url: Some(upstream),
+        runtime: "remote".into(),
+        repo: None,
+        git_ref: None,
+        entry: None,
+        module: None,
+    };
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "remote", "Remote")
+        .await
+        .unwrap();
+    let env: std::collections::BTreeMap<String, String> = [
+        ("AUTHORIZATION".to_string(), "dXNlcjpwYXNz".to_string()),
+        ("AUTHORIZATION_METHOD".to_string(), "Basic".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    instances::replace_env(&state.db, &state.secrets, &inst.id, &env)
+        .await
+        .unwrap();
+    make_group(&state, &user.id, "g", std::slice::from_ref(&inst.id)).await;
+
+    // Listing tools binds the group's backends, which dials the stand-in. The
+    // backend fails to initialize (by design), so the hub just reports no tools.
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, &user.id, "c")).await;
+    let _ = client.list_all_tools().await;
+    let _ = client.cancel().await;
+
+    let header = seen.lock().unwrap().clone();
+    assert_eq!(
+        header.as_deref(),
+        Some("Basic dXNlcjpwYXNz"),
+        "backend should have been dialed with the Basic scheme"
+    );
+}
+
 /// The mock backend as a plain stdio ServerDef.
 fn mock_def() -> ServerDef {
     ServerDef {

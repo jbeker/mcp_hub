@@ -80,7 +80,10 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "Replace the full set of environment variables on one of your servers \
              (encrypted at rest). Pass the complete map; omitted keys are removed. \
              Values may reference ${VAR} (expanded at launch), including \
-             ${MCP_CONFIG_FILE} for the config file's path.",
+             ${MCP_CONFIG_FILE} for the config file's path. On an http server, \
+             AUTHORIZATION is sent as the request's Authorization header, using \
+             the Bearer scheme unless AUTHORIZATION_METHOD overrides it (e.g. \
+             Basic); the credential is sent verbatim after the scheme.",
             schema(
                 json!({
                     "namespace": {"type": "string"},

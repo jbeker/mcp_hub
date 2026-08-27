@@ -13,7 +13,7 @@ Run one hub, let your users sign in with **passkeys**, add their own MCP servers
 - **Standards-based auth**: passkeys (WebAuthn) authenticate humans; the hub is its own OAuth 2.1 Authorization Server (PKCE, Dynamic Client Registration, ES256 JWTs, JWKS) for MCP clients.
 - **Sandboxed stdio**: each user's stdio subprocesses run as a distinct unprivileged UID, so a user's command cannot read the master key or other users' secrets.
 
-A **stdio** server runs a command (`uvx …`, `npx …`) as a subprocess; it may optionally point at a **git repo**, which the hub builds once into a cached virtualenv. An **http** server is a remote endpoint the hub proxies (with an `AUTHORIZATION` env var sent as the request header).
+A **stdio** server runs a command (`uvx …`, `npx …`) as a subprocess; it may optionally point at a **git repo**, which the hub builds once into a cached virtualenv. An **http** server is a remote endpoint the hub proxies (with an `AUTHORIZATION` env var sent as the request header, `Bearer` by default).
 
 ## Architecture
 
@@ -176,8 +176,12 @@ the dashboard (**+ Add a server**) or with `hub__add_server`:
 - **stdio**: a command line (e.g. `uvx zabbix-mcp-server`) plus environment
   variables. Optionally give a **git repo**; the hub builds it once into a cached
   virtualenv and runs the command inside it (see below).
-- **http**: a remote URL the hub proxies. Put an auth token in the `AUTHORIZATION`
-  env var and it is sent as the request's `Authorization` header.
+- **http**: a remote URL the hub proxies. Put the credential in the
+  `AUTHORIZATION` env var and it is sent as the request's `Authorization` header,
+  using the `Bearer` scheme. For a backend that wants a different scheme, set
+  `AUTHORIZATION_METHOD` (e.g. `Basic`, `Token`, `ApiKey`). The credential is sent
+  verbatim after the scheme — nothing is encoded for you, so a `Basic` credential
+  must already be base64 (`printf 'user:pass' | base64`).
 
 Environment variables are entered as `KEY=VALUE` lines, encrypted at rest, and
 shown back to you (your own data) when editing.

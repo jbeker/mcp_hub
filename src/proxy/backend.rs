@@ -1,9 +1,10 @@
 //! A single upstream backend connection (stdio subprocess or remote HTTP),
 //! wrapped as an MCP client whose tools the hub re-exports under a namespace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, bail, Context, Result};
+use axum::http::{header, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Prompt,
     ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
@@ -570,10 +571,22 @@ pub fn remove_workdir(env_dir: &str, instance_id: &str) {
     let _ = std::fs::remove_dir_all(workdir_path(env_dir, instance_id));
 }
 
+/// Env var holding an http backend's credential, sent as the `Authorization`
+/// header.
+const AUTH_KEY: &str = "AUTHORIZATION";
+/// Env var overriding the `Authorization` scheme. Defaults to `Bearer`.
+const AUTH_METHOD_KEY: &str = "AUTHORIZATION_METHOD";
+
 /// Build the Streamable-HTTP transport config for an http backend, applying the
-/// `AUTHORIZATION` env var as the bearer credential if present. (Returns the
+/// `AUTHORIZATION` env var as the credential if present. The scheme is `Bearer`
+/// unless `AUTHORIZATION_METHOD` overrides it (e.g. `Basic`). (Returns the
 /// config rather than the transport so the concrete reqwest-backed type need not
 /// be named at the call sites.)
+///
+/// `Bearer` goes through rmcp's `auth_header`, which its reqwest client turns
+/// into `Authorization: Bearer <value>`; any other scheme has to be written as a
+/// custom header, since `auth_header` cannot express one. The two are mutually
+/// exclusive — setting both would emit two `Authorization` headers.
 fn http_config(
     def: &ServerDef,
     env: &BTreeMap<String, String>,
@@ -583,10 +596,39 @@ fn http_config(
         .clone()
         .ok_or_else(|| anyhow!("http backend has no url"))?;
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
-    if let Some(auth) = env.get("AUTHORIZATION").filter(|v| !v.is_empty()) {
-        config = config.auth_header(strip_bearer(auth));
+    if let Some(auth) = env.get(AUTH_KEY).filter(|v| !v.is_empty()) {
+        let scheme = env
+            .get(AUTH_METHOD_KEY)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Bearer");
+        if scheme.eq_ignore_ascii_case("Bearer") {
+            config = config.auth_header(strip_scheme(auth, "Bearer"));
+        } else {
+            validate_scheme(scheme)?;
+            let value = format!("{scheme} {}", strip_scheme(auth, scheme));
+            let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
+                anyhow!("{AUTH_KEY} contains characters that are not valid in an HTTP header")
+            })?;
+            header_value.set_sensitive(true);
+            config = config.custom_headers(HashMap::from([(header::AUTHORIZATION, header_value)]));
+        }
     }
     Ok(config)
+}
+
+/// Reject an `AUTHORIZATION_METHOD` that is not a bare auth scheme. Per RFC 7235
+/// a scheme is a `token`, so this also rules out the spaces and CR/LF that would
+/// otherwise let a scheme smuggle extra headers into the request.
+fn validate_scheme(scheme: &str) -> Result<()> {
+    let is_token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if scheme.chars().all(is_token) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{AUTH_METHOD_KEY} must be a bare auth scheme such as 'Bearer' or 'Basic', got '{scheme}'"
+        ))
+    }
 }
 
 /// Drain a failed child's stderr (bounded in time and size) and return the tail
@@ -623,13 +665,15 @@ pub(crate) fn unwrap_uri(wrapped: &str) -> Option<(&str, &str)> {
     wrapped.strip_prefix("hub://")?.split_once('/')
 }
 
-/// Strip a leading `Bearer ` (case-insensitive) since reqwest re-adds it.
-fn strip_bearer(value: &str) -> String {
+/// Strip a leading `<scheme> ` (case-insensitive) from a credential, so a value
+/// entered as either `Basic abc` or `abc` yields the same header. Only the
+/// scheme actually in use is stripped — a mismatched prefix is left alone rather
+/// than guessed at.
+fn strip_scheme(value: &str, scheme: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
-        trimmed[7..].trim().to_string()
-    } else {
-        trimmed.to_string()
+    match trimmed.split_once(' ') {
+        Some((first, rest)) if first.eq_ignore_ascii_case(scheme) => rest.trim().to_string(),
+        _ => trimmed.to_string(),
     }
 }
 
@@ -852,9 +896,116 @@ mod tests {
     }
 
     #[test]
-    fn strip_bearer_is_case_insensitive() {
-        assert_eq!(strip_bearer("Bearer abc"), "abc");
-        assert_eq!(strip_bearer("bearer  abc "), "abc");
-        assert_eq!(strip_bearer("abc"), "abc");
+    fn strip_scheme_is_case_insensitive_and_only_strips_its_own_scheme() {
+        assert_eq!(strip_scheme("Bearer abc", "Bearer"), "abc");
+        assert_eq!(strip_scheme("bearer  abc ", "Bearer"), "abc");
+        assert_eq!(strip_scheme("abc", "Bearer"), "abc");
+        assert_eq!(strip_scheme("Basic dXNlcjpwYXNz", "Basic"), "dXNlcjpwYXNz");
+        // A prefix that is not the scheme in use is part of the credential.
+        assert_eq!(strip_scheme("Bearer abc", "Basic"), "Bearer abc");
+    }
+
+    fn http_def(url: &str) -> ServerDef {
+        ServerDef {
+            name: "t".into(),
+            description: String::new(),
+            transport: "http".into(),
+            command: None,
+            args: Vec::new(),
+            url: Some(url.into()),
+            runtime: "test".into(),
+            repo: None,
+            git_ref: None,
+            entry: None,
+            module: None,
+        }
+    }
+
+    fn config_for(env: &[(&str, &str)]) -> Result<StreamableHttpClientTransportConfig> {
+        let env: BTreeMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        http_config(&http_def("https://example.net/mcp"), &env)
+    }
+
+    /// The custom `Authorization` header value, if one was set.
+    fn custom_auth(config: &StreamableHttpClientTransportConfig) -> Option<&str> {
+        config
+            .custom_headers
+            .get(&header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap())
+    }
+
+    /// Without `AUTHORIZATION_METHOD` the credential stays on rmcp's bearer
+    /// path, which re-adds the `Bearer ` prefix — so it is stripped here.
+    #[test]
+    fn bearer_is_the_default_scheme() {
+        for env in [
+            vec![("AUTHORIZATION", "t")],
+            vec![("AUTHORIZATION", "Bearer t")],
+            vec![("AUTHORIZATION", "t"), ("AUTHORIZATION_METHOD", "Bearer")],
+            vec![("AUTHORIZATION", "t"), ("AUTHORIZATION_METHOD", "bearer")],
+            // An empty override falls back to the default rather than erroring.
+            vec![("AUTHORIZATION", "t"), ("AUTHORIZATION_METHOD", "  ")],
+        ] {
+            let config = config_for(&env).unwrap();
+            assert_eq!(config.auth_header.as_deref(), Some("t"), "{env:?}");
+            assert!(custom_auth(&config).is_none(), "{env:?}");
+        }
+    }
+
+    /// A non-Bearer scheme moves to a custom header, and must not also set
+    /// `auth_header` — that would send two `Authorization` headers.
+    #[test]
+    fn other_schemes_become_a_custom_authorization_header() {
+        for (value, method, expected) in [
+            ("dXNlcjpwYXNz", "Basic", "Basic dXNlcjpwYXNz"),
+            // Already prefixed by the user: not doubled.
+            ("Basic dXNlcjpwYXNz", "Basic", "Basic dXNlcjpwYXNz"),
+            ("abc123", "Token", "Token abc123"),
+            ("abc123", "ApiKey", "ApiKey abc123"),
+        ] {
+            let config =
+                config_for(&[("AUTHORIZATION", value), ("AUTHORIZATION_METHOD", method)]).unwrap();
+            assert_eq!(custom_auth(&config), Some(expected));
+            assert_eq!(config.auth_header, None, "{method}");
+        }
+    }
+
+    /// A scheme is a bare RFC 7235 token; anything else is a config error rather
+    /// than a chance to smuggle a second header into the request.
+    #[test]
+    fn a_malformed_scheme_is_rejected() {
+        for method in ["Bad Scheme", "Basic\r\nX-Evil: 1", "Ba,sic", "Basic\ttoken"] {
+            let err = match config_for(&[("AUTHORIZATION", "t"), ("AUTHORIZATION_METHOD", method)])
+            {
+                Err(e) => e,
+                Ok(c) => panic!("{method:?} should have been rejected, got {c:?}"),
+            };
+            assert!(
+                err.to_string().contains("AUTHORIZATION_METHOD"),
+                "{err} ({method:?})"
+            );
+        }
+        // Surrounding whitespace is not malformed, just untidy.
+        let config =
+            config_for(&[("AUTHORIZATION", "t"), ("AUTHORIZATION_METHOD", " Basic\n")]).unwrap();
+        assert_eq!(custom_auth(&config), Some("Basic t"));
+    }
+
+    /// The scheme alone authorizes nothing — without a credential no header is
+    /// sent at all.
+    #[test]
+    fn no_credential_means_no_header() {
+        for env in [
+            vec![("AUTHORIZATION_METHOD", "Basic")],
+            vec![("AUTHORIZATION", ""), ("AUTHORIZATION_METHOD", "Basic")],
+            vec![],
+        ] {
+            let config = config_for(&env).unwrap();
+            assert_eq!(config.auth_header, None, "{env:?}");
+            assert!(custom_auth(&config).is_none(), "{env:?}");
+        }
     }
 }
