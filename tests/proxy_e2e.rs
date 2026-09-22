@@ -156,6 +156,7 @@ async fn unbuilt_git_backend_is_skipped() {
         git_ref: Some("main".into()),
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "git", "Git Server")
         .await
@@ -221,6 +222,7 @@ async fn git_credential_tools_never_echo_the_token() {
         git_ref: Some("main".into()),
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     instances::create(&state.db, "u1", None, Some(&def), "git", "Git Server")
         .await
@@ -313,6 +315,7 @@ async fn proxy_aggregates_a_stdio_backend() {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
@@ -406,6 +409,7 @@ async fn slow_backend_call_times_out() {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
@@ -472,6 +476,7 @@ async fn restart_reloads_backend_config_in_a_live_session() {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
@@ -541,6 +546,7 @@ async fn failed_backend_reports_error_status() {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "broken", "Broken")
         .await
@@ -603,6 +609,7 @@ async fn proxy_aggregates_resources_and_prompts() {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
@@ -1047,6 +1054,7 @@ async fn hub_with_mock_backend() -> (String, AppState, String, String) {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "mock", "Mock")
         .await
@@ -1366,6 +1374,7 @@ async fn http_backend_sends_the_configured_auth_scheme() {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     };
     let inst = instances::create(&state.db, &user.id, None, Some(&def), "remote", "Remote")
         .await
@@ -1409,6 +1418,7 @@ fn mock_def() -> ServerDef {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     }
 }
 
@@ -1515,6 +1525,47 @@ async fn hung_initialize_is_timed_out_and_skipped() {
 
     let _ = client.cancel().await;
     let _ = mclient.cancel().await;
+}
+
+/// A server's own `connect_timeout_secs` overrides the hub-wide default: with
+/// the hub set to 1s, a backend that takes ~2.5s to answer `initialize` still
+/// comes up when its definition allows it longer.
+#[tokio::test]
+async fn per_server_connect_timeout_overrides_hub_default() {
+    let limits = Limits {
+        backend_connect_timeout_secs: 1,
+        bind_budget_secs: 0,
+        ..Limits::default()
+    };
+    let (base, state) = spawn_hub_with_limits(limits).await;
+    let user = users::create(&state.db, "u1", "alice", "Alice", false)
+        .await
+        .unwrap();
+    let def = ServerDef {
+        connect_timeout_secs: Some(15),
+        ..mock_def()
+    };
+    let inst = instances::create(&state.db, &user.id, None, Some(&def), "slow", "Slow")
+        .await
+        .unwrap();
+    instances::set_config_value(&state.db, &inst.id, "MOCK_INIT_DELAY_MS", "2500")
+        .await
+        .unwrap();
+    make_group(&state, &user.id, "g", &[inst.id]).await;
+
+    let client = connect_at(&base, "/mcp/g", group_token(&state, &base, "u1", "client")).await;
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "slow__pid"),
+        "backend should have connected under its own 15s cap: {names:?}"
+    );
+    let _ = client.cancel().await;
 }
 
 /// A backend that hangs answering `tools/list` is skipped from the aggregate

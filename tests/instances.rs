@@ -25,6 +25,7 @@ fn stdio_def(command: &str, args: &[&str]) -> ServerDef {
         git_ref: None,
         entry: None,
         module: None,
+        connect_timeout_secs: None,
     }
 }
 

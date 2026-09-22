@@ -341,6 +341,8 @@ fn server_fields(
     url: &str,
     env: &str,
     config_file: &str,
+    connect_timeout: &str,
+    hub_connect_timeout_secs: u64,
 ) -> String {
     let stdio_hidden = if transport == "http" { "hidden" } else { "" };
     let http_hidden = if transport == "http" { "" } else { "hidden" };
@@ -371,7 +373,8 @@ fn server_fields(
     <label>Remote URL<input name="url" value="{url}" placeholder="https://server.example.com/mcp"></label>
     <p class="muted">To authenticate, set <code>AUTHORIZATION</code> below to the credential; it is sent as <code>Authorization: Bearer &lt;value&gt;</code>. For a different scheme, add <code>AUTHORIZATION_METHOD</code> (e.g. <code>Basic</code>) — the credential is sent verbatim after it, so a <code>Basic</code> one must already be base64.</p>
   </div>
-  <label>Environment variables (one <code>KEY=VALUE</code> per line; values may reference <code>${{VAR}}</code>, e.g. <code>GOOGLE_APPLICATION_CREDENTIALS=${{MCP_CONFIG_FILE}}</code>)<textarea name="env" rows="6" placeholder="API_TOKEN=...">{env}</textarea></label>"#,
+  <label>Environment variables (one <code>KEY=VALUE</code> per line; values may reference <code>${{VAR}}</code>, e.g. <code>GOOGLE_APPLICATION_CREDENTIALS=${{MCP_CONFIG_FILE}}</code>)<textarea name="env" rows="6" placeholder="API_TOKEN=...">{env}</textarea></label>
+  <label>Connect timeout in seconds (optional — how long the hub waits for this server to start and answer <code>initialize</code>; blank uses the hub default of {hub_connect}, <code>0</code> waits forever)<input name="connect_timeout_secs" type="number" min="0" step="1" value="{connect_timeout}" placeholder="{hub_connect_placeholder}"></label>"#,
         transport_field = transport_field,
         stdio_hidden = stdio_hidden,
         http_hidden = http_hidden,
@@ -381,6 +384,9 @@ fn server_fields(
         url = esc(url),
         env = esc(env),
         config_file = esc(config_file),
+        connect_timeout = esc(connect_timeout),
+        hub_connect = secs_or(hub_connect_timeout_secs, "no limit"),
+        hub_connect_placeholder = hub_connect_timeout_secs,
     )
 }
 
@@ -401,7 +407,18 @@ pub async fn new_server(
   <button type="submit">Add server</button>
 </form>"#,
         csrf = csrf,
-        fields = server_fields("stdio", true, "", "", "", "", "", ""),
+        fields = server_fields(
+            "stdio",
+            true,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            state.config.limits.backend_connect_timeout_secs,
+        ),
     );
     page("Add a server", &body).into_response()
 }
@@ -429,6 +446,8 @@ pub struct CreateServerForm {
     pub env: String,
     #[serde(default)]
     pub config_file: String,
+    #[serde(default)]
+    pub connect_timeout_secs: String,
 }
 
 /// `POST /servers/create`
@@ -510,6 +529,8 @@ fn def_from_form(
         return Err("transport must be stdio or http".into());
     }
     let env = instances::parse_env(&form.env).map_err(|e| e.to_string())?;
+    let connect_timeout_secs =
+        instances::parse_connect_timeout(&form.connect_timeout_secs).map_err(|e| e.to_string())?;
     let opt = |s: &str| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
@@ -549,6 +570,7 @@ fn def_from_form(
             git_ref,
             entry: None,
             module: None,
+            connect_timeout_secs,
         },
         env,
     ))
@@ -625,6 +647,10 @@ pub async fn server_detail(
         def.url.as_deref().unwrap_or(""),
         &instances::render_env(&env),
         &config_file,
+        &def.connect_timeout_secs
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        state.config.limits.backend_connect_timeout_secs,
     );
 
     let toggle = if inst.enabled {
@@ -1235,7 +1261,7 @@ async fn probe_instance(
         &inst.id,
         config_file.as_deref(),
         state.config.child_limits,
-        state.config.limits.backend_connect_timeout_secs,
+        def.connect_timeout_or(state.config.limits.backend_connect_timeout_secs),
     )
     .await
     {
@@ -2891,7 +2917,7 @@ pub async fn stats_page(
 <tr><td>Max backends per user</td><td>{per_user}</td><td><code>HUB_MAX_BACKENDS_PER_USER</code></td></tr>
 <tr><td>Backend idle timeout</td><td>{idle}</td><td><code>HUB_BACKEND_IDLE_SECS</code></td></tr>
 <tr><td>Per-call timeout</td><td>{call}</td><td><code>HUB_BACKEND_CALL_TIMEOUT_SECS</code></td></tr>
-<tr><td>Connect timeout</td><td>{connect}</td><td><code>HUB_BACKEND_CONNECT_TIMEOUT_SECS</code></td></tr>
+<tr><td>Connect timeout (default; servers may override)</td><td>{connect}</td><td><code>HUB_BACKEND_CONNECT_TIMEOUT_SECS</code></td></tr>
 <tr><td>List timeout</td><td>{list}</td><td><code>HUB_BACKEND_LIST_TIMEOUT_SECS</code></td></tr>
 <tr><td>Bind budget</td><td>{budget}</td><td><code>HUB_BIND_BUDGET_SECS</code></td></tr>
 <tr><td>Keep warm</td><td>{warm}</td><td><code>HUB_KEEP_WARM</code></td></tr>

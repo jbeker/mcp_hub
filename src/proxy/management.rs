@@ -55,22 +55,25 @@ pub fn tools(admin: bool) -> Vec<Tool> {
                     "git_ref": {"type": "string", "description": "branch/tag for 'repo' (default main)"},
                     "display_name": {"type": "string"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Values may reference ${VAR}, e.g. GOOGLE_APPLICATION_CREDENTIALS=${MCP_CONFIG_FILE}"},
-                    "config_file": {"type": "string", "description": "stdio (optional): config file written to the server's working dir, path in MCP_CONFIG_FILE"}
+                    "config_file": {"type": "string", "description": "stdio (optional): config file written to the server's working dir, path in MCP_CONFIG_FILE"},
+                    "connect_timeout_secs": {"type": "integer", "minimum": 0, "description": "Seconds the hub waits for this server to start and answer initialize; omit to use the hub default (HUB_BACKEND_CONNECT_TIMEOUT_SECS), 0 = no limit"}
                 }),
                 &["namespace", "transport"],
             ),
         ),
         tool(
             "hub__edit_server",
-            "Change one of your servers' command/url/repo (omitted fields are \
-             left unchanged).",
+            "Change one of your servers' command/url/repo/connect_timeout_secs \
+             (omitted fields are left unchanged; pass connect_timeout_secs as \
+             null to go back to the hub default).",
             schema(
                 json!({
                     "namespace": {"type": "string"},
                     "command": {"type": "string"},
                     "url": {"type": "string"},
                     "repo": {"type": "string"},
-                    "git_ref": {"type": "string"}
+                    "git_ref": {"type": "string"},
+                    "connect_timeout_secs": {"type": ["integer", "null"], "minimum": 0, "description": "Seconds the hub waits for this server to start and answer initialize; 0 = no limit, null = hub default"}
                 }),
                 &["namespace"],
             ),
@@ -662,6 +665,7 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
             "transport": def.as_ref().map(|d| d.transport.clone()),
             "url": def.as_ref().and_then(|d| d.url.clone()),
             "repo": def.as_ref().and_then(|d| d.repo.clone()),
+            "connect_timeout_secs": def.as_ref().and_then(|d| d.connect_timeout_secs),
             "command": command,
             "env_keys": env_keys,
             "build_status": i.build_status,
@@ -678,6 +682,7 @@ async fn list_my_servers(state: &AppState, user_id: &str) -> Result<CallToolResu
 /// Build a `ServerDef` from add-server args (transport stdio | http).
 fn def_from_args(args: &JsonObject, display_name: &str) -> Result<ServerDef, McpError> {
     let transport = req_str(args, "transport")?;
+    let connect_timeout_secs = opt_secs(args, "connect_timeout_secs")?;
     if !matches!(transport.as_str(), "stdio" | "http") {
         return Err(McpError::invalid_params(
             "transport must be stdio or http",
@@ -699,6 +704,7 @@ fn def_from_args(args: &JsonObject, display_name: &str) -> Result<ServerDef, Mcp
             git_ref: None,
             entry: None,
             module: None,
+            connect_timeout_secs,
         })
     } else {
         let line = req_str(args, "command")?;
@@ -726,6 +732,7 @@ fn def_from_args(args: &JsonObject, display_name: &str) -> Result<ServerDef, Mcp
             git_ref,
             entry: None,
             module: None,
+            connect_timeout_secs,
         })
     }
 }
@@ -812,6 +819,10 @@ async fn edit_server(
     }
     if let Some(git_ref) = opt_str(args, "git_ref") {
         def.git_ref = Some(git_ref);
+    }
+    if args.contains_key("connect_timeout_secs") {
+        // Present-but-null resets to the hub default; an integer overrides it.
+        def.connect_timeout_secs = opt_secs(args, "connect_timeout_secs")?;
     }
     instances::update_def(&state.db, &inst.id, &def)
         .await
@@ -1430,9 +1441,55 @@ fn opt_str(args: &JsonObject, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// An optional non-negative whole number of seconds. Absent or `null` is
+/// `None`; anything else must be an unsigned integer.
+fn opt_secs(args: &JsonObject, key: &str) -> Result<Option<u64>, McpError> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            McpError::invalid_params(
+                format!("'{key}' must be a whole number of seconds (0 = no limit)"),
+                None,
+            )
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::tools;
+    use super::{def_from_args, opt_secs};
+    use serde_json::json;
+
+    /// `connect_timeout_secs` is optional on add, must be a non-negative
+    /// integer when given, and `null` reads as "not set".
+    #[test]
+    fn connect_timeout_argument_parsing() {
+        let args = |v: serde_json::Value| v.as_object().unwrap().clone();
+
+        let a = args(json!({"transport": "http", "url": "https://e.example/mcp"}));
+        assert_eq!(def_from_args(&a, "x").unwrap().connect_timeout_secs, None);
+
+        let a = args(
+            json!({"transport": "stdio", "command": "uvx thing", "connect_timeout_secs": 120}),
+        );
+        assert_eq!(
+            def_from_args(&a, "x").unwrap().connect_timeout_secs,
+            Some(120)
+        );
+
+        let a = args(json!({"connect_timeout_secs": null}));
+        assert_eq!(opt_secs(&a, "connect_timeout_secs").unwrap(), None);
+        let a = args(json!({"connect_timeout_secs": 0}));
+        assert_eq!(opt_secs(&a, "connect_timeout_secs").unwrap(), Some(0));
+        for bad in [json!(-5), json!(1.5), json!("30")] {
+            let a = args(json!({"connect_timeout_secs": bad}));
+            assert!(
+                opt_secs(&a, "connect_timeout_secs").is_err(),
+                "{bad} accepted"
+            );
+        }
+    }
 
     /// Every management tool carries behavioral-hint annotations, and the
     /// representative tools land in the right categories.

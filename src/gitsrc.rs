@@ -825,6 +825,7 @@ mod tests {
             git_ref: Some("main".into()),
             entry: None,
             module: None,
+            connect_timeout_secs: None,
         }
     }
 

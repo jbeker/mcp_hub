@@ -524,7 +524,7 @@ async fn spawn_one(
         &state.config.env_dir,
         config_file.as_deref(),
         state.config.child_limits,
-        state.config.limits.backend_connect_timeout_secs,
+        def.connect_timeout_or(state.config.limits.backend_connect_timeout_secs),
     )
     .await;
     let elapsed_ms = t0.elapsed().as_millis() as u64;

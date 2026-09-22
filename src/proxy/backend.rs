@@ -694,6 +694,7 @@ mod tests {
             git_ref: None,
             entry: None,
             module: None,
+            connect_timeout_secs: None,
         }
     }
 
@@ -918,6 +919,7 @@ mod tests {
             git_ref: None,
             entry: None,
             module: None,
+            connect_timeout_secs: None,
         }
     }
 

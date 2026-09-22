@@ -214,6 +214,7 @@ mod tests {
             git_ref: None,
             entry: None,
             module: None,
+            connect_timeout_secs: None,
         };
         instances::create(pool, user_id, None, Some(&def), ns, ns)
             .await

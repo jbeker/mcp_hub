@@ -41,9 +41,21 @@ pub struct ServerDef {
     pub entry: Option<String>,
     #[serde(default)]
     pub module: Option<String>,
+    /// Per-server cap in seconds on spawning + `initialize`-ing this backend.
+    /// `None` inherits the hub-wide `HUB_BACKEND_CONNECT_TIMEOUT_SECS`; `Some(0)`
+    /// waits forever. Slow-starting servers (a cold `uvx`, a large Go binary)
+    /// raise it without loosening the limit for everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 impl ServerDef {
+    /// The connect timeout this server should be spawned with: its own
+    /// `connect_timeout_secs` when set, else the hub-wide default.
+    pub fn connect_timeout_or(&self, hub_default_secs: u64) -> u64 {
+        self.connect_timeout_secs.unwrap_or(hub_default_secs)
+    }
+
     /// Normalise legacy shapes: collapse `transport == "git"` to `"stdio"`, and
     /// derive a command line from a legacy `entry`/`module` when none is set, so
     /// the rest of the code only ever deals with `command` + `args`.
@@ -476,6 +488,7 @@ pub async fn migrate_catalog_instances(pool: &SqlitePool, secrets: &SecretBox) -
             git_ref,
             entry,
             module,
+            connect_timeout_secs: None,
         }
         .normalized();
 
@@ -640,6 +653,19 @@ pub async fn env_for_edit(
         }
     }
     Ok(out)
+}
+
+/// Parse a per-server connect timeout as typed into a form: blank means
+/// "inherit the hub default" (`None`); otherwise a whole number of seconds,
+/// where `0` waits forever.
+pub fn parse_connect_timeout(raw: &str) -> Result<Option<u64>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<u64>()
+        .map(Some)
+        .map_err(|_| anyhow!("connect timeout must be a whole number of seconds (0 = no limit)"))
 }
 
 /// Parse a `KEY=VALUE` env block (one per line; blanks and `#` comments skipped).
@@ -885,6 +911,47 @@ async fn decrypt_config_file(
 #[cfg(test)]
 mod tests {
     use super::{check_backend_host, ip_is_private, validate_remote_url, CapabilitiesSnapshot};
+    use super::{parse_connect_timeout, ServerDef};
+
+    fn def() -> ServerDef {
+        serde_json::from_str(r#"{"name":"x","transport":"http","url":"https://e.example/mcp"}"#)
+            .unwrap()
+    }
+
+    /// Definitions stored before the field existed load with no override and
+    /// serialize without it, so old rows round-trip unchanged.
+    #[test]
+    fn connect_timeout_defaults_to_the_hub_setting() {
+        let d = def();
+        assert_eq!(d.connect_timeout_secs, None);
+        assert_eq!(d.connect_timeout_or(20), 20);
+        assert!(!serde_json::to_string(&d)
+            .unwrap()
+            .contains("connect_timeout_secs"));
+
+        let mut d = def();
+        d.connect_timeout_secs = Some(90);
+        assert_eq!(d.connect_timeout_or(20), 90);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""connect_timeout_secs":90"#), "{json}");
+        let back: ServerDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.connect_timeout_secs, Some(90));
+
+        // An explicit zero is "no limit", distinct from "inherit".
+        d.connect_timeout_secs = Some(0);
+        assert_eq!(d.connect_timeout_or(20), 0);
+    }
+
+    #[test]
+    fn connect_timeout_form_parsing() {
+        assert_eq!(parse_connect_timeout("").unwrap(), None);
+        assert_eq!(parse_connect_timeout("   ").unwrap(), None);
+        assert_eq!(parse_connect_timeout(" 45 ").unwrap(), Some(45));
+        assert_eq!(parse_connect_timeout("0").unwrap(), Some(0));
+        assert!(parse_connect_timeout("-1").is_err());
+        assert!(parse_connect_timeout("1.5").is_err());
+        assert!(parse_connect_timeout("soon").is_err());
+    }
 
     #[test]
     fn remote_url_validation() {

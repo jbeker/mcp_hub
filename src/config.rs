@@ -116,9 +116,10 @@ pub struct Limits {
     /// 0 = no timeout. Stops one wedged backend from hanging a client forever.
     /// Defaults to 90s; set the env var to `0` to opt back into unbounded calls.
     pub backend_call_timeout_secs: u64,
-    /// Wall-clock cap on spawning + `initialize`-ing one backend
+    /// Default wall-clock cap on spawning + `initialize`-ing one backend
     /// (`HUB_BACKEND_CONNECT_TIMEOUT_SECS`); 0 = unbounded. A backend that hangs
-    /// during its handshake is marked failed instead of stalling the bind.
+    /// during its handshake is marked failed instead of stalling the bind. A
+    /// server definition may override it (`ServerDef::connect_timeout_secs`).
     pub backend_connect_timeout_secs: u64,
     /// Wall-clock cap on one backend's tools/resources/prompts list call
     /// (`HUB_BACKEND_LIST_TIMEOUT_SECS`); 0 = unbounded. A backend that hangs
