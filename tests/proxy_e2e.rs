@@ -2366,3 +2366,45 @@ async fn edit_server_restarts_backend_in_a_live_session() {
     let _ = gclient.cancel().await;
     let _ = mclient.cancel().await;
 }
+
+/// Connecting a backend through the pool re-captures its capabilities
+/// snapshot, so the Capabilities tab, dashboard tool counts, and
+/// `hub__list_groups` describe the build that is actually running — not just
+/// the last time someone clicked Test / Refresh.
+#[tokio::test]
+async fn connecting_a_backend_refreshes_its_capabilities_snapshot() {
+    let (base, state, user_id, inst_id) = hub_with_mock_backend().await;
+    assert!(
+        instances::get_capabilities_snapshot(&state.db, &inst_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no snapshot before the first connect"
+    );
+
+    let client = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
+    let _ = client.list_all_tools().await.unwrap();
+
+    // The refresh is detached from the bind; give it a moment.
+    let mut snap = None;
+    for _ in 0..50 {
+        snap = instances::get_capabilities_snapshot(&state.db, &inst_id)
+            .await
+            .unwrap();
+        if snap.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let snap = snap.expect("snapshot written after connect");
+    let names: Vec<&str> = snap.tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(names.contains(&"echo"), "snapshot tools: {names:?}");
+    assert!(snap.fetched_at > 0);
+
+    let _ = client.cancel().await;
+}

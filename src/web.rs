@@ -1283,7 +1283,7 @@ async fn probe_instance(
 }
 
 /// `/servers/{id}/capabilities` — the Capabilities tab: everything the backend
-/// advertised to MCP clients the last time it was probed, rendered from the
+/// advertised to MCP clients the last time it connected or was probed, rendered from the
 /// cached snapshot.
 pub async fn server_capabilities(
     State(state): State<AppState>,

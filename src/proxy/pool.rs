@@ -337,22 +337,27 @@ impl UserBackends {
                 let late = late.clone();
                 let sandbox = sandbox.clone();
                 tokio::spawn(async move {
-                    let backend = spawn_one(&state, &inst, sandbox.as_ref(), permit).await;
-                    let announce = {
+                    let backend = spawn_one(&state, &inst, sandbox.as_ref(), permit)
+                        .await
+                        .map(Arc::new);
+                    let (announce, pooled) = {
                         let mut inner = ub.inner.lock().unwrap();
                         inner.connecting.remove(&inst.id);
                         match backend {
                             // Untracked means the instance was disabled or
                             // deleted while we were connecting: drop it.
                             Some(b) if inner.applied_epochs.contains_key(&inst.id) => {
-                                inner.backends.push(Arc::new(b));
-                                late.load(Ordering::SeqCst)
+                                inner.backends.push(b.clone());
+                                (late.load(Ordering::SeqCst), Some(b))
                             }
-                            _ => false,
+                            _ => (false, None),
                         }
                     };
                     if announce {
                         state.notify_tools_changed(&ub.user_id);
+                    }
+                    if let Some(b) = pooled {
+                        refresh_snapshot(state, inst.id, b);
                     }
                 })
             })
@@ -556,6 +561,45 @@ async fn spawn_one(
             None
         }
     }
+}
+
+/// Re-capture a freshly connected backend's capabilities snapshot (what the
+/// Capabilities tab, the dashboard tool counts, `hub__list_groups`, and the
+/// `mcp_hub_group_tools` gauge read) so they describe the build that is
+/// actually running, not the last time someone clicked Test / Refresh.
+/// Detached and best-effort: it must not hold up the bind, and a failure just
+/// leaves the previous snapshot in place. Capped by the list timeout
+/// (`HUB_BACKEND_LIST_TIMEOUT_SECS`; 0 = none) so a wedged child can't pin the
+/// task forever.
+fn refresh_snapshot(state: AppState, instance_id: String, backend: Arc<Backend>) {
+    tokio::spawn(async move {
+        let secs = state.config.limits.backend_list_timeout_secs;
+        let capture = backend.capabilities_snapshot();
+        let snap = if secs == 0 {
+            capture.await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(secs), capture).await {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(
+                        namespace = %backend.namespace,
+                        secs,
+                        "capabilities snapshot timed out; keeping the previous one"
+                    );
+                    return;
+                }
+            }
+        };
+        if let Err(e) = instances::set_capabilities_snapshot(&state.db, &instance_id, &snap).await {
+            tracing::warn!(namespace = %backend.namespace, error = %e, "storing capabilities snapshot");
+        } else {
+            tracing::debug!(
+                namespace = %backend.namespace,
+                tools = snap.tools.len(),
+                "refreshed capabilities snapshot on connect"
+            );
+        }
+    });
 }
 
 /// Bind (or re-touch) the pooled backends of every non-disabled user with at

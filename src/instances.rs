@@ -82,8 +82,9 @@ impl ServerDef {
     }
 }
 
-/// What a backend advertised to the hub the last time it was probed (Test
-/// connection / Refresh capabilities). Cached as JSON in
+/// What a backend advertised to the hub the last time it connected — refreshed
+/// whenever the pool (re)spawns it, and by Test connection / Refresh
+/// capabilities. Cached as JSON in
 /// `user_server_instances.capabilities_json`. Persists rmcp's own wire shapes;
 /// if a future rmcp upgrade can no longer parse an old row, the cache simply
 /// reads as "never fetched" and one refresh re-captures it.

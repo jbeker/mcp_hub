@@ -269,6 +269,13 @@ impl Backend {
             .with_context(|| format!("calling tool on '{}'", self.namespace))
     }
 
+    /// Everything this live backend advertises (initialize result plus its
+    /// tool/prompt/resource lists), for the persisted capabilities snapshot.
+    /// Best-effort like [`probe`](Self::probe): a list that fails reads as empty.
+    pub async fn capabilities_snapshot(&self) -> crate::instances::CapabilitiesSnapshot {
+        capture_snapshot(&self.peer).await
+    }
+
     /// Whether the connection's transport has closed underneath us (the stdio
     /// child died, the http stream dropped). A closed backend serves nothing
     /// and should be respawned.

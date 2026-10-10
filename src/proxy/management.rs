@@ -192,7 +192,7 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "List your connector groups: each is its own MCP endpoint at \
              /mcp/<slug> serving only its member servers' tools. Shows every \
              group's connector URL, member servers with tool counts (from the \
-             last capability probe; may be stale), and whether the total fits \
+             last connect or capability probe), and whether the total fits \
              under claude.ai's 256-tool cap.",
             schema(json!({}), &[]),
         ),
@@ -1273,7 +1273,7 @@ async fn group_json(
         "servers": members,
         "total_tool_count": total,
         "fits_claude_ai": total.map(|t| t <= 256),
-        "note": "tool counts come from each server's last capability probe and may be stale",
+        "note": "tool counts come from each server's last connect or capability probe",
     }))
 }
 
