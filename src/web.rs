@@ -737,7 +737,7 @@ pub async fn server_detail(
   {toggle}
   <form method="post" action="/servers/{id}/delete" data-confirm="Remove this server?">{csrf}<button class="ghost danger">Remove</button></form>
 </div>
-<p class="muted">Restart relaunches this server in your connected MCP sessions to apply configuration changes (it takes effect on their next request).</p>"#,
+<p class="muted">Saving configuration or updating from the repository relaunches this server in your connected MCP sessions automatically; Restart does the same on demand (it takes effect on their next request).</p>"#,
         name = esc(&inst.display_name),
         ns = esc(&inst.namespace),
         transport = esc(&def.transport),
@@ -906,6 +906,11 @@ pub async fn save_config(
     if let Err(e) = apply_config_file(&state, &inst.id, &form.config_file).await {
         return error_page(&e.to_string());
     }
+    // The pooled backend is still running the old def/env; relaunch it and let
+    // live sessions know. A disabled server has nothing running to relaunch.
+    if inst.enabled {
+        state.restart_backend(&inst.id, &user.id);
+    }
     audit_ok("server.edit", &user, &headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
@@ -972,11 +977,12 @@ pub async fn disable_server(
     set_enabled_and_redirect(&state, &user, &headers, &id, false).await
 }
 
-/// `POST /servers/{id}/restart` — relaunch this one server in the user's live
-/// MCP sessions so a configuration change takes effect without reconnecting the
-/// client. The web layer can't reach a session's child processes directly, so it
-/// bumps the instance's reload epoch; each session respawns just this backend on
-/// its next request (see `proxy::server::reconcile_reloads`).
+/// `POST /servers/{id}/restart` — relaunch this one server's pooled backend
+/// without reconnecting the client. The web layer can't reach the child
+/// process directly, so it bumps the instance's reload epoch; the pool respawns
+/// just this backend on the next request (see `proxy::pool::UserBackends::reconcile`).
+/// Config edits and git rebuilds do the same automatically; this button is for
+/// everything else (a wedged server, an external dependency that changed).
 pub async fn restart_server(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -996,11 +1002,7 @@ pub async fn restart_server(
     else {
         return error_page("server not found");
     };
-    state.bump_reload(&inst.id);
-    // Nudge the user's live MCP sessions to re-list now: the epoch bump alone
-    // only takes effect on a session's *next* request, which an idle client may
-    // not make for a while. The notification prompts that request immediately.
-    state.notify_tools_changed(&user.id);
+    state.restart_backend(&inst.id, &user.id);
     audit_ok("server.restart", &user, &headers, &inst.namespace);
     Redirect::to(&format!("/servers/{id}")).into_response()
 }
@@ -1078,7 +1080,13 @@ pub async fn update_server(
     )
     .await
     {
-        Ok(_) => {
+        Ok(report) => {
+            // The pooled child is still running the old build (the rebuild
+            // unlinked its environment underneath it); relaunch it so the new
+            // code — and its tool list — reaches clients without a hub restart.
+            if report.changed && inst.enabled {
+                state.restart_backend(&inst.id, &user.id);
+            }
             audit_ok("server.update", &user, &headers, &inst.namespace);
             Redirect::to(&format!("/servers/{id}")).into_response()
         }

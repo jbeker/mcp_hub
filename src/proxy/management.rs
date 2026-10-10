@@ -65,7 +65,8 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "hub__edit_server",
             "Change one of your servers' command/url/repo/connect_timeout_secs \
              (omitted fields are left unchanged; pass connect_timeout_secs as \
-             null to go back to the hub default).",
+             null to go back to the hub default). The running server is \
+             relaunched with the new definition.",
             schema(
                 json!({
                     "namespace": {"type": "string"},
@@ -86,7 +87,8 @@ pub fn tools(admin: bool) -> Vec<Tool> {
              ${MCP_CONFIG_FILE} for the config file's path. On an http server, \
              AUTHORIZATION is sent as the request's Authorization header, using \
              the Bearer scheme unless AUTHORIZATION_METHOD overrides it (e.g. \
-             Basic); the credential is sent verbatim after the scheme.",
+             Basic); the credential is sent verbatim after the scheme. The \
+             running server is relaunched with the new environment.",
             schema(
                 json!({
                     "namespace": {"type": "string"},
@@ -101,7 +103,7 @@ pub fn tools(admin: bool) -> Vec<Tool> {
              (encrypted at rest). At launch the file is written into the server's \
              working directory and its path exposed as the MCP_CONFIG_FILE \
              environment variable. Pass an empty 'content' (or omit it) to remove \
-             the file.",
+             the file. The running server is relaunched with the new file.",
             schema(
                 json!({
                     "namespace": {"type": "string"},
@@ -114,7 +116,8 @@ pub fn tools(admin: bool) -> Vec<Tool> {
             "hub__update_server",
             "Build or update a git-sourced server from its repository (fetches the \
              latest commit and rebuilds its environment). Run this after you push \
-             changes; connecting otherwise uses the cached build.",
+             changes; if the build changed, the running server is relaunched and \
+             live sessions are told to re-list their tools.",
             schema(json!({"namespace": {"type": "string"}}), &["namespace"]),
         ),
         tool(
@@ -827,7 +830,12 @@ async fn edit_server(
     instances::update_def(&state.db, &inst.id, &def)
         .await
         .map_err(internal)?;
-    ok(json!({ "edited": true, "namespace": namespace }))
+    // Pooled backends outlive sessions: relaunch the running one on the new
+    // def and let live clients re-list. A disabled server has nothing running.
+    if inst.enabled {
+        state.restart_backend(&inst.id, user_id);
+    }
+    ok(json!({ "edited": true, "namespace": namespace, "restarted": inst.enabled }))
 }
 
 async fn set_env(
@@ -841,7 +849,15 @@ async fn set_env(
     instances::replace_env(&state.db, &state.secrets, &inst.id, &env)
         .await
         .map_err(internal)?;
-    ok(json!({ "set": true, "namespace": namespace, "keys": env.keys().collect::<Vec<_>>() }))
+    if inst.enabled {
+        state.restart_backend(&inst.id, user_id);
+    }
+    ok(json!({
+        "set": true,
+        "namespace": namespace,
+        "keys": env.keys().collect::<Vec<_>>(),
+        "restarted": inst.enabled,
+    }))
 }
 
 async fn set_config_file(
@@ -852,18 +868,23 @@ async fn set_config_file(
     let namespace = req_str(args, "namespace")?;
     let inst = find_instance(state, user_id, &namespace).await?;
     let content = opt_str(args, "content").unwrap_or_default();
-    if content.is_empty() {
+    let result = if content.is_empty() {
         instances::clear_config_file(&state.db, &inst.id)
             .await
             .map_err(internal)?;
         crate::proxy::backend::remove_workdir(&state.config.env_dir, &inst.id);
-        ok(json!({ "namespace": namespace, "cleared": true }))
+        json!({ "namespace": namespace, "cleared": true, "restarted": inst.enabled })
     } else {
         instances::set_config_file(&state.db, &state.secrets, &inst.id, &content)
             .await
             .map_err(internal)?;
-        ok(json!({ "namespace": namespace, "set": true }))
+        json!({ "namespace": namespace, "set": true, "restarted": inst.enabled })
+    };
+    // The running child still has the old file in its working directory.
+    if inst.enabled {
+        state.restart_backend(&inst.id, user_id);
     }
+    ok(result)
 }
 
 async fn update_server(
@@ -896,12 +917,26 @@ async fn update_server(
     )
     .await
     .map_err(bad_request)?;
+    // The pooled child is still running the old build (the rebuild unlinked
+    // its environment underneath it); relaunch it so the new code — and its
+    // tool list — reaches clients without a hub restart.
+    let restarted = report.changed && inst.enabled;
+    if restarted {
+        state.restart_backend(&inst.id, user_id);
+    }
     ok(json!({
         "namespace": namespace,
         "updated": report.changed,
+        "restarted": restarted,
         "commit": report.commit,
         "previous_commit": report.previous_commit,
-        "note": if report.changed { "rebuilt; reconnect to use the new version" } else { "already up to date" },
+        "note": if restarted {
+            "rebuilt; the running server is being relaunched and live sessions were told to re-list"
+        } else if report.changed {
+            "rebuilt; the server is disabled and will run the new build once enabled"
+        } else {
+            "already up to date"
+        },
     }))
 }
 

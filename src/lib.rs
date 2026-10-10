@@ -196,8 +196,18 @@ impl AppState {
         });
     }
 
+    /// A server's definition, env, config file, or build changed: relaunch its
+    /// pooled backend on the next request and tell the owner's live clients to
+    /// re-list. Pooled backends outlive sessions, so without this a healthy
+    /// child keeps serving the old code/config until the hub restarts. Shared
+    /// by the web Restart button, config edits, and git-source rebuilds.
+    pub fn restart_backend(&self, instance_id: &str, user_id: &str) {
+        self.bump_reload(instance_id);
+        self.notify_tools_changed(user_id);
+    }
+
     /// Bump an instance's reload epoch so every live proxy session relaunches
-    /// that backend on its next request (the web Restart button).
+    /// that backend on its next request (see [`restart_backend`](Self::restart_backend)).
     pub fn bump_reload(&self, instance_id: &str) {
         *self
             .reload_epochs

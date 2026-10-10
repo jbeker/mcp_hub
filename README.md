@@ -136,7 +136,9 @@ Three freshness mechanisms, from most to least automatic:
 - **Live sessions** get a `tools/list_changed` notification whenever servers or
   groups change (and when a slow backend joins the pool after connect), so an
   open Claude Code session or active claude.ai conversation re-fetches on its
-  own.
+  own. Editing a server's command, env, or config file, or rebuilding a
+  git-sourced server, relaunches its pooled backend and sends the same
+  notification — no manual Restart or reconnect needed.
 - **New claude.ai conversations** fetch a fresh `tools/list` at session start,
   so per-chat freshness is automatic as long as the list is complete — the
   keep-warm loop's heartbeat exists to guarantee that.
@@ -271,7 +273,8 @@ built binary). For example, [Teamwork's MCP server](https://github.com/Teamwork/
 
 **Updating after you push:** run `hub__update_server` again (or the "Update from repository"
 button on the server's page). It resolves the branch tip; if nothing changed it's a no-op,
-otherwise it rebuilds in the background and the next session uses the new code. The previously
+otherwise it rebuilds, relaunches the running server on the new build, and pushes
+`tools/list_changed` to your live sessions so they pick up any new tools. The previously
 built version keeps serving until the rebuild succeeds.
 
 Notes:

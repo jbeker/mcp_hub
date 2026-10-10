@@ -450,8 +450,9 @@ async fn slow_backend_call_times_out() {
 
 /// Bumping a server's reload epoch (what the web Restart button does) relaunches
 /// just that backend in a live session, so a configuration change takes effect
-/// without reconnecting the MCP client — and a config change alone does NOT
-/// reload (the action is explicit, by design).
+/// without reconnecting the MCP client. A raw DB write alone does NOT reload —
+/// the pool only watches the epoch; the edit handlers (web form, `hub__set_env`
+/// and friends) bump it themselves, see `set_env_restarts_backend_in_a_live_session`.
 #[tokio::test]
 async fn restart_reloads_backend_config_in_a_live_session() {
     let exe = mock_server_path();
@@ -503,8 +504,8 @@ async fn restart_reloads_backend_config_in_a_live_session() {
     // First call binds the backend with the original prefix.
     assert!(echo(&client).await.contains("PFX:hi"));
 
-    // Change the config but do NOT restart: the live session keeps the old
-    // process, so the prefix is unchanged (config edits don't auto-reload).
+    // Change the config behind the handlers' back (a raw DB write): the live
+    // session keeps the old process, so the prefix is unchanged.
     instances::set_config_value(&state.db, &inst.id, "MOCK_PREFIX", "NEW:")
         .await
         .unwrap();
@@ -2239,4 +2240,129 @@ async fn non_admin_cannot_use_admin_tools() {
     assert!(refused, "non-admin must be refused hub__list_users");
 
     let _ = client.cancel().await;
+}
+
+/// `hub__set_env` relaunches the pooled backend with the new environment and
+/// the change is visible to a live group session on its next request — no
+/// Restart button, no reconnect. (Pooled backends outlive sessions, so without
+/// this the old process would serve the stale env until the hub restarted.)
+#[tokio::test]
+async fn set_env_restarts_backend_in_a_live_session() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let gclient = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
+        .unwrap();
+    let mclient = connect(&base, token).await;
+
+    async fn echo(client: &RunningService<RoleClient, ()>) -> String {
+        let result = client
+            .call_tool({
+                let mut __p = CallToolRequestParams::new("mock__echo");
+                __p.arguments = args(serde_json::json!({ "msg": "hi" }));
+                __p
+            })
+            .await
+            .unwrap();
+        serde_json::to_string(&result.content).unwrap()
+    }
+
+    // Bind with no prefix configured.
+    let before = echo(&gclient).await;
+    assert!(
+        before.contains("hi") && !before.contains("NEW:"),
+        "{before}"
+    );
+    let pid_before = mock_pid(&gclient, "mock__pid").await;
+
+    let set = mclient
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__set_env");
+            __p.arguments = args(serde_json::json!({
+                "namespace": "mock",
+                "env": { "MOCK_PREFIX": "NEW:" }
+            }));
+            __p
+        })
+        .await
+        .unwrap();
+    let set_json = serde_json::to_string(&set.content).unwrap();
+    assert!(set_json.contains(r#"\"restarted\": true"#), "{set_json}");
+
+    // Same live group session: the next request runs against a fresh process
+    // carrying the new env.
+    let after = echo(&gclient).await;
+    assert!(
+        after.contains("NEW:hi"),
+        "env edit did not reach the backend: {after}"
+    );
+    let pid_after = mock_pid(&gclient, "mock__pid").await;
+    assert_ne!(pid_before, pid_after, "backend should have been relaunched");
+
+    let _ = gclient.cancel().await;
+    let _ = mclient.cancel().await;
+}
+
+/// `hub__edit_server` likewise relaunches the running backend on the new
+/// definition, visible in a live session without a reconnect.
+#[tokio::test]
+async fn edit_server_restarts_backend_in_a_live_session() {
+    let (base, state, user_id, _inst_id) = hub_with_mock_backend().await;
+    let gclient = connect_at(
+        &base,
+        "/mcp/g",
+        group_token(&state, &base, &user_id, "client"),
+    )
+    .await;
+    let (token, _) = state
+        .signer
+        .issue_access_token(
+            &user_id,
+            "client",
+            &format!("{base}/mcp"),
+            "mcp",
+            false,
+            3600,
+        )
+        .unwrap();
+    let mclient = connect(&base, token).await;
+
+    let pid_before = mock_pid(&gclient, "mock__pid").await;
+
+    // Re-save the same command: the definition "changed", so the pool relaunches.
+    let edited = mclient
+        .call_tool({
+            let mut __p = CallToolRequestParams::new("hub__edit_server");
+            __p.arguments = args(serde_json::json!({
+                "namespace": "mock",
+                "command": mock_server_path(),
+            }));
+            __p
+        })
+        .await
+        .unwrap();
+    let edited_json = serde_json::to_string(&edited.content).unwrap();
+    assert!(
+        edited_json.contains(r#"\"restarted\": true"#),
+        "{edited_json}"
+    );
+
+    let pid_after = mock_pid(&gclient, "mock__pid").await;
+    assert_ne!(pid_before, pid_after, "backend should have been relaunched");
+
+    let _ = gclient.cancel().await;
+    let _ = mclient.cancel().await;
 }
